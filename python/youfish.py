@@ -4,17 +4,19 @@ The app never pins a yt-dlp version — it shells out to whatever yt-dlp is on t
 device, and the user updates that binary themselves. Every call is made from
 PyOtherSide's worker thread, so blocking subprocess calls are fine here.
 
-Playback note: googlevideo rejects GStreamer's default `souphttpsrc` User-Agent
-with HTTP 403, and QtMultimedia's MediaPlayer can't set request headers. So the
-prototype player streams through a tiny localhost proxy (below) that refetches the
-real URL with a browser User-Agent and forwards byte ranges. This reuses
-QtMultimedia's rendering; the raw dual-track GStreamer player (M1, for 720p) will
-set headers itself and won't need the proxy.
+Playback note: googlevideo rejects GStreamer's libsoup HTTP stack with 403 (not a
+fixable header — curl/urllib with identical headers get 206), so BOTH tracks of the
+dual-source pipeline stream through a tiny localhost proxy (below) that refetches
+the real URL with the format's own User-Agent and serves byte ranges from a
+bounded, backpressured on-disk download job.
 
-IMPORTANT (2026 reality): yt-dlp increasingly needs a Proof-of-Origin (PO) token
-to return real formats — without one you get "no video format available". The PO
-token is minted by a bgutil provider on a bundled Deno/Node runtime; wiring that
-sidecar is milestone M2. For now yt-dlp's android_vr client resolves without one.
+PO tokens (2026 reality): YouTube increasingly binds a Proof-of-Origin token to the
+stream URLs — without one many clients return nothing fetchable. The bgutil
+provider (OPT-IN, user-installed; see install_pot_provider) mints them on a
+sandboxed Deno sidecar. The common path avoids the mint entirely: resolve()'s
+primary dump is the TOKEN-FREE tv_embedded client, run anonymously; the token
+machinery is only the safety net for gated/restricted videos (see
+_resolve_uncached / _default_client).
 """
 
 import atexit
@@ -434,10 +436,10 @@ def _proxy_url_ok(url):
 
 
 def _probe_url_ok(url, ua, timeout=3):
-    """Fast pre-flight for the web_embedded→mweb fallback: does this googlevideo URL actually SERVE
-    bytes, or 403 at byte 0? A DRC/flagged web_embedded stream looks fine at resolve but 403s the
-    instant the player fetches it, so resolve probes one chosen URL and, on a real 403, re-extracts
-    with mweb BEFORE playback. Returns False ONLY on a definite HTTP 403 (the escalation trigger);
+    """Fast pre-flight for the token-free→token fallback (today: tv_embedded→mweb): does this
+    googlevideo URL actually SERVE bytes, or 403 at byte 0? A gated token-free stream looks fine
+    at resolve but 403s the instant the player fetches it, so resolve probes one chosen URL and,
+    on a real 403, re-extracts with the token client BEFORE playback. Returns False ONLY on a definite HTTP 403 (the escalation trigger);
     True on 2xx AND on any ambiguous failure (timeout / DNS / other HTTP code) — we never escalate to
     the slower client on a maybe, so a flaky network can't make resolve pay for BOTH clients. One tiny
     Range: bytes=0-1 GET, forced IPv4, with the SAME UA the player will use (a mismatched UA 403s on
@@ -1059,8 +1061,14 @@ _RERESOLVE_BURST = 8
 
 
 @_timed_fn("q.formats")
-def _ytdlp_formats(video_id):
-    """Run yt-dlp and return {itag: direct_url} for every format that has a URL."""
+def _ytdlp_formats(video_id, anon=False):
+    """Run yt-dlp and return {itag: direct_url} for every format that has a URL.
+
+    anon=True mirrors resolve()'s PRIMARY dump — token-free AND cookie-free — so the refreshed
+    map comes from the same client + auth posture that produced the playing URLs (same itag
+    shapes) and dodges the authenticated-token-free gating the anonymous-primary fix proved
+    (see _dump). anon=False is the reliable safety net: cookies (restricted content) + a
+    minted PO token, exactly like resolve()'s fallback dumps."""
     path = _ytdlp_path()
     if not path or not video_id:
         return {}
@@ -1069,9 +1077,9 @@ def _ytdlp_formats(video_id):
     if _DEBUG and _pot_active():   # gate state on the WARM (self-heal) side, to compare with resolve's
         _tlog("reresolve gate: port=%s http=%r" % (_pot_ready_on_port(), _pot_http_ping(0.5)["ok"]))
     try:
-        with _cookies_args() as cargs:
+        with (contextlib.nullcontext([]) if anon else _cookies_args()) as cargs:
             proc = subprocess.run([path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(),
-                                   *_yt_extractor_args(want_pot=True),
+                                   *_yt_extractor_args(want_pot=not anon),
                                    "--dump-single-json", "--", url],
                                   capture_output=True, text=True, timeout=90,
                                   preexec_fn=_set_pdeathsig)   # D6: die with the app if abandoned
@@ -1089,6 +1097,14 @@ def _reresolve(video_id, itag, failed_url):
     generation. Concurrent video+audio 403s share one refresh: whoever takes the lock
     first re-extracts; the other sees a cached URL that differs from its failed one and
     reuses it without a second yt-dlp run.
+
+    Mirrors resolve()'s two-step strategy: an ANONYMOUS token-free dump first (the posture
+    that produced the playing URLs on the common path — same itag shapes, and immune to the
+    authenticated-token-free gating), then the cookie'd + PO-token dump only when the
+    anonymous pass didn't yield THIS itag (restricted content, or URLs born from the mweb
+    gated-fallback whose shapes a token-free dump may not reproduce). Both dumps count
+    against the spawn rate-limit; worst case this holds _url_cache_lock across two 90s
+    dumps — acceptable for a rare recovery path where reliability beats latency.
     """
     with _url_cache_lock:
         ent = _url_cache.get(video_id)
@@ -1102,7 +1118,15 @@ def _reresolve(video_id, itag, failed_url):
             _plog("reresolve rate-limited (%d in %.0fs)" % (len(_reresolve_spawns), _RERESOLVE_WINDOW))
             return None
         _reresolve_spawns.append(now)
-        fresh = _ytdlp_formats(video_id)
+        fresh = _ytdlp_formats(video_id, anon=True)
+        if not fresh.get(itag):
+            if len(_reresolve_spawns) < _RERESOLVE_BURST:      # the fallback spawn pays the limit too
+                _reresolve_spawns.append(time.time())
+                fresh2 = _ytdlp_formats(video_id)              # cookie'd + minted-token safety net
+                if fresh2:
+                    fresh = {**fresh, **fresh2}                # merged map still serves the other track
+            else:
+                _plog("reresolve token fallback rate-limited")
         if not fresh:
             return None
         if _DEBUG:   # the WARM re-resolve's token + client for the exact itag that 403'd
@@ -1132,10 +1156,11 @@ _resolve_inflight = {}                     # key -> threading.Event (leader sign
 _RESOLVE_CACHE_MAX = 24
 _RESOLVE_CACHE_MAX_TTL = 20 * 60           # never trust an entry longer than this, even if expire is hours out
 _RESOLVE_SAFETY = 120                      # drop an entry this many secs BEFORE its URLs actually expire
-# D1: join ceiling. _resolve_uncached runs up to TWO subprocess.run(timeout=90) dumps
-# (primary + widen retry), so ~180s worst case. The joiner must wait PAST that, never
-# time out early and launch a second resolve. 200s covers 2x90s + margin.
-_RESOLVE_JOIN_TIMEOUT = 200
+# D1: join ceiling. _resolve_uncached runs up to THREE subprocess.run(timeout=90) dumps
+# (primary + probe→mweb gated fallback + its SABR widen; the hard-fail widen is mutually
+# exclusive with the probe path), so ~270s worst case. The joiner must wait PAST that,
+# never time out early and launch a second resolve. 300s covers 3x90s + margin.
+_RESOLVE_JOIN_TIMEOUT = 300
 
 _prefetch_sema = threading.BoundedSemaphore(2)   # <=2 speculative yt-dlp jobs at once (no swarm)
 _prefetch_pending = set()                  # keys queued/running as prefetch (debounce)
@@ -1760,6 +1785,10 @@ def _inproc_ydl(mod):
             "noprogress": True,
             "no_color": True,
             "source_address": "0.0.0.0",   # == yt-dlp -4 (force IPv4), matching _COMMON_ARGS
+            # Bound each in-process request. The BINARY path has a hard 90s aggregate cap
+            # (subprocess timeout=90) that extract_info lacks; per-request bounding is the
+            # in-process stand-in, so one wedged socket can't pin the worker indefinitely.
+            "socket_timeout": 20,
             # No explicit cachedir: use yt-dlp's default (~/.cache/yt-dlp), the SAME the frozen
             # binary uses (app is unsandboxed → writable). So the in-process path shares the
             # binary's warm n-sig / player-JS disk cache — a first-of-session resolve is warmer.
@@ -1902,7 +1931,9 @@ _FFMPEG_MD5_URL = _FFMPEG_URL + ".md5"
 # check on the actual executable we run (a host/supply-chain compromise can't forge it). Empty =
 # fall back to the corruption-only MD5. NOTE: this is the hash of the `ffmpeg` binary itself
 # (sha256sum ~/.local/share/<app>/bin/ffmpeg), so upgrading ffmpeg means re-pinning. Set to a
-# known-good build; a download that doesn't match is treated as a newer build, not rejected.
+# known-good build; a mismatching download is REFUSED while staged (never promoted over a
+# working install) unless the user explicitly accepts it via allow_unpinned — see the M12
+# integrity gate in install_ffmpeg.
 _FFMPEG_SHA256 = "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce"
 
 
@@ -2327,15 +2358,22 @@ def _pot_bind_localhost():
 
     Upstream main.ts hardcodes host "::" (fallback "0.0.0.0") with no env/flag — its own
     comment says a localhost default is planned 'in the next major version', so we make that
-    change early. Best-effort + idempotent: if the source shape ever changes, the replace is a
-    no-op and the server just keeps binding all interfaces (the low-severity status quo). Deno
-    runs the .ts directly, so the rewrite takes effect on the next server start."""
+    change early. The SUCCESS LOG is patched too: upstream prints a HARDCODED "[::]:<port>"
+    address string regardless of the actual bind, so an unpatched log reads as an
+    all-interfaces bind even when the rebind worked — a recurring false alarm when reading
+    device logs (verify for real with `ss -tlnp | grep 4416`). The "address " prefix keeps
+    the error lines ("Could not listen on [::]…") untouched. Best-effort + idempotent: if
+    the source shape ever changes, the replaces are no-ops and the server just keeps
+    upstream behaviour (the low-severity status quo). Deno runs the .ts directly, so the
+    rewrite takes effect on the next server start."""
     main_ts = os.path.join(_pot_server_dir(), "src", "main.ts")
     try:
         with open(main_ts) as f:
             src = f.read()
         patched = (src.replace('host: "::"', 'host: "127.0.0.1"')
-                      .replace('host: "0.0.0.0"', 'host: "127.0.0.1"'))
+                      .replace('host: "0.0.0.0"', 'host: "127.0.0.1"')
+                      .replace('address [::]:', 'address 127.0.0.1:')
+                      .replace('address 0.0.0.0:', 'address 127.0.0.1:'))
         if patched != src:
             with open(main_ts, "w") as f:
                 f.write(patched)
@@ -3110,6 +3148,8 @@ def _resolve_uncached(video_id):
         skipping the ~1.3s frozen-binary spawn tax; ANY failure falls through to the binary below.
         The token path (fetch_pot=always baked into `extra`) always takes the binary — that's
         where the bgutil PO-token plugin lives — so the in-process path never needs it.
+        (Provider INACTIVE → a widen retry carries no fetch_pot marker and may run in-process
+        too; equivalent by construction, since without the provider the binary loads no plugin.)
 
         anon=True resolves WITHOUT the login cookies. YouTube gates token-free clients (tv_embedded)
         HARD for AUTHENTICATED requests but not anonymous ones — confirmed on-device 2026-09-05: the
@@ -3426,15 +3466,18 @@ def _pick_video(formats, cap=0):
 
     Candidates are property-selected + sorted best-first (highest resolution, preferred codec,
     lower fps); returns the first whose height is within the cap. If nothing fits under the cap,
-    falls back to the highest available so playback still happens — this is what makes 'Default
-    quality' a ceiling that degrades gracefully when the exact rung isn't offered."""
+    falls back to the LOWEST rung offered — the nearest to the requested ceiling — so playback
+    still happens without overshooting the user's quality/decode budget more than it must."""
     cands = _video_candidates(formats)
     if not cands:
         return None
     for f in cands:
         if not cap or (f.get("height") or 0) <= cap:
             return f
-    return cands[0]                            # cap below everything offered → highest available
+    # Cap below everything offered → nearest rung above it. min() is stable (first minimal
+    # element wins), and within the lowest height group the sort already put the preferred
+    # codec / lower fps / direct variant first — so that's the one min() lands on.
+    return min(cands, key=lambda f: f.get("height") or 0)
 
 
 def _pick_audio(formats, prefer_lang=""):
@@ -3747,8 +3790,9 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
                       # The binary stays the resilient default AND the fallback for every failure.
                       "fast_resolve": False}
 
-# Widened client net, tried in ONE extra yt-dlp pass when the primary (mweb) comes
-# back SABR-thin (no fetchable HD pair). yt-dlp queries them all and merges formats; the
+# Widened client net, tried in ONE extra yt-dlp pass when the primary (tv_embedded, or
+# yt-dlp's auto pick when no provider is set up) hard-fails on a bot-wall or comes back
+# SABR-thin (no fetchable HD pair). yt-dlp queries them all and merges formats; the
 # url-presence filter in _pick keeps only the ones a SABR client can't serve. Unknown names
 # are skipped with a warning, never a hard error, so a broad net here is safe.
 _RETRY_CLIENTS = "tv,mweb,android,android_vr"
@@ -4799,8 +4843,8 @@ def channel_avatar(channel):
     """Just the channel's avatar URL + id — cheap enough to fetch on video open.
 
     Fetches one flat entry so yt-dlp still hands back the channel metadata (avatar)
-    without listing the whole uploads tab. Cached for a day so opening several of a
-    channel's videos doesn't re-run yt-dlp each time.
+    without listing the whole uploads tab. Cached for a week (_AVATAR_CACHE_TTL, persisted
+    to disk) so opening several of a channel's videos doesn't re-run yt-dlp each time.
     """
     path = _ytdlp_path()
     if not path or not channel:
@@ -5577,7 +5621,12 @@ def download(video_id, title, kind):
                  *_yt_extractor_args(want_pot=True), *_pot_ytdlp_args(), *_ffmpeg_args(),
                  "--no-playlist", "-f", fmt, *merge, "--no-part", "--newline",
                  "-o", base + ".%(ext)s", "--", url],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                # Die with the app: the result can only be REGISTERED (downloads.json + the
+                # download_done event) while the app lives, so an app-exit orphan would keep
+                # burning network/CPU writing a file the app can never list. Same doctrine
+                # as every other child in this module (D6).
+                preexec_fn=_set_pdeathsig)
             last = -1
             tail = []                              # keep the last lines to explain a failure
             for line in proc.stdout:

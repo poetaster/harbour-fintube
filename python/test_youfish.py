@@ -109,7 +109,8 @@ class VideoCandidates(unittest.TestCase):
         fmts = [vf("137", 1080, "avc1"), vf("136", 720, "avc1"), vf("135", 480, "avc1")]
         self.assertEqual(youfish._pick_video(fmts, 720)["height"], 720)      # capped
         self.assertEqual(youfish._pick_video(fmts, 0)["height"], 1080)       # uncapped = best
-        self.assertEqual(youfish._pick_video(fmts, 240)["height"], 1080)     # cap below all -> best
+        self.assertEqual(youfish._pick_video(fmts, 240)["height"], 480)      # cap below all -> lowest
+                                                                             # offered (nearest the cap)
 
 
 class VideoManifestTiebreak(unittest.TestCase):
@@ -1937,6 +1938,154 @@ class AnonymousPrimary(unittest.TestCase):
         self.assertGreaterEqual(len(self.calls), 2)
         self.assertNotIn("--cookies", self.calls[0])          # primary anonymous
         self.assertIn("--cookies", self.calls[1])             # fallback re-runs WITH cookies
+
+
+class ReresolveAnonFirst(unittest.TestCase):
+    """_reresolve mirrors resolve(): an anonymous token-free dump first (same client + auth
+    posture as the primary that produced the playing URLs), the cookie'd + PO-token dump only
+    when the anonymous pass didn't yield the wanted itag."""
+
+    def setUp(self):
+        self.calls = []
+        self._saved = dict(path=youfish._ytdlp_path, run=youfish.subprocess.run,
+                           pot=youfish._pot_active, ens=youfish._ensure_pot_server,
+                           ck=youfish._write_cookies_temp, gs=youfish.get_settings)
+        youfish._ytdlp_path = lambda: "/bin/yt-dlp"
+        youfish._pot_active = lambda: True
+        youfish._ensure_pot_server = lambda: True
+        youfish._write_cookies_temp = lambda: ""   # signed out → _cookies_args yields []
+        youfish.get_settings = lambda: {}
+        youfish._url_cache.clear()
+        youfish._reresolve_spawns[:] = []
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._saved["path"]
+        youfish.subprocess.run = self._saved["run"]
+        youfish._pot_active = self._saved["pot"]
+        youfish._ensure_pot_server = self._saved["ens"]
+        youfish._write_cookies_temp = self._saved["ck"]
+        youfish.get_settings = self._saved["gs"]
+        youfish._url_cache.clear()
+        youfish._reresolve_spawns[:] = []
+
+    @staticmethod
+    def _dump_json(itags):
+        return json.dumps({"formats": [{"format_id": i, "url": "https://g/" + i} for i in itags]})
+
+    def test_anon_hit_spawns_once_no_token(self):
+        def run(cmd, **kw):
+            self.calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout=self._dump_json(["303"]), stderr="")
+        youfish.subprocess.run = run
+        got = youfish._reresolve("vid", "303", "https://g/old")
+        self.assertEqual(got, "https://g/303")
+        self.assertEqual(len(self.calls), 1)                     # anon pass sufficed
+        joined = " ".join(self.calls[0])
+        self.assertNotIn("--cookies", joined)                    # cookie-free
+        self.assertNotIn("fetch_pot=always", joined)             # token-free
+
+    def test_missing_itag_falls_back_to_token_dump(self):
+        def run(cmd, **kw):
+            self.calls.append(cmd)
+            first = len(self.calls) == 1
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout=self._dump_json(["136"] if first else ["136", "303"]), stderr="")
+        youfish.subprocess.run = run
+        got = youfish._reresolve("vid", "303", "https://g/old")
+        self.assertEqual(got, "https://g/303")
+        self.assertEqual(len(self.calls), 2)
+        self.assertNotIn("fetch_pot=always", " ".join(self.calls[0]))   # anon first
+        self.assertIn("fetch_pot=always", " ".join(self.calls[1]))      # token safety net second
+        self.assertEqual(len(youfish._reresolve_spawns), 2)             # both spawns rate-counted
+
+    def test_fallback_respects_rate_limit(self):
+        def run(cmd, **kw):
+            self.calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout=self._dump_json(["136"]), stderr="")
+        youfish.subprocess.run = run
+        now = time.time()
+        youfish._reresolve_spawns[:] = [now] * (youfish._RERESOLVE_BURST - 1)   # one slot left
+        got = youfish._reresolve("vid", "303", "https://g/old")
+        self.assertIsNone(got)                                   # itag never found
+        self.assertEqual(len(self.calls), 1)                     # the anon spawn took the last slot;
+                                                                 # the token fallback was NOT spawned
+
+
+class PotBindLocalhost(unittest.TestCase):
+    """_pot_bind_localhost against the exact bgutil 1.3.2 source shape: BOTH hardcoded bind
+    hosts move to 127.0.0.1, and the hardcoded success-log address strings are corrected too
+    (upstream prints "[::]:<port>" regardless of the actual bind — a recurring log red
+    herring). Genuine error-path text is left untouched."""
+
+    SRC = (
+        'httpServer\n'
+        '    .listen(\n'
+        '        {\n'
+        '            host: "::",\n'
+        '            port: PORT_NUMBER,\n'
+        '        },\n'
+        '        (err) => {\n'
+        '            if (err) {\n'
+        '                console.error(\n'
+        '                    `Could not listen on [::]:${PORT_NUMBER}, falling back to 0.0.0.0 '
+        '(Caused by ${strerror(err)})`,\n'
+        '                );\n'
+        '            } else {\n'
+        '                console.log(\n'
+        '                    `Started POT server (v${VERSION}) on on address [::]:${PORT_NUMBER}`,\n'
+        '                );\n'
+        '            }\n'
+        '        },\n'
+        '    )\n'
+        '    .on("error", () => {\n'
+        '        httpServer.listen(\n'
+        '            {\n'
+        '                host: "0.0.0.0",\n'
+        '                port: PORT_NUMBER,\n'
+        '            },\n'
+        '            (err) => {\n'
+        '                console.log(\n'
+        '                    `Started POT server (v${VERSION}) on address 0.0.0.0:${PORT_NUMBER}`,\n'
+        '                );\n'
+        '            },\n'
+        '        );\n'
+        '    });\n'
+    )
+
+    def _patch(self, src):
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        os.makedirs(os.path.join(td, "src"))
+        p = os.path.join(td, "src", "main.ts")
+        with open(p, "w") as f:
+            f.write(src)
+        saved = youfish._pot_server_dir
+        youfish._pot_server_dir = lambda: td
+        try:
+            youfish._pot_bind_localhost()
+        finally:
+            youfish._pot_server_dir = saved
+        with open(p) as f:
+            return f.read()
+
+    def test_binds_and_success_logs_localhost(self):
+        out = self._patch(self.SRC)
+        self.assertNotIn('host: "::"', out)
+        self.assertNotIn('host: "0.0.0.0"', out)
+        self.assertEqual(out.count('host: "127.0.0.1"'), 2)
+        self.assertEqual(out.count('address 127.0.0.1:${PORT_NUMBER}'), 2)
+        self.assertNotIn('address [::]:', out)
+        self.assertNotIn('address 0.0.0.0:', out)
+        self.assertIn('falling back to 0.0.0.0', out)            # error text untouched
+        self.assertIn('Could not listen on [::]:', out)
+
+    def test_idempotent_and_unknown_shape_noop(self):
+        out1 = self._patch(self.SRC)
+        out2 = self._patch(out1)
+        self.assertEqual(out1, out2)                             # second run changes nothing
+        odd = "serve({ hostname: cfg.host })"
+        self.assertEqual(self._patch(odd), odd)                  # unknown shape → untouched
 
 
 if __name__ == "__main__":
