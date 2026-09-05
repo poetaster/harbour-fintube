@@ -119,10 +119,11 @@ Page {
                             page.ytdlpStatus = "Downloading yt-dlp…"
                             app.backend.installYtdlp()
                         } else {
-                            page.ytdlpStatus = "Updating yt-dlp…"
-                            app.backend.updateYtdlp()
                             // Keep the in-process zipapp in lockstep with the binary so a YouTube
                             // breakage fix reaches the fast path too (else it silently stays stale).
+                            page.ytdlpStatus = app.backend.fastResolveInstalled
+                                ? "Updating yt-dlp + fast-resolve copy…" : "Updating yt-dlp…"
+                            app.backend.updateYtdlp()
                             if (app.backend.fastResolveInstalled)
                                 app.backend.installFastResolve()
                         }
@@ -219,6 +220,26 @@ Page {
                 wrapMode: Text.Wrap
                 text: app.backend.fastResolveStatusMsg
                 color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
+
+            // Version-skew alarm: the fast path runs whatever zipapp is on disk, so a copy older
+            // than the binary quietly misses the breakage fix an Update just delivered (it fails
+            // or thins out in-process and every resolve detours through the binary). Covers the
+            // cases the Update-lockstep can't see: a zipapp fetch that failed after a successful
+            // binary update, and a system yt-dlp another package manager moved forward.
+            Label {
+                visible: app.backend.fastResolveInstalled
+                         && app.backend.ytdlpVersion.length > 0
+                         && app.backend.fastResolveVersion.length > 0
+                         && app.backend.fastResolveVersion !== app.backend.ytdlpVersion
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: "Fast-resolve copy (" + app.backend.fastResolveVersion
+                      + ") is out of step with the yt-dlp binary (" + app.backend.ytdlpVersion
+                      + ") — tap Update above to refresh both."
+                color: Theme.secondaryHighlightColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 

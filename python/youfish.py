@@ -1574,7 +1574,7 @@ def ytdlp_update():
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found", "version": ""}
-    channel = "nightly" if (get_settings().get("ytdlp_channel") == "nightly") else "stable"
+    channel = _ytdlp_channel()
     try:
         # --update-to <channel>@latest is unambiguous whichever channel the binary is on now;
         # it can pull ~30 MB over a phone link, so allow generous time.
@@ -1594,9 +1594,27 @@ def ytdlp_update():
 # the device's Python version). "latest" redirects to the current release asset; each release
 # also publishes SHA2-256SUMS, which we verify the download against.
 _YTDLP_ASSET = "yt-dlp_linux_aarch64"
-_YTDLP_RELEASE_BASE = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/"
-_YTDLP_DOWNLOAD_URL = _YTDLP_RELEASE_BASE + _YTDLP_ASSET
-_YTDLP_SUMS_URL = _YTDLP_RELEASE_BASE + "SHA2-256SUMS"
+# Release bases PER UPDATE CHANNEL. The binary hops channels via its own --update-to, but every
+# direct download here (first binary install and — crucially — the importable ZIPAPP, which has
+# no self-updater) must come from the repo matching the user's channel: a nightly binary next to
+# a stable zipapp means the in-process fast path is missing the very breakage fix the user
+# switched to nightly FOR — it fails (or goes SABR-thin) and every resolve silently pays a dead
+# in-process attempt before the binary rescues it. Both repos publish the identical asset set
+# (yt-dlp_linux_aarch64, the yt-dlp zipapp, SHA2-256SUMS); verified 2026-09-06.
+_YTDLP_RELEASE_BASES = {
+    "stable": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/",
+    "nightly": "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/",
+}
+
+
+def _ytdlp_channel():
+    """The user's yt-dlp update channel: "stable" unless explicitly "nightly"."""
+    return "nightly" if (get_settings().get("ytdlp_channel") == "nightly") else "stable"
+
+
+def _ytdlp_release_base():
+    """GitHub release-asset base URL for the user's channel (binary, zipapp and sums alike)."""
+    return _YTDLP_RELEASE_BASES[_ytdlp_channel()]
 
 
 def _https_open(url, ctx, timeout=60):
@@ -1614,8 +1632,8 @@ def _https_open(url, ctx, timeout=60):
 
 def _expected_sha256(ctx, asset=_YTDLP_ASSET):
     """The published SHA-256 for `asset` (the aarch64 binary by default; the arch-independent
-    zipapp for fast resolve), from the release's SHA2-256SUMS file (or None)."""
-    with _https_open(_YTDLP_SUMS_URL, ctx, timeout=30) as resp:
+    zipapp for fast resolve), from the CHANNEL repo's SHA2-256SUMS file (or None)."""
+    with _https_open(_ytdlp_release_base() + "SHA2-256SUMS", ctx, timeout=30) as resp:
         text = resp.read().decode("utf-8", "replace")
     for line in text.splitlines():
         parts = line.split()
@@ -1641,7 +1659,7 @@ def install_ytdlp():
             dest = _managed_ytdlp()
             tmp = dest + ".part"
             h = hashlib.sha256()
-            with _https_open(_YTDLP_DOWNLOAD_URL, ctx) as resp:
+            with _https_open(_ytdlp_release_base() + _YTDLP_ASSET, ctx) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 last = -1
@@ -1701,8 +1719,7 @@ def install_ytdlp():
 # bgutil PO-token PLUGIN machinery is untouched and never needed in-process.
 # --------------------------------------------------------------------------- #
 
-_YTDLP_ZIPAPP_ASSET = "yt-dlp"   # the arch-independent zipapp in the same GitHub release
-_YTDLP_ZIPAPP_URL = _YTDLP_RELEASE_BASE + _YTDLP_ZIPAPP_ASSET
+_YTDLP_ZIPAPP_ASSET = "yt-dlp"   # the arch-independent zipapp in the same (channel) release
 
 
 def _ytdlp_zipapp_path():
@@ -1750,7 +1767,7 @@ def install_ytdlp_zipapp():
             dest = _ytdlp_zipapp_path()
             tmp = dest + ".part"
             h = hashlib.sha256()
-            with _https_open(_YTDLP_ZIPAPP_URL, ctx) as resp:
+            with _https_open(_ytdlp_release_base() + _YTDLP_ZIPAPP_ASSET, ctx) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 last = -1
@@ -1790,6 +1807,8 @@ def install_ytdlp_zipapp():
             note = "Installed yt-dlp zipapp " + (ver or "(unknown version)")
             if not expected:
                 note += " (checksum unavailable, not verified)"
+            if _YT_DLP_IMPORT_DONE:   # a copy is already imported (one-shot per process) — tell
+                note += " — takes effect next app launch"    # the user why nothing changes yet
             pyotherside.send("ytdlp_zipapp_done", True, note, ver)
         except Exception as ex:
             try:

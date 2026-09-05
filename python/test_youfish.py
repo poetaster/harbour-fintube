@@ -2145,6 +2145,47 @@ class DirectFetchStreamer(unittest.TestCase):
         self.assertIn("Range: bytes=5-", " ".join(argvs[0]))          # resume offset forwarded
 
 
+class ChannelAwareDownloads(unittest.TestCase):
+    """Direct downloads (binary install, zipapp, SHA2-256SUMS) must follow the user's update
+    channel — a nightly BINARY beside a stable ZIPAPP means the in-process fast path silently
+    misses the breakage fix the user switched to nightly for."""
+
+    def setUp(self):
+        self._gs = youfish.get_settings
+        self._open = youfish._https_open
+
+    def tearDown(self):
+        youfish.get_settings = self._gs
+        youfish._https_open = self._open
+
+    def test_release_base_follows_channel(self):
+        youfish.get_settings = lambda: {"ytdlp_channel": "nightly"}
+        self.assertIn("yt-dlp-nightly-builds", youfish._ytdlp_release_base())
+        youfish.get_settings = lambda: {}
+        self.assertIn("/yt-dlp/yt-dlp/", youfish._ytdlp_release_base())
+        youfish.get_settings = lambda: {"ytdlp_channel": "weird"}   # unknown -> stable, never KeyError
+        self.assertIn("/yt-dlp/yt-dlp/", youfish._ytdlp_release_base())
+
+    def test_expected_sha_reads_channel_sums(self):
+        seen = []
+
+        class _Sums:
+            def read(self):
+                return b"abc123 *yt-dlp\ndef456  yt-dlp_linux_aarch64\n"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        youfish._https_open = lambda url, ctx, timeout=30: seen.append(url) or _Sums()
+        youfish.get_settings = lambda: {"ytdlp_channel": "nightly"}
+        self.assertEqual(youfish._expected_sha256(None, "yt-dlp"), "abc123")
+        self.assertIn("yt-dlp-nightly-builds", seen[0])
+        self.assertTrue(seen[0].endswith("SHA2-256SUMS"))
+
+
 class PotBindLocalhost(unittest.TestCase):
     """_pot_bind_localhost against the exact bgutil 1.3.2 source shape: BOTH hardcoded bind
     hosts move to 127.0.0.1, and the hardcoded success-log address strings are corrected too
