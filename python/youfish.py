@@ -270,12 +270,14 @@ _proxy_lock = threading.Lock()
 _ipv4_forced = False
 
 # --- Download-backed streaming substrate ------------------------------------- #
-# yt-dlp streams an itag into our stdin over a pipe; the reader thread pwrites it into a temp
-# file and advances an in-process `edge` counter; do_GET serves preads gated by `edge`. A pipe
-# gives free end-to-end backpressure (GStreamer buffer full -> wfile.write blocks -> cursor stops
-# advancing -> reader stops draining -> yt-dlp blocks on its pipe write -> googlevideo pauses), so
-# disk stays bounded with no SIGSTOP / --limit-rate machinery. `edge` is OUR counter (bytes we
-# actually pwrote), never getsize(), so a read can never see a byte we didn't place.
+# A per-(video,itag) job streams googlevideo bytes (in-process _DirectFetch by default; the
+# yt-dlp child as fallback — see _spawn); the reader thread pwrites them into a temp file and
+# advances an in-process `edge` counter; do_GET serves preads gated by `edge`. Backpressure is
+# end-to-end either way: the reader only pulls when the read-ahead gate is open (GStreamer
+# buffer full -> wfile.write blocks -> cursor stops advancing -> reader stops pulling -> the
+# fetch pauses / the child blocks on its pipe), so disk stays bounded with no SIGSTOP /
+# --limit-rate machinery. `edge` is OUR counter (bytes we actually pwrote), never getsize(),
+# so a read can never see a byte we didn't place.
 _SESS_CHUNK   = 256 << 10    # pipe read / pwrite unit
 _READAHEAD    = 32 << 20     # download at most this far past the play cursor (the read-ahead cap)
 _SEEK_SOON    = 4  << 20     # forward seek within this of edge -> block; beyond -> restart
@@ -301,6 +303,16 @@ _PUNCH_OK     = True         # cleared on the first fallocate failure -> degrade
 # corruption-proof), can grow the temp file during a deep resume, and relies on the reader's
 # free-space fail-safe to turn a would-be device-fill into a clean FAIL — never the shipped mode.
 _RANGE_RESTART = True
+# In-process direct fetch (default): the download job streams googlevideo via urllib INSIDE
+# this process instead of spawning the frozen yt-dlp binary per job — the same ~1.3s spawn tax
+# fast-resolve removed from resolve() was still paid on every playback start (twice: video +
+# audio jobs) and on every mid-stream resume. _DirectFetch mirrors the child's proven behaviour
+# (headers, IPv4, 30s socket timeout, bounded 10M Range chunks for the burst-window speedup)
+# behind the exact proc surface _reader/_reap expect. Fallback doctrine (see _spawn/_reader): a
+# stream whose direct fetch dies at byte 0 flips to the binary child for its remaining life —
+# worst case is the status quo plus one failed HTTPS round-trip. Set False to force the child.
+_DIRECT_STREAM = True
+_DIRECT_CHUNK  = 10 << 20    # bounded Range chunk (== the child's --http-chunk-size 10M)
 _streams = {}                # (video_id, itag) -> _Stream
 _streams_lock = threading.Lock()
 _reap_pending = []           # R3/R5: Popen zombies to wait() OFF-lock, drained by _reaper + atexit
@@ -485,6 +497,7 @@ class _Stream:
         s.cursor_at_last_death = 0         # R9: cursor at the previous pipe death -> resets tries
         s.cond = threading.Condition()
         s.proc = None
+        s.use_binary = False               # flipped when a direct fetch dies at byte 0 -> child
         s.gen = 0                          # fences a stale reader across a restart
 
 
@@ -511,14 +524,140 @@ def _reap_proc(proc):
         pass
 
 
+class _DirectFetch:
+    """In-process googlevideo streamer — a duck-typed stand-in for the yt-dlp child (_spawn):
+    same `.stdout.read(n)` / `.kill()` / `.poll()` / `.wait()` surface, so _reader and the reap
+    machinery run unchanged. Exists because every playback start (and every mid-stream resume)
+    paid the same ~1.3s frozen-binary spawn tax that fast-resolve removed from resolve() — twice
+    per video (video + audio jobs). Mirrors what the child did for an already-resolved DIRECT
+    URL: the proven 6-header set with the format's own UA, forced IPv4, a 30s socket timeout,
+    and — the load-bearing part — BOUNDED ~10M Range GETs per chunk (the --http-chunk-size
+    trick: each bounded request re-enters googlevideo's full-speed burst window, where one
+    open-ended GET gets paced down to ~playback bitrate; on-device 2026-09-03: 0.58->10 MB/s).
+
+    Error surface: read() returns b"" at clean EOF *and* on any failure — exactly a child pipe
+    closing — so _reader's existing resume machinery (re-resolve, R9 tries cap, D5) handles
+    both; this object never retries what it can't fix (it has no way to re-resolve a URL).
+    A mid-chunk truncation IS self-healed by reopening from the current offset (cheap — no
+    process to relaunch), capped so a no-progress loop still dies into the resume path. kill()
+    from the reap paths closes the live response, which unblocks a concurrent read(); a read
+    blocked in connect() rides out its own <=30s timeout (the reader re-checks DEAD/gen right
+    after, same as a slow child kill today)."""
+
+    def __init__(self, url, ua, at, total):
+        _force_ipv4()                # the in-process equivalent of the child's -4
+        self.url, self.ua = url, ua
+        self.pos = at                # next content offset to fetch (bytes are handed out in order)
+        self.total = total           # from clen=; None -> learned from the first 206 Content-Range
+        self.resp = None
+        self.chunk_end = -1          # last offset of the open bounded chunk; None = open-ended 200
+        self.reopens = 0             # consecutive ZERO-PROGRESS reopens (truncation guard)
+        self.returncode = None       # duck: None while live, 0 clean EOF / killed, 1 error death
+        self.stdout = self           # _reader drains proc.stdout.read(n)
+
+    def _open_next(self):
+        end = self.pos + _DIRECT_CHUNK - 1
+        if self.total is not None:
+            end = min(end, self.total - 1)
+        req = urllib.request.Request(self.url, headers={
+            "User-Agent": self.ua or _BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Sec-Fetch-Mode": "navigate",
+            "Accept-Encoding": "identity",
+            "Range": "bytes=%d-%d" % (self.pos, end),
+        })
+        resp = urllib.request.urlopen(req, timeout=30)
+        code = getattr(resp, "status", None) or resp.getcode()
+        if code == 200:              # server ignored the Range: stream this one response to EOF
+            self.chunk_end = None
+        else:                        # 206: note the chunk bound; learn the total ("bytes a-b/N")
+            self.chunk_end = end
+            if self.total is None:
+                m = re.search(r"/(\d+)\s*$", resp.headers.get("Content-Range", "") or "")
+                if m:
+                    self.total = int(m.group(1))
+        self.resp = resp
+
+    def read(self, n):
+        """Next <=n bytes at self.pos; b"" at clean EOF or on any failure (= child pipe close)."""
+        while self.returncode is None:
+            if self.resp is None:
+                if self.total is not None and self.pos >= self.total:
+                    self.returncode = 0                   # everything delivered — clean EOF
+                    return b""
+                try:
+                    self._open_next()
+                except urllib.error.HTTPError as ex:
+                    self.returncode = 0 if ex.code == 416 else 1   # 416: past EOF (no-clen case)
+                    return b""
+                except Exception:
+                    self.returncode = 1                   # DNS / TLS / timeout / reset / ...
+                    return b""
+            try:
+                buf = self.resp.read(n)
+            except Exception:
+                buf = b""
+            if buf:
+                self.pos += len(buf)
+                self.reopens = 0
+                return buf
+            try:                                          # response exhausted (or died) — retire it
+                self.resp.close()
+            except Exception:
+                pass
+            self.resp = None
+            if self.chunk_end is None:                    # open-ended 200 finished -> stream done
+                self.returncode = 0
+                return b""
+            if self.pos > self.chunk_end:                 # bounded chunk fully consumed — normal;
+                continue                                  # loop opens the next burst window
+            self.reopens += 1                             # truncated mid-chunk: reopen from pos,
+            if self.reopens > 3:                          # but never loop on zero progress
+                self.returncode = 1
+                return b""
+        return b""
+
+    # --- duck-typed child-process surface (for _reap_proc / _reap_locked / _reaper) --- #
+    def kill(self):
+        self.returncode = 0
+        resp, self.resp = self.resp, None
+        try:
+            if resp is not None:
+                resp.close()                              # unblocks a concurrent read()
+        except Exception:
+            pass
+
+    terminate = kill
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 def _spawn(s, at):
-    """Launch yt-dlp streaming the direct URL to stdout, optionally resuming at byte `at`. `s.url`
-    is an already-resolved DIRECT googlevideo URL (from _proxied / _reresolve), so no cookies /
-    PO-token / extractor args belong here. Mirrors the EXACT 6-header set the retired _fetch proved
-    on-device 2026-09-03 (a bare request 403s at byte 0, empty body = bot-check) plus --socket-timeout
-    so a stalled fetch dies into the resume path. preexec_fn makes the kernel SIGKILL the child if the
-    worker dies. With _RANGE_RESTART=True `at` is s.edge on a resume; the frozen yt-dlp forwards the
-    Range header (verified), so streamed content offset == at (pwrite offset stays correct). (D8, D10)"""
+    """The download job for bytes [at, ...) of s.url — an in-process _DirectFetch by default,
+    the yt-dlp CHILD when this stream flipped to the fallback (or _DIRECT_STREAM is off). Both
+    expose the same duck surface (.stdout.read/.kill/.poll/.wait), so _reader and the reap
+    machinery are agnostic. `s.url` is an already-resolved DIRECT googlevideo URL (from
+    _proxied / _reresolve), so no cookies / PO-token / extractor args belong on either path.
+
+    Child path: mirrors the EXACT 6-header set the retired _fetch proved on-device 2026-09-03
+    (a bare request 403s at byte 0, empty body = bot-check) plus --socket-timeout so a stalled
+    fetch dies into the resume path. preexec_fn makes the kernel SIGKILL the child if the
+    worker dies. With _RANGE_RESTART=True `at` is s.edge on a resume; the frozen yt-dlp
+    forwards the Range header (verified), so streamed content offset == at (pwrite offset
+    stays correct). (D8, D10)"""
+    if _DIRECT_STREAM and not s.use_binary:
+        try:
+            _plog("spawn direct itag=%s at=%d" % (s.itag, at))
+            return _DirectFetch(s.url, s.ua, at, s.total)
+        except Exception as ex:                # constructor is offline/lazy; belt-and-braces
+            s.use_binary = True
+            _plog("direct-fetch init failed (%r) -> binary child" % ex)
+    _plog("spawn child itag=%s at=%d" % (s.itag, at))
     argv = [_ytdlp_path(), *_COMMON_ARGS, "--no-playlist",
             "--socket-timeout", "30",
             # googlevideo paces a single open-ended GET down to ~playback bitrate; --http-chunk-size
@@ -623,6 +762,13 @@ def _reader(s, gen):
             with s.cond:
                 s.edge_ts = time.time()   # B4: recovery in progress — don't let the stall watchdog abort re-resolve
             _reap_proc(proc)                                 # off-lock reap of the exited child
+            if isinstance(proc, _DirectFetch) and nproc == 0:
+                # The direct fetch produced NOTHING (403/expired/blocked at byte 0). Flip this
+                # stream to the binary child before the resume respawn — the fallback doctrine:
+                # worst case becomes exactly the pre-direct behaviour. (The re-resolve below may
+                # also hand the next spawn a fresh URL; the child gets first go at it.)
+                s.use_binary = True
+                _plog("direct-fetch dead at byte 0 (itag=%s) -> binary child" % s.itag)
             if s.cursor > s.cursor_at_last_death:            # R9: credit REAL playback advance (cursor
                 tries = 0                                    #     survives a False resume's edge=0),
             s.cursor_at_last_death = s.cursor                #     cap only genuinely stuck streams
@@ -996,9 +1142,8 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def _ensure_proxy():
     """Start the localhost proxy once; return its port. Also prepares the stream cache
     (<data_dir>/streamcache), sweeps any temp files a prior hard crash left, starts the idle reaper,
-    and registers an atexit sweep so no yt-dlp child or temp file is ever orphaned. The _force_ipv4()
-    call is retired — the proxy no longer does urllib googlevideo fetches; yt-dlp carries -4 itself
-    (the function stays for its 9 other callers)."""
+    and registers an atexit sweep so no yt-dlp child or temp file is ever orphaned. IPv4 pinning:
+    _DirectFetch calls _force_ipv4() itself (the in-process equivalent of the child's -4)."""
     global _proxy_port, _STREAM_DIR
     with _proxy_lock:
         if _proxy_port:

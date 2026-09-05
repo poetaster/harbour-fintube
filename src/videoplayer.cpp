@@ -5,6 +5,7 @@
 #include <QMetaObject>
 #include <QMatrix4x4>
 #include <QDebug>
+#include <QHash>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
 
@@ -841,7 +842,22 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
     case GST_MESSAGE_BUFFERING: {
         gint percent = 0;
         gst_message_parse_buffering(msg, &percent);
-        YLOG << "[youfish] buffering" << percent << "% (from" << src << ")";
+        // Rate-limited: queue2 emits a message per percent step, so an unfiltered log drowns
+        // in ~30 staircase lines per start. Log only what carries information — the endpoints
+        // (0 = stalled/starting, 100 = playable) and >=25-point swings — keyed per source
+        // element (queue2-N names are process-unique; bus watch runs on the main loop, so the
+        // static is single-threaded). A genuine rebuffer (100 -> … -> 0 -> … -> 100) still
+        // logs its edges; the per-percent chatter does not.
+        static QHash<QString, int> lastLogged;
+        const QString key = QString::fromUtf8(src);
+        const int last = lastLogged.value(key, -1);
+        if (percent != last && (percent == 0 || percent == 100 || last < 0
+                                || qAbs(percent - last) >= 25)) {
+            YLOG << "[youfish] buffering" << percent << "% (from" << src << ")";
+            if (lastLogged.size() > 64)     // bound the map over a very long session
+                lastLogged.clear();
+            lastLogged.insert(key, percent);
+        }
         break;
     }
     // Routine per-stream chatter (tags, stream-status, latency, clock/segment resets, …) fires

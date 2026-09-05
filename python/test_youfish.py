@@ -2012,6 +2012,139 @@ class ReresolveAnonFirst(unittest.TestCase):
                                                                  # the token fallback was NOT spawned
 
 
+class _FakeHttpResp:
+    """Minimal urllib-response stand-in: .status/.getcode(), .headers (dict), .read(n), .close()."""
+    def __init__(self, code, data, headers=None):
+        self.status = code
+        self._data = data
+        self._off = 0
+        self.headers = dict(headers or {})
+
+    def getcode(self):
+        return self.status
+
+    def read(self, n):
+        b = self._data[self._off:self._off + n]
+        self._off += len(b)
+        return b
+
+    def close(self):
+        pass
+
+
+class DirectFetchStreamer(unittest.TestCase):
+    """_DirectFetch: the in-process stand-in for the yt-dlp streaming child. Chunked Range
+    delivery (the burst-window behaviour), clean-EOF vs error semantics (both read as b"", like
+    a child pipe closing), truncation self-heal, the kill() duck surface, and _spawn's
+    direct-vs-binary chooser + byte-0 fallback flip."""
+
+    DATA = bytes(range(25)) * 1                     # 25 known bytes
+
+    def setUp(self):
+        self._urlopen = youfish.urllib.request.urlopen
+        self._chunk = youfish._DIRECT_CHUNK
+        self._ipv4 = youfish._force_ipv4
+        youfish._force_ipv4 = lambda: None          # leave the test process's resolver alone
+        youfish._DIRECT_CHUNK = 10
+        self.ranges = []                            # every Range header the fetcher sent
+
+    def tearDown(self):
+        youfish.urllib.request.urlopen = self._urlopen
+        youfish._DIRECT_CHUNK = self._chunk
+        youfish._force_ipv4 = self._ipv4
+
+    def _serve(self, data, truncate_first=0):
+        """Fake urlopen honouring bounded ranges over `data`; optionally truncate the first
+        response after N bytes (server closed early) to exercise the reopen path."""
+        state = {"first": True}
+
+        def fake(req, timeout=None):
+            rng = req.headers.get("Range", "")
+            m = __import__("re").match(r"bytes=(\d+)-(\d+)", rng)
+            a, b = int(m.group(1)), int(m.group(2))
+            self.ranges.append((a, b))
+            if a >= len(data):
+                raise urllib.error.HTTPError(req.full_url, 416, "range", {}, None)
+            body = data[a:b + 1]
+            if state["first"] and truncate_first:
+                state["first"] = False
+                body = body[:truncate_first]
+            return _FakeHttpResp(206, body,
+                                 {"Content-Range": "bytes %d-%d/%d" % (a, min(b, len(data) - 1),
+                                                                       len(data))})
+        youfish.urllib.request.urlopen = fake
+
+    @staticmethod
+    def _drain(f, n=7):
+        out = b""
+        while True:
+            b = f.read(n)
+            if not b:
+                return out
+            out += b
+
+    def test_chunked_ranges_full_delivery_clean_eof(self):
+        self._serve(self.DATA)
+        f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 0, len(self.DATA))
+        self.assertEqual(self._drain(f), self.DATA)
+        self.assertEqual(self.ranges, [(0, 9), (10, 19), (20, 24)])   # bounded chunks, clamped end
+        self.assertEqual(f.poll(), 0)                                 # clean EOF, not an error
+
+    def test_resume_at_offset(self):
+        self._serve(self.DATA)
+        f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 12, len(self.DATA))
+        self.assertEqual(self._drain(f), self.DATA[12:])
+        self.assertEqual(self.ranges[0][0], 12)                       # first chunk starts AT the offset
+
+    def test_unknown_total_learned_and_416_ends_clean(self):
+        self._serve(self.DATA)
+        f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 0, None)
+        self.assertEqual(self._drain(f), self.DATA)                   # total learned from Content-Range
+        self.assertEqual(f.poll(), 0)
+
+    def test_error_at_byte0_reads_as_pipe_death(self):
+        def fake(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, None)
+        youfish.urllib.request.urlopen = fake
+        f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 0, 100)
+        self.assertEqual(f.read(7), b"")                              # like the child dying at byte 0
+        self.assertEqual(f.poll(), 1)                                 # error, not clean EOF
+
+    def test_midchunk_truncation_self_heals(self):
+        self._serve(self.DATA, truncate_first=4)                      # server closes after 4 bytes
+        f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 0, len(self.DATA))
+        self.assertEqual(self._drain(f), self.DATA)                   # no byte lost, no byte doubled
+        self.assertIn((4, 13), self.ranges)                           # reopened FROM the truncation point
+
+    def test_kill_finalises_and_unblocks(self):
+        self._serve(self.DATA)
+        f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 0, len(self.DATA))
+        self.assertTrue(f.read(7))
+        f.kill()
+        self.assertEqual(f.read(7), b"")
+        self.assertEqual(f.poll(), 0)
+        f.wait(timeout=5)                                             # duck surface for _reap_proc
+
+    def test_spawn_prefers_direct_and_honours_flip(self):
+        self._serve(self.DATA)
+        s = types.SimpleNamespace(url="https://r.googlevideo.com/vp", ua="UA", total=25,
+                                  itag="136", use_binary=False)
+        self.assertIsInstance(youfish._spawn(s, 0), youfish._DirectFetch)
+        argvs = []
+        saved_popen, saved_path = youfish.subprocess.Popen, youfish._ytdlp_path
+        youfish.subprocess.Popen = lambda argv, **kw: argvs.append(argv) or types.SimpleNamespace(
+            stdout=None, kill=lambda: None, poll=lambda: 0, wait=lambda **k: 0)
+        youfish._ytdlp_path = lambda: "/bin/yt-dlp"
+        try:
+            s.use_binary = True                                       # the byte-0 flip happened
+            youfish._spawn(s, 5)
+        finally:
+            youfish.subprocess.Popen, youfish._ytdlp_path = saved_popen, saved_path
+        self.assertEqual(len(argvs), 1)                               # binary child took over
+        self.assertIn("--http-chunk-size", argvs[0])
+        self.assertIn("Range: bytes=5-", " ".join(argvs[0]))          # resume offset forwarded
+
+
 class PotBindLocalhost(unittest.TestCase):
     """_pot_bind_localhost against the exact bgutil 1.3.2 source shape: BOTH hardcoded bind
     hosts move to 127.0.0.1, and the hardcoded success-log address strings are corrected too
