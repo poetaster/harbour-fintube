@@ -14,6 +14,14 @@ Item {
     property bool updating: false
     property bool installing: false      // downloading yt-dlp into the app data dir
     property real installPct: -1
+    // Fast resolve (experimental): run yt-dlp IN-PROCESS (imported zipapp) for the token-free hot
+    // path instead of respawning the frozen binary each resolve. Opt-in; binary stays the fallback.
+    property bool fastResolve: false         // the setting is ON
+    property bool fastResolveInstalled: false// the importable yt-dlp zipapp is present
+    property string fastResolveVersion: ""   // installed zipapp version
+    property bool fastResolveInstalling: false
+    property real fastResolvePct: -1
+    property string fastResolveStatusMsg: ""
     property bool ffmpegReady: false     // ffmpeg present (bundled/system) → HD merged downloads
     property string ffmpegVersion: ""
     property bool ffmpegInstalling: false
@@ -159,6 +167,7 @@ Item {
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
             backend.defaultQuality = s.default_quality || "720"
             backend.hwDecode = !!s.hw_decode
+            backend.fastResolve = !!s.fast_resolve
             backend.keepDisplayOn = !!s.keep_display_on
             backend.backgroundAudio = (s.background_audio === undefined) ? true : !!s.background_audio
             backend.eqEnabled = !!s.eq_enabled
@@ -617,6 +626,30 @@ Item {
         py.call("youfish.install_deno", [], function() {})
     }
 
+    // --- Fast resolve (experimental): in-process yt-dlp. Status + install + on/off ---
+    function loadFastResolveStatus() {
+        py.call("youfish.fast_resolve_status", [], function(s) {
+            if (!s) return
+            backend.fastResolve = !!s.enabled
+            backend.fastResolveInstalled = !!s.installed
+            backend.fastResolveVersion = s.version || ""
+        })
+    }
+    // Fetch the small importable yt-dlp zipapp into our bin/. Progress/result arrive as
+    // pyotherside events (see onReceived), mirroring installYtdlp.
+    function installFastResolve() {
+        if (backend.fastResolveInstalling) return
+        backend.fastResolveInstalling = true
+        backend.fastResolvePct = 0
+        backend.fastResolveStatusMsg = "Downloading the importable yt-dlp…"
+        py.call("youfish.install_ytdlp_zipapp", [], function() {})
+    }
+    function setFastResolve(on) {
+        py.call("youfish.set_setting", ["fast_resolve", !!on], function(s) {
+            if (s) backend.fastResolve = !!s.fast_resolve
+        })
+    }
+
     // --- PO-token provider (bgutil): opt-in setup + on/off, all driven from Python ---
     function loadPotStatus() {
         py.call("youfish.pot_status", [], function(s) {
@@ -691,6 +724,7 @@ Item {
                 backend.loadPlaylists()
                 backend.loadWatchState()
                 backend.loadPotStatus()
+                backend.loadFastResolveStatus()
                 py.call("youfish.prewarm", [], function() {})  // POT server up before first play
             })
         }
@@ -712,6 +746,16 @@ Item {
                     backend.ready = true
                 }
                 backend.updateFinished(!!data[1], data[2])
+            }
+            else if (data[0] === "ytdlp_zipapp_progress")
+                backend.fastResolvePct = data[1]
+            else if (data[0] === "ytdlp_zipapp_done") {
+                backend.fastResolveInstalling = false
+                backend.fastResolvePct = -1
+                backend.fastResolveStatusMsg = data[2]
+                if (data[3] && data[3].length > 0)
+                    backend.fastResolveVersion = data[3]
+                backend.loadFastResolveStatus()   // refresh installed/version from disk truth
             }
             else if (data[0] === "ffmpeg_install_progress")
                 backend.ffmpegPct = data[1]

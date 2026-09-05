@@ -112,6 +112,25 @@ class VideoCandidates(unittest.TestCase):
         self.assertEqual(youfish._pick_video(fmts, 240)["height"], 1080)     # cap below all -> best
 
 
+class VideoManifestTiebreak(unittest.TestCase):
+    def setUp(self):
+        self._gs = youfish.get_settings
+        youfish.get_settings = lambda: {"hw_decode": False}
+
+    def tearDown(self):
+        youfish.get_settings = self._gs
+
+    def test_prefers_direct_over_manifest(self):
+        # tv_embedded exposes an HLS/manifest AND a direct DASH format at every resolution; the direct
+        # one must win the tie (no manifest round-trip; the app's proven range-seekable proxy path).
+        # Manifest listed FIRST, as in real responses — so only the tiebreak keeps it from winning.
+        hls = {"format_id": "614", "height": 1080, "vcodec": "vp09", "acodec": "none", "fps": 30,
+               "url": "https://manifest.googlevideo.com/api/manifest/hls/x",
+               "protocol": "m3u8_native", "http_headers": {"User-Agent": "UA"}}
+        dash = vf("248", 1080, "vp09", url="https://rr1---sn.googlevideo.com/x")
+        self.assertEqual(youfish._video_candidates([hls, dash])[0]["format_id"], "248")
+
+
 class AudioCandidates(unittest.TestCase):
     def test_ladder_prefers_opus_then_bitrate(self):
         # The ranking is opus-family-first (best on-device playback), each family then ordered by
@@ -133,9 +152,34 @@ class AudioCandidates(unittest.TestCase):
                 af("140-0", 128, "mp4a.40.2", lang_pref=10)]   # source, lower bitrate
         self.assertEqual(youfish._pick_audio(fmts)["format_id"], "140-0")
 
+    def test_original_beats_same_codec_drc(self):
+        # web_embedded exposes a DRC ("stable volume") variant beside the original; same language +
+        # codec + bitrate, so only the DRC tie-break separates them — the ORIGINAL must win.
+        fmts = [af("251-drc", 120, "opus", lang_pref=10),   # loudness-normalized
+                af("251-7", 120, "opus", lang_pref=10)]     # original dynamics
+        self.assertEqual(youfish._pick_audio(fmts)["format_id"], "251-7")
+
+    def test_drc_used_when_only_option(self):
+        # If DRC is all that's offered, it's still picked (no regression to "no audio").
+        fmts = [af("251-drc", 120, "opus", lang_pref=10)]
+        self.assertEqual(youfish._pick_audio(fmts)["format_id"], "251-drc")
+
+    def test_opus_drc_kept_over_nondrc_aac(self):
+        # The DRC penalty sits AFTER codec: we never trade the opus push-seek win for a non-DRC AAC.
+        fmts = [af("251-drc", 120, "opus", lang_pref=10),        # opus, DRC
+                af("140-7", 128, "mp4a.40.2", lang_pref=10)]     # aac, original
+        self.assertEqual(youfish._pick_audio(fmts)["format_id"], "251-drc")
+
     def test_excludes_video_only_and_empty(self):
         self.assertEqual(youfish._audio_candidates([vf("137", 1080, "avc1")]), [])
         self.assertIsNone(youfish._pick_audio([vf("137", 1080, "avc1")]))
+
+    def test_prefers_direct_over_manifest(self):
+        # Same language/codec/bitrate → the manifest (m3u8) audio must lose to the direct URL.
+        m = af("233", 160, "opus", lang_pref=10, url="https://manifest.googlevideo.com/a")
+        m["protocol"] = "m3u8_native"
+        d = af("251", 160, "opus", lang_pref=10, url="https://rr1---sn.googlevideo.com/a")
+        self.assertEqual(youfish._audio_candidates([m, d])[0]["format_id"], "251")
 
 
 class AudioLangName(unittest.TestCase):
@@ -1613,6 +1657,286 @@ class Related(unittest.TestCase):
         youfish.subprocess.run = lambda *a, **k: types.SimpleNamespace(
             returncode=0, stdout="{}", stderr="")
         self.assertFalse(youfish.related("")["ok"])
+
+
+# --- fast resolve (in-process yt-dlp) --------------------------------------------------------- #
+
+class ExtractorArgParse(unittest.TestCase):
+    """_parse_extractor_args turns the yt-dlp argv fragment into YoutubeDL's extractor_args dict."""
+    def test_empty(self):
+        self.assertEqual(youfish._parse_extractor_args([]), {})
+
+    def test_single_client(self):
+        self.assertEqual(
+            youfish._parse_extractor_args(["--extractor-args", "youtube:player_client=tv_embedded"]),
+            {"youtube": {"player_client": ["tv_embedded"]}})
+
+    def test_multi_client_and_fetch_pot(self):
+        self.assertEqual(
+            youfish._parse_extractor_args(
+                ["--extractor-args", "youtube:player_client=tv,mweb;fetch_pot=always"]),
+            {"youtube": {"player_client": ["tv", "mweb"], "fetch_pot": ["always"]}})
+
+    def test_bare_key_and_missing_value_dont_crash(self):
+        self.assertEqual(youfish._parse_extractor_args(["--extractor-args", "youtube:flag"]),
+                         {"youtube": {"flag": []}})
+        self.assertEqual(youfish._parse_extractor_args(["--extractor-args"]), {})   # value absent
+
+
+class ZipappVersion(unittest.TestCase):
+    """_zipapp_version reads yt_dlp/version.py's __version__ WITHOUT importing the zipapp (importing
+    would pin the whole process to one yt_dlp version)."""
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="zipapp-")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_reads_version_from_zip(self):
+        import zipfile
+        p = os.path.join(self._tmp, "yt-dlp.zip")
+        with zipfile.ZipFile(p, "w") as z:
+            z.writestr("yt_dlp/__init__.py", "")
+            z.writestr("yt_dlp/version.py", "__version__ = '2026.08.19'\n")
+        self.assertEqual(youfish._zipapp_version(p), "2026.08.19")
+
+    def test_non_zip_returns_blank(self):
+        p = os.path.join(self._tmp, "junk")
+        with open(p, "wb") as f:
+            f.write(b"not a zip")
+        self.assertEqual(youfish._zipapp_version(p), "")
+
+
+class FastResolveStatusAndGate(unittest.TestCase):
+    def setUp(self):
+        self._gs, self._zp, self._imp = (youfish.get_settings, youfish._ytdlp_zipapp_path,
+                                         youfish._import_yt_dlp)
+        self._tmp = tempfile.mkdtemp(prefix="frs-")
+
+    def tearDown(self):
+        (youfish.get_settings, youfish._ytdlp_zipapp_path,
+         youfish._import_yt_dlp) = self._gs, self._zp, self._imp
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_status_not_installed(self):
+        youfish.get_settings = lambda: {"fast_resolve": False}
+        youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")
+        st = youfish.fast_resolve_status()
+        self.assertEqual((st["enabled"], st["installed"], st["version"]), (False, False, ""))
+
+    def test_status_installed_reports_version(self):
+        import zipfile
+        p = os.path.join(self._tmp, "yt-dlp.zip")
+        with zipfile.ZipFile(p, "w") as z:
+            z.writestr("yt_dlp/__init__.py", "")
+            z.writestr("yt_dlp/version.py", "__version__ = '2026.08.19'\n")
+        youfish.get_settings = lambda: {"fast_resolve": True}
+        youfish._ytdlp_zipapp_path = lambda: p
+        st = youfish.fast_resolve_status()
+        self.assertEqual((st["enabled"], st["installed"], st["version"]), (True, True, "2026.08.19"))
+
+    def test_ready_false_when_off_never_imports(self):
+        called = [0]
+        youfish.get_settings = lambda: {"fast_resolve": False}
+        youfish._import_yt_dlp = lambda: (called.__setitem__(0, called[0] + 1) or object())
+        self.assertFalse(youfish._fast_resolve_ready())
+        self.assertEqual(called[0], 0)          # opted out short-circuits: no import attempt
+
+    def test_ready_false_when_import_unavailable(self):
+        youfish.get_settings = lambda: {"fast_resolve": True}
+        youfish._import_yt_dlp = lambda: None
+        self.assertFalse(youfish._fast_resolve_ready())
+
+    def test_ready_true_when_on_and_importable(self):
+        youfish.get_settings = lambda: {"fast_resolve": True}
+        youfish._import_yt_dlp = lambda: object()
+        self.assertTrue(youfish._fast_resolve_ready())
+
+
+class _FakeJar:
+    def clear(self):
+        self.cleared = True
+
+    def load(self, path):
+        self.loaded = path
+
+
+class _FakeYDL:
+    """Stand-in YoutubeDL: records params + extract calls, returns canned info (or raises)."""
+    instances = []
+    raise_on_extract = False
+    formats = []
+
+    def __init__(self, params):
+        self.params = dict(params)
+        self.cookiejar = _FakeJar()
+        self.extract_calls = []
+        _FakeYDL.instances.append(self)
+
+    def extract_info(self, url, download=False):
+        self.extract_calls.append((url, download, dict(self.params.get("extractor_args") or {})))
+        if _FakeYDL.raise_on_extract:
+            raise RuntimeError("boom")
+        return {"title": "T", "formats": list(_FakeYDL.formats), "duration": 100,
+                "_internal": "strip-me"}
+
+    def sanitize_info(self, info):
+        info = dict(info)
+        info.pop("_internal", None)          # the real sanitize_info strips yt-dlp internals
+        return info
+
+
+class FastResolveRouting(unittest.TestCase):
+    """resolve() runs the token-free hot dump IN-PROCESS when fast_resolve is on + importable, and
+    falls back to the binary on any in-process failure or for the token (fetch_pot) path."""
+    def setUp(self):
+        self._saved = {}
+        for name in ("_ytdlp_path", "_ensure_pot_server", "_pot_ytdlp_args", "_yt_extractor_args",
+                     "_proxied", "get_settings", "_import_yt_dlp", "_pot_active"):
+            self._saved[name] = getattr(youfish, name)
+        self._run = youfish.subprocess.run
+        self._tls = youfish._inproc_tls
+
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish._ensure_pot_server = lambda: True
+        youfish._pot_ytdlp_args = lambda: []
+        youfish._pot_active = lambda: False          # no probe / token path in the common case
+        youfish._proxied = lambda url, *a, **k: url
+        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False,
+                                        "fast_resolve": True}
+        youfish._import_yt_dlp = lambda: types.SimpleNamespace(YoutubeDL=_FakeYDL)
+        youfish._inproc_tls = youfish.threading.local()   # fresh warm-instance store per test
+        youfish.invalidate_resolve_cache()
+
+        _FakeYDL.instances = []
+        _FakeYDL.raise_on_extract = False
+        _FakeYDL.formats = [vf("137", 1080, "avc1"), af("251", 160, "opus", lang_pref=10)]
+
+        self.binary_calls = []
+
+        def fake_run(cmd, **kw):
+            self.binary_calls.append(cmd)
+            data = {"title": "BIN", "duration": 100,
+                    "formats": [vf("137", 1080, "avc1"), af("251", 160, "opus", lang_pref=10)]}
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+        youfish.subprocess.run = fake_run
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(youfish, name, fn)
+        youfish.subprocess.run = self._run
+        youfish._inproc_tls = self._tls
+
+    def test_token_free_dump_runs_in_process(self):
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: (
+            ["--extractor-args", "youtube:player_client=mweb;fetch_pot=always"] if want_pot else
+            ["--extractor-args", "youtube:player_client=tv_embedded"])
+        res = youfish.resolve("vid")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["info"]["title"], "T")            # from the in-process fake, not "BIN"
+        self.assertEqual(res["info"]["video_itag"], "137")
+        self.assertEqual(res["info"]["audio_itag"], "251")
+        self.assertEqual(self.binary_calls, [])                # binary NEVER spawned
+        self.assertEqual(len(_FakeYDL.instances), 1)           # one warm instance built
+        ydl = _FakeYDL.instances[0]
+        self.assertEqual(ydl.params.get("source_address"), "0.0.0.0")          # == -4 (force IPv4)
+        self.assertEqual(ydl.extract_calls[0][2], {"youtube": {"player_client": ["tv_embedded"]}})
+
+    def test_warm_instance_reused_across_resolves(self):
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+            ["--extractor-args", "youtube:player_client=tv_embedded"]
+        youfish.resolve("vidA")
+        youfish.resolve("vidB")
+        self.assertEqual(len(_FakeYDL.instances), 1)           # same warm YoutubeDL, not rebuilt
+        self.assertEqual(len(_FakeYDL.instances[0].extract_calls), 2)
+
+    def test_inproc_failure_falls_back_to_binary(self):
+        _FakeYDL.raise_on_extract = True
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+            ["--extractor-args", "youtube:player_client=tv_embedded"]
+        res = youfish.resolve("vid")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["info"]["title"], "BIN")          # binary served it
+        self.assertTrue(self.binary_calls)                     # fallback actually ran
+
+    def test_token_path_never_runs_in_process(self):
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+            ["--extractor-args", "youtube:player_client=mweb;fetch_pot=always"]
+        res = youfish.resolve("vid")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["info"]["title"], "BIN")
+        self.assertEqual(_FakeYDL.instances, [])               # in-process path skipped entirely
+
+    def test_disabled_setting_uses_binary(self):
+        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False,
+                                        "fast_resolve": False}
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
+        res = youfish.resolve("vid")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(res["info"]["title"], "BIN")
+        self.assertEqual(_FakeYDL.instances, [])
+
+
+class AnonymousPrimary(unittest.TestCase):
+    """The token-free PRIMARY dump resolves WITHOUT cookies (anonymous) — YouTube gates authenticated
+    token-free requests but not anonymous ones. Only the fallback re-runs WITH cookies (restricted
+    content). Exercised on the binary path (fast_resolve off)."""
+    def setUp(self):
+        self._saved = {}
+        for name in ("_ytdlp_path", "_ensure_pot_server", "_pot_ytdlp_args", "_yt_extractor_args",
+                     "_proxied", "get_settings", "_cookies_args", "_pot_active"):
+            self._saved[name] = getattr(youfish, name)
+        self._run = youfish.subprocess.run
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish._ensure_pot_server = lambda: True
+        youfish._pot_ytdlp_args = lambda: []
+        youfish._pot_active = lambda: False
+        youfish._proxied = lambda url, *a, **k: url
+        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}   # fast off → binary
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def _ck():
+            yield ["--cookies", "CKFILE"]
+        youfish._cookies_args = _ck
+        # primary (want_pot=False) → tv_embedded; fallback (want_pot=True) → the wider retry set
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+            ["--extractor-args", "youtube:player_client=" + (client_override or "tv_embedded")]
+        youfish.invalidate_resolve_cache()
+        self.calls = []
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(youfish, n, f)
+        youfish.subprocess.run = self._run
+
+    def _full(self):
+        return {"title": "T", "duration": 100,
+                "formats": [vf("137", 1080, "avc1"), af("251", 160, "opus", lang_pref=10)]}
+
+    def test_public_primary_is_anonymous(self):
+        def run(cmd, **kw):
+            self.calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(self._full()), stderr="")
+        youfish.subprocess.run = run
+        res = youfish.resolve("vid")
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(len(self.calls), 1)                  # public → one dump, no fallback
+        self.assertNotIn("--cookies", self.calls[0])          # PRIMARY carries no cookies
+
+    def test_restricted_falls_back_with_cookies(self):
+        def run(cmd, **kw):
+            self.calls.append(cmd)
+            if "tv_embedded" in " ".join(cmd):                # the anonymous primary FAILS (restricted)
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="Sign in to confirm")
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(self._full()), stderr="")
+        youfish.subprocess.run = run
+        res = youfish.resolve("vid")
+        self.assertTrue(res.get("ok"), res)
+        self.assertGreaterEqual(len(self.calls), 2)
+        self.assertNotIn("--cookies", self.calls[0])          # primary anonymous
+        self.assertIn("--cookies", self.calls[1])             # fallback re-runs WITH cookies
 
 
 if __name__ == "__main__":

@@ -121,6 +121,10 @@ Page {
                         } else {
                             page.ytdlpStatus = "Updating yt-dlp…"
                             app.backend.updateYtdlp()
+                            // Keep the in-process zipapp in lockstep with the binary so a YouTube
+                            // breakage fix reaches the fast path too (else it silently stays stale).
+                            if (app.backend.fastResolveInstalled)
+                                app.backend.installFastResolve()
                         }
                     }
                 }
@@ -176,6 +180,46 @@ Page {
                     if (v !== app.backend.playerClient)
                         app.backend.setSetting("player_client", v)
                 }
+            }
+
+            // Experimental: run yt-dlp IN-PROCESS for the token-free hot path — no ~1.3s binary
+            // respawn per resolve, and the player-JS / n-sig caches stay warm. First enable fetches
+            // a small importable yt-dlp; the binary above stays the default AND the fallback.
+            TextSwitch {
+                visible: app.backend.ready
+                text: "Fast resolve (experimental)"
+                description: app.backend.fastResolveInstalling
+                    ? ("Downloading the importable yt-dlp… "
+                       + Math.round(app.backend.fastResolvePct) + "%")
+                    : (app.backend.fastResolveInstalled
+                       ? ("Runs yt-dlp in-process (no per-resolve respawn) using the imported yt-dlp "
+                          + app.backend.fastResolveVersion
+                          + ". Any error falls back to the binary above.")
+                       : "Downloads a small importable yt-dlp, then runs it in-process for faster "
+                         + "resolves. The binary stays the fallback.")
+                automaticCheck: false
+                checked: app.backend.fastResolve
+                enabled: !app.backend.fastResolveInstalling
+                onClicked: {
+                    if (app.backend.fastResolve) {
+                        app.backend.setFastResolve(false)
+                    } else if (app.backend.fastResolveInstalled) {
+                        app.backend.setFastResolve(true)
+                    } else {
+                        app.backend.installFastResolve()   // fetch the zipapp…
+                        app.backend.setFastResolve(true)   // …and switch on (activates once it lands)
+                    }
+                }
+            }
+
+            Label {
+                visible: app.backend.fastResolveStatusMsg.length > 0
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                text: app.backend.fastResolveStatusMsg
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
             }
 
             SectionHeader { text: "ffmpeg" }

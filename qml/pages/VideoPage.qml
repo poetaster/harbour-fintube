@@ -337,6 +337,24 @@ Page {
         onEnded: if (page.holdsPlayer) { page.markFinished(); page.playNextInQueue() }
     }
 
+    // While the current queued video plays, warm the NEXT one's resolve in the background so
+    // autoplay/next is instant instead of paying a cold (~5s, device-CPU-bound) yt-dlp resolve at
+    // end-of-video. Fired ~4s after this video resolves (see onResolved) — past its own preroll — so
+    // it doesn't compete for the CPU while playback is starting. Speculative: deduped + concurrency-
+    // capped in the engine (prefetch_resolve), a no-op if already cached/in-flight, and the fresh URL
+    // is cached with a googlevideo-expiry deadline so it's still valid when the video actually ends.
+    Timer {
+        id: nextPrefetchTimer
+        interval: 4000
+        onTriggered: {
+            if (!page.fromQueue || !page.holdsPlayer || !app.playQueue)
+                return
+            var ni = app.playQueueIndex + 1
+            if (ni < app.playQueue.length && app.playQueue[ni] && app.playQueue[ni].id)
+                app.backend.prefetchResolve(app.playQueue[ni].id)
+        }
+    }
+
     // A googlevideo stream can 403 mid-playback (session throttle) faster than the proxy's
     // in-place URL refresh can recover — the failure that makes a manual swipe-out-and-reload
     // fix it. Do that automatically: re-resolve for fresh URLs and reload, resuming where we
@@ -657,6 +675,8 @@ Page {
             // no dark flash, no audio/video rate split.
             gplayer.rate = page.playbackRate
             page.populateMetadata(info)
+            if (page.fromQueue)          // warm the next queued video's resolve shortly (see the Timer)
+                nextPrefetchTimer.restart()
             if (info.video_url && info.video_url.length > 0
                     && info.audio_url && info.audio_url.length > 0) {
                 page.useGst = true
