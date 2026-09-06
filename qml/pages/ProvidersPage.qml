@@ -253,9 +253,10 @@ Page {
                       ? ("Downloading ffmpeg… " + Math.round(app.backend.ffmpegPct) + "%")
                       : (app.backend.ffmpegReady
                          ? ("Installed — " + app.backend.ffmpegVersion)
-                         : "Optional. Lets downloads merge separate HD video + audio into one "
-                           + "file; without it, video downloads fall back to 360p. Tap Download "
-                           + "to fetch a static build into the app's folder.")
+                         : "Needed for video downloads — YouTube removed the combined formats, "
+                           + "so video is always fetched as separate tracks and merged by "
+                           + "ffmpeg. Audio downloads work without it. Tap Download to fetch a "
+                           + "static build into the app's folder.")
                 color: app.backend.ffmpegReady ? Theme.secondaryHighlightColor : Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -348,12 +349,16 @@ Page {
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
+            // Visible when Deno is missing, OR when the APP-MANAGED copy is in use — that copy
+            // has no other updater (the button hid forever once any Deno existed, so a managed
+            // Deno stayed at its install-day version for life). A system/user Deno stays theirs.
             Button {
                 visible: !app.backend.potDeno || app.backend.denoInstalling
+                         || app.backend.potDenoManaged
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.backend.denoInstalling
                       ? ("Downloading Deno… " + Math.round(app.backend.denoPct) + "%")
-                      : "Download Deno"
+                      : (app.backend.potDeno ? "Update Deno" : "Download Deno")
                 enabled: !app.backend.denoInstalling
                 onClicked: app.backend.installDeno()
             }

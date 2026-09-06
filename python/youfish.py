@@ -2086,6 +2086,11 @@ def ffmpeg_version():
 # Static aarch64 build (self-contained; John Van Sickle's release is the de-facto arm64 source).
 # It's a .tar.xz carrying ffmpeg + ffprobe under a versioned dir; a companion .md5 lets us verify
 # the archive before unpacking. (MD5 is weak, but the transfer is HTTPS + cert-verified.)
+# NOTE (2026-09): the JVS arm64 build has been FROZEN since Aug 2024 (Last-Modified checked
+# live) — fine for us (ffmpeg only muxes here, and the pinned SHA below stays valid), but it is
+# a single point of failure. If the site ever dies, BtbN/FFmpeg-Builds on GitHub publishes
+# linuxarm64 static builds with per-asset sums (the same trust model as the yt-dlp and Deno
+# installers): switching means re-pointing these URLs and re-pinning _FFMPEG_SHA256.
 _FFMPEG_URL = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
 _FFMPEG_MD5_URL = _FFMPEG_URL + ".md5"
 
@@ -2623,6 +2628,53 @@ def _pot_server_log_tail(n=30):
         return ""
 
 
+def _pot_plugin_probe(timeout=30):
+    """Does the installed yt-dlp actually RESOLVE our bgutil plugin directory? The clone keeps
+    server+plugin in lockstep, but the plugin must ALSO be loadable by whatever yt-dlp binary is
+    installed — and when it isn't, everything else looks healthy (server up, /ping answering)
+    while every gated video quietly runs token-less. One OFFLINE binary run answers it:
+    `--simulate` on a dummy scheme fails before any network, and the verbose debug header is
+    where yt-dlp reports plugin-dir resolution — the exact line that caught the 2026-09-02
+    'Plugin directories: none' incident. (NB `--version` short-circuits BEFORE plugin loading
+    and prints none of this.) Costs one spawn (~1.3s on-device); diagnostics-only.
+
+    Returns {checked, loaded, detail, js_runtimes, bgutil_lines}:
+      loaded  True  → a 'Plugin directories' line names our repo (the historical failure mode
+                      is ruled out);
+              False → the line exists WITHOUT our repo (e.g. 'none') — yt-dlp runs unplugged;
+              None  → no such line (very old yt-dlp / probe inconclusive) — no false alarms.
+      js_runtimes   yt-dlp's own '[debug] JS runtimes' view — names Deno when reachable for the
+                    n-sig solver, 'none' when EJS would fall back to the slow built-in.
+      bgutil_lines  any output mentioning bgutil — a plugin that RESOLVES but fails to import
+                    surfaces its warning/traceback here, which dir resolution alone can't see."""
+    path = _ytdlp_path()
+    if not path or not _pot_installed():
+        return {"checked": False, "loaded": None, "detail": "",
+                "js_runtimes": "", "bgutil_lines": ""}
+    try:
+        proc = subprocess.run(
+            [path, "--no-plugin-dirs", "--plugin-dirs", _pot_plugin_dir(),
+             "-v", "--simulate", "--", "youfish-probe:"],
+            capture_output=True, text=True, timeout=timeout)
+        out = (proc.stderr or "") + "\n" + (proc.stdout or "")
+    except Exception as ex:
+        return {"checked": False, "loaded": None, "detail": "probe failed: %s" % ex,
+                "js_runtimes": "", "bgutil_lines": ""}
+    lines = [ln.strip() for ln in out.splitlines()]
+    dir_line = next((ln for ln in lines if "Plugin directories" in ln), "")
+    js_line = next((ln for ln in lines if "JS runtimes" in ln), "")
+    # The repo PATH itself contains "bgutil", so exclude the lines that merely echo it (the
+    # argv dump and the dir line) — what's left is genuine plugin chatter (warnings/tracebacks).
+    bgutil = "\n".join(ln for ln in lines
+                       if "bgutil" in ln.lower()
+                       and ln != dir_line and "Command-line config" not in ln)
+    return {"checked": True,
+            "loaded": (_pot_repo_dir() in dir_line) if dir_line else None,
+            "detail": dir_line,
+            "js_runtimes": js_line.split(":", 1)[-1].strip() if js_line else "",
+            "bgutil_lines": bgutil}
+
+
 def _set_pdeathsig():
     """Ask the kernel to SIGKILL the Deno child if FinTube dies, so the sidecar can never be
     left orphaned (Linux PR_SET_PDEATHSIG = 1). Best-effort; runs in the forked child."""
@@ -2789,6 +2841,9 @@ def pot_status():
         "default_tag": _POT_TAG,
         "updated": bool((get_settings().get("pot_tag") or "").strip()),
         "last_error": _pot_last_error,
+        # True when the Deno in use is the APP-MANAGED copy — the one that has no other
+        # updater, so the UI offers "Update Deno" for it (a system/user Deno is theirs).
+        "deno_managed": bool(deno) and deno == _managed_deno(),
     }
 
 
@@ -2819,6 +2874,11 @@ def pot_diagnostics():
     ffmpeg = _ffmpeg_path()
     running = _pot_ready_on_port()
     ping = _pot_http_ping() if running else {"ok": False, "version": ""}
+    # The axis nothing else checks: does THIS yt-dlp binary actually load our plugin? A healthy
+    # server + an unloaded plugin still means token-less gated videos. One offline spawn.
+    probe = (_pot_plugin_probe() if (installed and ytdlp)
+             else {"checked": False, "loaded": None, "detail": "",
+                   "js_runtimes": "", "bgutil_lines": ""})
 
     L = []
     L.append("FinTube / FinTune — PO-token provider diagnostics")
@@ -2850,7 +2910,22 @@ def pot_diagnostics():
     L.append("answering HTTP     : " + ("yes" + (" (server v" + ping["version"] + ")"
                                                  if ping["version"] else "")
                                         if ping["ok"] else "no"))
-    verdict = ("working" if (enabled and ping["ok"])
+    if probe["checked"]:
+        if probe["loaded"] is True:
+            L.append("plugin in yt-dlp   : loads (" + probe["detail"] + ")")
+        elif probe["loaded"] is False:
+            L.append("plugin in yt-dlp   : NOT LOADED — " + (probe["detail"] or "not resolved")
+                     + " — yt-dlp runs WITHOUT the token plugin; reinstall the provider or "
+                       "update yt-dlp")
+        else:
+            L.append("plugin in yt-dlp   : undetermined ("
+                     + (probe["detail"] or "no plugin report from this yt-dlp") + ")")
+        L.append("yt-dlp JS runtime  : " + (probe["js_runtimes"] or "(not reported)"))
+        if probe["bgutil_lines"]:
+            L.append("bgutil mentions    : " + probe["bgutil_lines"][:300])
+    # A confirmed-unloaded plugin overrides "working": the server answering is irrelevant if
+    # yt-dlp never calls it.
+    verdict = ("working" if (enabled and ping["ok"] and probe["loaded"] is not False)
                else "NOT working" if enabled else "installed but switched off" if installed
                else "not set up")
     L.append("verdict            : " + verdict)
@@ -2870,6 +2945,7 @@ def pot_diagnostics():
         "deno": bool(deno), "git": bool(git), "ytdlp": bool(ytdlp), "ffmpeg": bool(ffmpeg),
         "installed": installed, "enabled": enabled,
         "running": running, "responding": bool(ping["ok"]),
+        "plugin_loaded": probe["loaded"], "js_runtimes": probe["js_runtimes"],
         "prev_exit": prev_code,
         "last_error": _pot_last_error,
     }
@@ -5652,8 +5728,11 @@ def comments(video_id, limit=20, with_replies=True):
 
 
 # --------------------------------------------------------------------------- #
-# Downloads: audio (140 → .m4a), or video — merged best HD video+audio (→ .mkv) when ffmpeg is
-# installed, else muxed progressive (22/18 → .mp4).
+# Downloads: audio (140 → .m4a; needs no ffmpeg), or video — best HD video+audio merged via
+# ffmpeg (→ .mkv). Video REQUIRES ffmpeg since 2026: YouTube removed the muxed progressive
+# formats (22/18 — verified live 2026-09-06, `-f 22/18` errors), so there is no single-file
+# fallback left; without ffmpeg a video download is refused with a clear message instead of
+# failing on yt-dlp's cryptic "Requested format is not available".
 # yt-dlp runs in a background thread; progress + completion go to QML via
 # pyotherside.send events. Metadata is tracked in downloads.json.
 # --------------------------------------------------------------------------- #
@@ -5741,15 +5820,23 @@ def _save_downloads(lst):
 
 
 def download(video_id, title, kind):
-    """Kick off a background download. kind = "audio" (m4a) | "video". Video merges the best HD
-    video+audio via ffmpeg when it's installed (→ .mkv); without ffmpeg it falls back to a muxed
-    progressive stream (<=360p, → .mp4)."""
+    """Kick off a background download. kind = "audio" (m4a, no ffmpeg needed) | "video" (best
+    HD video+audio merged via ffmpeg → .mkv). Video downloads REFUSE with a clear message when
+    ffmpeg is missing — the old <=360p muxed fallback died with YouTube's progressive formats."""
     import pyotherside
     kind = "audio" if kind == "audio" else "video"
     merge = []
     if kind == "audio":
         fmt, ext = "140", "m4a"
-    elif _ffmpeg_dir():
+    elif not _ffmpeg_dir():
+        # No single-file fallback exists any more (see the section comment above), so running
+        # yt-dlp anyway just burns a spawn to produce a cryptic error. Refuse up front with a
+        # message that says WHAT to do; the UI surfaces it through the normal done event.
+        pyotherside.send("download_done", video_id, kind, False,
+                         "Video downloads need ffmpeg (YouTube removed the combined formats). "
+                         "Install it from Providers — audio downloads work without it.")
+        return {"ok": False, "error": "ffmpeg required for video downloads"}
+    else:
         # ffmpeg present → merge best separate video+audio. Cap by the Default-quality setting;
         # exclude AV1 (no hardware decoder on the target). mkv holds any codec combo (VP9/opus or
         # H.264/m4a) cleanly, and GStreamer plays it back fine.
@@ -5762,8 +5849,6 @@ def download(video_id, title, kind):
         # *something* to download rather than erroring out with "no format".
         fmt = "bestvideo%s[vcodec!*=av01]+bestaudio/22/18/best" % h
         ext, merge = "mkv", ["--merge-output-format", "mkv"]
-    else:
-        fmt, ext = "22/18", "mp4"
     binp = _ytdlp_path()
     if not binp:
         pyotherside.send("download_done", video_id, kind, False, "yt-dlp not found")

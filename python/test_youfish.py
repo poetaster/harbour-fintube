@@ -2145,6 +2145,134 @@ class DirectFetchStreamer(unittest.TestCase):
         self.assertIn("Range: bytes=5-", " ".join(argvs[0]))          # resume offset forwarded
 
 
+class DownloadNeedsFfmpeg(unittest.TestCase):
+    """Video downloads REFUSE with a clear message when ffmpeg is missing — the old <=360p
+    muxed fallback (-f 22/18) died with YouTube's progressive formats (verified live
+    2026-09-06), so running yt-dlp anyway only produced a cryptic error."""
+
+    def setUp(self):
+        self.events = []
+        self._had_pyo = "pyotherside" in sys.modules
+        if not self._had_pyo:
+            sys.modules["pyotherside"] = types.SimpleNamespace(
+                send=lambda *a: self.events.append(a))
+        else:
+            self._old_send = sys.modules["pyotherside"].send
+            sys.modules["pyotherside"].send = lambda *a: self.events.append(a)
+        self._saved = dict(ff=youfish._ffmpeg_dir, path=youfish._ytdlp_path)
+        youfish._ffmpeg_dir = lambda: None
+        youfish._ytdlp_path = lambda: "/bin/yt-dlp"
+
+    def tearDown(self):
+        youfish._ffmpeg_dir = self._saved["ff"]
+        youfish._ytdlp_path = self._saved["path"]
+        if not self._had_pyo:
+            sys.modules.pop("pyotherside", None)
+        else:
+            sys.modules["pyotherside"].send = self._old_send
+
+    def test_video_without_ffmpeg_refused_with_reason(self):
+        res = youfish.download("vid123", "Title", "video")
+        self.assertFalse(res.get("ok"))
+        self.assertEqual(len(self.events), 1)
+        ev = self.events[0]
+        self.assertEqual(ev[0], "download_done")
+        self.assertFalse(ev[3])                         # ok = False
+        self.assertIn("ffmpeg", ev[4])                  # the message says WHAT is missing
+        self.assertIn("Providers", ev[4])               # ...and WHERE to fix it
+
+
+class PotPluginProbe(unittest.TestCase):
+    """_pot_plugin_probe: one offline verbose run tells whether the installed yt-dlp resolves
+    the bgutil plugin dir (the 2026-09-02 'Plugin directories: none' incident detector), plus
+    yt-dlp's own JS-runtime view."""
+
+    HEADER_OK = ("[debug] Command-line config: [...]\n"
+                 "[debug] yt-dlp version stable@2026.08.19\n"
+                 "[debug] JS runtimes: deno 2026.1\n"
+                 "[debug] Plugin directories: /repo/plugin/yt_dlp_plugins\n"
+                 "[debug] Loaded 1744 extractors\n")
+    HEADER_NONE = ("[debug] yt-dlp version stable@2026.08.19\n"
+                   "[debug] JS runtimes: none\n"
+                   "[debug] Plugin directories: none\n")
+    HEADER_OLD = "[debug] yt-dlp version stable@2023.01.01\n"
+
+    def setUp(self):
+        self._saved = dict(path=youfish._ytdlp_path, run=youfish.subprocess.run,
+                           inst=youfish._pot_installed, pd=youfish._pot_plugin_dir,
+                           rd=youfish._pot_repo_dir)
+        youfish._ytdlp_path = lambda: "/bin/yt-dlp"
+        youfish._pot_installed = lambda: True
+        youfish._pot_plugin_dir = lambda: "/repo"
+        youfish._pot_repo_dir = lambda: "/repo"
+        self.argv = None
+
+    def tearDown(self):
+        youfish._ytdlp_path = self._saved["path"]
+        youfish.subprocess.run = self._saved["run"]
+        youfish._pot_installed = self._saved["inst"]
+        youfish._pot_plugin_dir = self._saved["pd"]
+        youfish._pot_repo_dir = self._saved["rd"]
+
+    def _with_header(self, header):
+        def run(cmd, **kw):
+            self.argv = cmd
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=header)
+        youfish.subprocess.run = run
+        return youfish._pot_plugin_probe()
+
+    def test_resolved_dir_reads_loaded(self):
+        p = self._with_header(self.HEADER_OK)
+        self.assertTrue(p["checked"])
+        self.assertIs(p["loaded"], True)
+        self.assertEqual(p["js_runtimes"], "deno 2026.1")
+        self.assertIn("--no-plugin-dirs", self.argv)     # only OUR dir is probed
+        self.assertIn("--simulate", self.argv)           # offline — fails before any network
+        self.assertIn("-v", self.argv)                   # the header only prints verbose
+
+    def test_none_reads_not_loaded(self):
+        p = self._with_header(self.HEADER_NONE)
+        self.assertIs(p["loaded"], False)                # the incident shape
+        self.assertEqual(p["js_runtimes"], "none")
+
+    def test_missing_line_is_undetermined_not_alarm(self):
+        p = self._with_header(self.HEADER_OLD)
+        self.assertIsNone(p["loaded"])
+
+    def test_not_installed_skips(self):
+        youfish._pot_installed = lambda: False
+        self.assertFalse(youfish._pot_plugin_probe()["checked"])
+
+
+class PotStatusDenoManaged(unittest.TestCase):
+    """pot_status flags whether the Deno in use is the APP-MANAGED copy — the one with no other
+    updater, which the UI offers an 'Update Deno' button for."""
+
+    def setUp(self):
+        self._saved = dict(dp=youfish._deno_path, md=youfish._managed_deno,
+                           port=youfish._pot_ready_on_port, inst=youfish._pot_installed,
+                           gs=youfish.get_settings)
+        youfish._pot_ready_on_port = lambda timeout=0.25: False
+        youfish._pot_installed = lambda: False
+        youfish.get_settings = lambda: {}
+
+    def tearDown(self):
+        youfish._deno_path = self._saved["dp"]
+        youfish._managed_deno = self._saved["md"]
+        youfish._pot_ready_on_port = self._saved["port"]
+        youfish._pot_installed = self._saved["inst"]
+        youfish.get_settings = self._saved["gs"]
+
+    def test_managed_and_system_deno(self):
+        youfish._managed_deno = lambda: "/data/bin/deno"
+        youfish._deno_path = lambda: "/data/bin/deno"
+        self.assertTrue(youfish.pot_status()["deno_managed"])
+        youfish._deno_path = lambda: "/usr/bin/deno"
+        self.assertFalse(youfish.pot_status()["deno_managed"])
+        youfish._deno_path = lambda: None
+        self.assertFalse(youfish.pot_status()["deno_managed"])
+
+
 class ChannelAwareDownloads(unittest.TestCase):
     """Direct downloads (binary install, zipapp, SHA2-256SUMS) must follow the user's update
     channel — a nightly BINARY beside a stable ZIPAPP means the in-process fast path silently

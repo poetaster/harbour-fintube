@@ -67,6 +67,7 @@ Item {
     property string potServerVersion: "" // version the running provider reports (from its /ping)
     property string potLastError: ""     // why the provider last failed to start / respond (diagnostics)
     property string potDenoPath: ""      // where Deno was found ("" = not found)
+    property bool potDenoManaged: false  // the found Deno is the app-managed copy (we update it)
 
     // Download folder — where completed downloads are written. downloadDir is the configured value
     // ("" = the app's own folder); downloadDirEffective is the absolute path actually in use.
@@ -658,6 +659,7 @@ Item {
             backend.potEnabled = !!s.enabled
             backend.potDeno = !!s.deno
             backend.potDenoPath = s.deno_path || ""
+            backend.potDenoManaged = !!s.deno_managed
             backend.potRunning = !!s.running
             backend.potResponding = !!s.responding
             backend.potServerVersion = s.server_version || ""
