@@ -8,6 +8,12 @@ import Sailfish.Silica 1.0
 Item {
     id: root
 
+    // One knob over the three overlay buttons (play/pause, gear, fullscreen). 1.5 after user
+    // feedback that the drawn glyphs — especially fullscreen — were too small to hit reliably
+    // (issue #4); everything else (bar height, label centering, menu placement) anchors to the
+    // buttons and follows automatically.
+    property real controlScale: 1.3
+
     property int positionMs: 0
     property int durationMs: 0
     property bool isPlaying: false
@@ -105,7 +111,7 @@ Item {
     Rectangle {
         id: playDisc
         anchors.centerIn: parent
-        width: Theme.itemSizeMedium
+        width: Math.round(Theme.itemSizeMedium * root.controlScale)
         height: width
         radius: width / 2
         color: '#00000000'
@@ -165,7 +171,7 @@ Item {
         Canvas {
             id: gearGlyph
             anchors.centerIn: parent
-            width: Theme.iconSizeSmall * 0.72
+            width: Theme.iconSizeSmall * 0.72 * root.controlScale
             height: width
             property bool lit: root.playbackMenuOpen
             onLitChanged: requestPaint()
@@ -255,7 +261,7 @@ Item {
         // dependence on a theme icon that may not exist.
         Item {
             id: fsButton
-            width: Theme.iconSizeSmall
+            width: Math.round(Theme.iconSizeSmall * root.controlScale)
             height: width
             anchors {
                 right: parent.right; rightMargin: Theme.horizontalPageMargin

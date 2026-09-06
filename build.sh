@@ -5,7 +5,7 @@
 # Override the SDK target with:  TARGET=SailfishOS-x.y.z-aarch64 sh build.sh
 set -e
 
-TARGET="${TARGET:-SailfishOS-5.1.0.11-aarch64.default}"
+TARGET="${TARGET:-SailfishOS-5.0.0.62-aarch64.default}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$SRC.build"
 
