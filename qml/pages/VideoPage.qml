@@ -1187,8 +1187,9 @@ Page {
                 // Load-on-approach: warm comments the first time the user actually scrolls the info
                 // panel down toward them. The comments section is the LAST thing in the column, so
                 // nearing the bottom (belowFold < one screen) = nearing comments. A one-shot watch
-                // that never scrolls here never fires the ~8s walk — the waste that made a
-                // video-start prefetch a bad trade. contentY > 0 gates out the at-open case where a
+                // that never scrolls here never fires the walk (a few seconds even post-2026-09
+                // lean profile) — the waste that made a video-start prefetch a bad trade.
+                // contentY > 0 gates out the at-open case where a
                 // short panel already shows the header with nothing to scroll (tap it to load);
                 // loadComments() is idempotent, so a repeated trigger while it's in flight is a no-op.
                 if (contentY > 0 && !page.commentsLoading
@@ -1609,6 +1610,21 @@ Page {
                     }
                     onClicked: page.commentsShown =
                         Math.min(page.commentsShown + 5, page.comments.length)
+                }
+
+                // End of the fetched pool: when everything we walked is on screen but the video
+                // has (far) more, say so instead of just... stopping. One walk per video is the
+                // deliberate budget — honesty beats an ever-deeper continuation crawl.
+                Label {
+                    x: Theme.horizontalPageMargin
+                    width: parent.width - 2 * Theme.horizontalPageMargin
+                    visible: page.commentsLoaded && page.comments.length > 0
+                             && page.commentsShown >= page.comments.length
+                             && page.commentsTotal > page.comments.length
+                    text: "Showing the top " + page.comments.length + " of "
+                          + page.fmtCount(page.commentsTotal) + " comments"
+                    font.pixelSize: Theme.fontSizeExtraSmall
+                    color: Theme.secondaryColor
                 }
             }
         }

@@ -1466,6 +1466,18 @@ class CommentsThreads(unittest.TestCase):
         self.assertIn("max_comments=50,50,0,0", self._xargs())
         self.assertNotIn("player_client=android", self._xargs())   # comments need the web client
 
+    def test_lean_profile_skips_player_and_manifests(self):
+        """The walk doesn't need player JS / n-sig (a Deno spawn!) or HLS/DASH manifests —
+        skipping them was measured safe (identical comments) and saves seconds on-device."""
+        self._mock({"comments": []})
+        youfish.comments("vid")
+        on = self._xargs()
+        self.assertIn("player_skip=js,configs", on)
+        self.assertIn("skip=hls,dash", on)
+        cmd = self.captured["cmd"]
+        self.assertIn("--ignore-no-formats-error", cmd)   # formats-less extraction must not error
+        self.assertIn("--write-comments", cmd)
+
     def test_error_return(self):
         def fail(cmd, **kw):
             return types.SimpleNamespace(returncode=1, stdout="", stderr="nope")
@@ -2271,6 +2283,85 @@ class PotStatusDenoManaged(unittest.TestCase):
         self.assertFalse(youfish.pot_status()["deno_managed"])
         youfish._deno_path = lambda: None
         self.assertFalse(youfish.pot_status()["deno_managed"])
+
+
+class InprocComments(unittest.TestCase):
+    """_inproc_comments: the warm-YoutubeDL comment walk. THE invariant: the per-call params
+    (getcomments / ignore_no_formats_error) are restored afterwards — a leaked getcomments=True
+    would make every later resolve on the thread silently pay a full comment walk."""
+
+    class _StubYdl:
+        def __init__(self, result=None, raise_=None, params=None):
+            self.params = dict(params or {})
+            self._result = result
+            self._raise = raise_
+            self.seen_params = None
+
+        def extract_info(self, url, download=False):
+            self.seen_params = dict(self.params)     # what was in effect DURING the walk
+            if self._raise:
+                raise self._raise
+            return self._result
+
+        def sanitize_info(self, info):
+            return info
+
+    def setUp(self):
+        self._saved = dict(imp=youfish._import_yt_dlp, ydl=youfish._inproc_ydl,
+                           ck=youfish._inproc_apply_cookies)
+        youfish._import_yt_dlp = lambda: object()
+        youfish._inproc_apply_cookies = lambda ydl, anon=False: None
+
+    def tearDown(self):
+        youfish._import_yt_dlp = self._saved["imp"]
+        youfish._inproc_ydl = self._saved["ydl"]
+        youfish._inproc_apply_cookies = self._saved["ck"]
+
+    def test_params_set_during_walk_and_restored_after(self):
+        stub = self._StubYdl(result={"comments": [{"id": "a", "parent": "root", "text": "t"}]})
+        youfish._inproc_ydl = lambda mod: stub
+        data = youfish._inproc_comments("https://u", ["--extractor-args", "youtube:comment_sort=top"])
+        self.assertEqual(len(data["comments"]), 1)
+        self.assertTrue(stub.seen_params["getcomments"])              # ON during the walk
+        self.assertTrue(stub.seen_params["ignore_no_formats_error"])
+        self.assertNotIn("getcomments", stub.params)                  # gone afterwards
+        self.assertNotIn("ignore_no_formats_error", stub.params)
+
+    def test_preexisting_values_restored_not_deleted(self):
+        stub = self._StubYdl(result={}, params={"getcomments": False})
+        youfish._inproc_ydl = lambda mod: stub
+        youfish._inproc_comments("https://u", [])
+        self.assertIs(stub.params["getcomments"], False)              # restored, not popped
+
+    def test_restored_even_when_extraction_raises(self):
+        stub = self._StubYdl(raise_=RuntimeError("boom"))
+        youfish._inproc_ydl = lambda mod: stub
+        with self.assertRaises(RuntimeError):
+            youfish._inproc_comments("https://u", [])
+        self.assertNotIn("getcomments", stub.params)                  # finally ran
+
+    def test_comments_falls_back_to_binary_on_inproc_failure(self):
+        saved = dict(ready=youfish._fast_resolve_ready, inp=youfish._inproc_comments,
+                     path=youfish._ytdlp_path, run=youfish.subprocess.run)
+        youfish._fast_resolve_ready = lambda: True
+        youfish._inproc_comments = lambda url, extra: (_ for _ in ()).throw(RuntimeError("x"))
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"comments": [{"id": "a", "parent": "root", "text": "t"}]}), stderr="")
+        youfish.subprocess.run = fake_run
+        try:
+            res = youfish.comments("vid")
+        finally:
+            youfish._fast_resolve_ready = saved["ready"]
+            youfish._inproc_comments = saved["inp"]
+            youfish._ytdlp_path = saved["path"]
+            youfish.subprocess.run = saved["run"]
+        self.assertTrue(res["ok"], res)                               # binary rescued the walk
+        self.assertEqual(len(calls), 1)
 
 
 class ChannelAwareDownloads(unittest.TestCase):

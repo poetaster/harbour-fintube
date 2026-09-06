@@ -2036,6 +2036,33 @@ def _inproc_dump(url, extra, anon=False):
     return ydl.sanitize_info(info)
 
 
+def _inproc_comments(url, extra):
+    """Comment walk on the warm per-thread YoutubeDL (fast-resolve opt-in): no binary spawn
+    tax, and the continuation walk reuses the warm TLS session. Follows the SIGNED-IN view
+    like the binary path (cookies applied, not anon). The two per-call params are set and
+    RESTORED in a finally — a leaked getcomments=True would make every later resolve on this
+    thread silently pay a full comment walk, the one leak this warm-instance design must never
+    allow. Raises on any failure — the caller falls back to the binary."""
+    mod = _import_yt_dlp()
+    if mod is None:
+        raise RuntimeError("yt-dlp zipapp not importable")
+    ydl = _inproc_ydl(mod)
+    ydl.params["extractor_args"] = _parse_extractor_args(extra)
+    _inproc_apply_cookies(ydl)
+    had = {k: ydl.params.get(k) for k in ("getcomments", "ignore_no_formats_error")}
+    ydl.params["getcomments"] = True
+    ydl.params["ignore_no_formats_error"] = True
+    try:
+        info = ydl.extract_info(url, download=False)
+        return ydl.sanitize_info(info)
+    finally:
+        for k, v in had.items():
+            if v is None:
+                ydl.params.pop(k, None)
+            else:
+                ydl.params[k] = v
+
+
 # --------------------------------------------------------------------------- #
 # ffmpeg: optional, app-managed. yt-dlp needs it to MERGE separate HD video+audio
 # tracks into one file; without it, video downloads fall back to muxed 360p (itag
@@ -5649,9 +5676,18 @@ def comments(video_id, limit=20, with_replies=True):
 
     Comment extraction walks YouTube's continuation tokens, so it's slow — this is called
     on demand (tap to load), never as part of resolve(). Replies add more walking, capped by
-    _REPLY_BUDGET / _REPLIES_PER_THREAD (or off entirely via with_replies=False). The UI
+    _REPLY_BUDGET / _REPLIES_PER_THREAD (or off entirely via with_replies=False); NB the reply
+    walk costs ~one round-trip PER THREAD regardless of the per-thread cap (YouTube pages
+    replies per continuation), so the budgets bound the payload, not the latency. The UI
     reveals the batch a few at a time as the user scrolls, and reveals each thread's replies
     on tap.
+
+    Speed (measured 2026-09-06): the dump is run LEAN — player_skip=js,configs and
+    skip=hls,dash spare the player JS + n-sig solve (a Deno spawn!) and the manifest fetches,
+    none of which comments need; --ignore-no-formats-error keeps a formats-less extraction
+    from erroring. Comments come from the watch page's initial data + /next continuations,
+    verified unaffected. With fast-resolve on, the walk also runs IN-PROCESS on the warm
+    YoutubeDL (no spawn tax, warm TLS); any failure falls back to the binary as usual.
     """
     path = _ytdlp_path()
     if not path:
@@ -5664,24 +5700,37 @@ def comments(video_id, limit=20, with_replies=True):
     except (TypeError, ValueError):
         n = 50
     # max_comments = total, max-parents, max-replies (global), max-replies-per-thread.
+    # The trailing LEAN profile skips everything a comment walk doesn't need (see docstring).
+    _lean = ";player_skip=js,configs;skip=hls,dash,translated_subs"
     if with_replies:
         xargs = ("youtube:max_comments=%d,%d,%d,%d;comment_sort=top"
-                 % (n + _REPLY_BUDGET, n, _REPLY_BUDGET, _REPLIES_PER_THREAD))
+                 % (n + _REPLY_BUDGET, n, _REPLY_BUDGET, _REPLIES_PER_THREAD)) + _lean
     else:
-        xargs = "youtube:max_comments=%d,%d,0,0;comment_sort=top" % (n, n)
+        xargs = "youtube:max_comments=%d,%d,0,0;comment_sort=top" % (n, n) + _lean
     # NB: comments MUST use yt-dlp's default (web) client — unlike video_info. player_client=android
     # was MEASURED on-device to return NO comments (the mobile player response carries no comment
     # continuation), so forcing it just burns a whole extraction before falling back to web. Don't
     # reintroduce it; the web client's continuation walk is the only path that yields comments.
     try:
-        with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--skip-download", "--write-comments",
-                 "--extractor-args", xargs, "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=180)
-        if proc.returncode != 0:
-            return {"ok": False, "error": (proc.stderr.strip()[:300] or "comments failed")}
-        data = json.loads(proc.stdout)
+        data = None
+        if _fast_resolve_ready():          # warm in-process walk first; binary on ANY failure
+            try:
+                _tc = time.time()
+                data = _inproc_comments(url, ["--extractor-args", xargs])
+                _tlog("comments(inproc) %.2fs" % (time.time() - _tc))
+            except Exception as ex:
+                _tlog("comments(inproc) failed → binary: %s" % str(ex)[:120])
+                data = None
+        if data is None:
+            with _cookies_args() as cargs:
+                proc = subprocess.run(
+                    [path, *_COMMON_ARGS, *cargs, "--skip-download", "--write-comments",
+                     "--ignore-no-formats-error",
+                     "--extractor-args", xargs, "--dump-single-json", "--", url],
+                    capture_output=True, text=True, timeout=180)
+            if proc.returncode != 0:
+                return {"ok": False, "error": (proc.stderr.strip()[:300] or "comments failed")}
+            data = json.loads(proc.stdout)
         raw = data.get("comments") or []
 
         def _fmt(c):

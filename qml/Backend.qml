@@ -448,10 +448,11 @@ Item {
         })
     }
 
-    // Comments (slow — walks YouTube continuations). ONE call now fetches the top comments WITH their
-    // replies (the old parents-then-reply-top-up walked YouTube TWICE). Prefetched during playback and
-    // cached by id; a page load that arrives while the prefetch is still in flight JOINS it rather than
-    // firing a duplicate ~15s walk (the fetch is slow enough that the race is the norm, not the edge).
+    // Comments (walks YouTube continuations — a few seconds even after the 2026-09 lean profile
+    // + in-process walk cut it from ~7-10s). ONE call fetches the top comments WITH their replies
+    // (the old parents-then-reply-top-up walked YouTube TWICE). Prefetched during playback and
+    // cached by id; a page load that arrives while the prefetch is still in flight JOINS it
+    // rather than firing a duplicate walk (the race is still the norm, not the edge).
     property var _commentsCache: ({})     // videoId -> result (completed)
     property var _commentsPending: ({})   // videoId -> [callbacks] awaiting an in-flight fetch
 
