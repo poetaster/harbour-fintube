@@ -29,7 +29,7 @@ jobs:
       run: mkdir output
 
     - name: Build  ${{ matrix.arch }}
-      id: build_${{ matrix.arch }}
+      id: ${{ matrix.arch }}
       uses: coderus/github-sfos-build@sfos5
       with: 
         release: ${{ matrix.rel }}
