@@ -7,33 +7,25 @@ on:
 env:
   RELEASE: 5.0.0.43
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rel: [5.0.0.43, 5.1.0.11]
-        arch: [armv7hl, aarch64]
-        include:
-          - arch: armv7hl
-            libarch: armv7
-          - arch: aarch64
-            libarch: arm64
 
     steps:
     - uses: actions/checkout@v4
-      with:
-        submodules: recursive
 
     - name: Prepare
       run: mkdir output
 
-    - name: Build  ${{ matrix.arch }}
-      id: build
+    - name: Build aarch64
+      id: build_aarch64
       uses: coderus/github-sfos-build@sfos5
-      with: 
-        release: ${{ matrix.rel }}
-        arch: ${{ matrix.arch }}
+      with:
+        release: ${{ env.RELEASE }}
+        arch: aarch64
 
     - name: Extract Version Name
       id: extract_name
@@ -42,16 +34,6 @@ jobs:
         result-encoding: string
         script: |
           return context.payload.ref.replace(/refs\/tags\//, '');
-
-    - name: Rename arm files
-      if: matrix.rel == '5.0.0.43' && matrix.arch == 'armv7hl'
-      run: |
-        mv RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.armv7hl.rpm RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.${{matrix.rel}}.${{matrix.arch}}.rpm
-
-    - name: rename aarch files
-      if: matrix.rel == '5.0.0.43' && matrix.arch == 'aarch64'
-      run: |
-        mv RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.aarch64.rpm RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.${{matrix.rel}}.${{matrix.arch}}.rpm
 
     - name: Create a Release
       uses: softprops/action-gh-release@v1
