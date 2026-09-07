@@ -75,6 +75,8 @@ void VideoPlayer::setVideoUrl(const QString &url)
     if (m_videoUrl == url)
         return;
     m_videoUrl = url;
+    m_seekRebuilt = false;   // genuinely new content → fresh one-rebuild allowance (the
+                             // recovery rebuild reuses the SAME url, so it keeps the flag)
     emit videoUrlChanged();
 }
 
@@ -83,6 +85,7 @@ void VideoPlayer::setAudioUrl(const QString &url)
     if (m_audioUrl == url)
         return;
     m_audioUrl = url;
+    m_seekRebuilt = false;   // see setVideoUrl — dub switches count as new content too
     emit audioUrlChanged();
 }
 
@@ -981,6 +984,14 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
                 emit player->positionChanged();
                 YLOG << "[youfish] audio-align -> video landed" << landed << "ms (requested"
                      << req << "ms) audio seek:" << alignOk;
+                if (!alignOk) {
+                    // Audio refused the align (e.g. mid-flush) → the branches are split at
+                    // kf vs old position. Hand it to the existing recovery: the retry
+                    // re-sends BOTH at the landed spot (the video's re-seek to its own
+                    // keyframe is a harmless no-op-shaped jump).
+                    player->m_seekRetryMs = landed;
+                    player->m_seekRetryTimer->start();
+                }
             } else if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, 1.0)) {
                 player->m_rateEngaged = true;
                 gint64 pos = 0;

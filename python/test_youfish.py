@@ -1815,6 +1815,26 @@ class ZipappAutofetch(unittest.TestCase):
         youfish._autofetch_zipapp()      # second prewarm nudge in the same process
         self.assertEqual(len(self.calls), 1)
 
+    def test_installer_refuses_when_python_too_old(self):
+        # Engine-side belt for the QML gate: a too-old python must never even download the
+        # zipapp (rides can race the async status load). Emits an honest done(False) event.
+        import types as _t
+        prev = sys.modules.get("pyotherside")
+        events = []
+        sys.modules["pyotherside"] = _t.SimpleNamespace(
+            send=lambda *a: events.append(a))
+        try:
+            youfish._FAST_RESOLVE_PY_OK = False
+            res = self._saved["inst"]()          # the REAL installer (setUp mocks the name)
+            self.assertEqual(res, {"ok": False})
+            self.assertTrue(events and events[0][0] == "ytdlp_zipapp_done"
+                            and events[0][1] is False)
+        finally:
+            if prev is not None:
+                sys.modules["pyotherside"] = prev
+            else:
+                sys.modules.pop("pyotherside", None)
+
     def test_skips_when_python_too_old(self):
         youfish._FAST_RESOLVE_PY_OK = False
         youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")

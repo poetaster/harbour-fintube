@@ -1773,6 +1773,14 @@ def install_ytdlp_zipapp():
     import pyotherside
     import zipfile
 
+    # Engine-side gate, mirroring the QML pythonOk checks: on a too-old OS python the zipapp
+    # can never run, so refuse the download outright. Covers the race where an install rides
+    # along before fast_resolve_status() has told the UI that python_ok is false.
+    if not _FAST_RESOLVE_PY_OK:
+        pyotherside.send("ytdlp_zipapp_done", False,
+                         "In-process yt-dlp needs OS Python 3.10+ — the binary is used instead.", "")
+        return {"ok": False}
+
     def run():
         tmp = None
         try:

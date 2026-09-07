@@ -706,6 +706,11 @@ Page {
                 } else {
                     page.useGst = true
                     gplayer.userAgent = info.http_ua
+                    // Clear the container hints: muxed mode seeks at pipeline level and must
+                    // not inherit a previous dual attempt's videoExt (a stale "mp4" would
+                    // wrongly give the single bin a downloadbuffer).
+                    gplayer.videoExt = ""
+                    gplayer.audioExt = ""
                     gplayer.audioUrl = ""
                     gplayer.videoUrl = info.muxed_url
                     gplayer.play()
