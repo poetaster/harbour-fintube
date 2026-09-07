@@ -37,7 +37,7 @@ jobs:
 
 
     - name: Rename arm files
-      if: ${{matrix.rel}} == '5.0.0.43' && ${{matrix.arch}} == 'armv7hl'
+      if: matrix.rel == '5.0.0.43' && matrix.arch == 'armv7hl'
       run: |
         mkdir -p RPMS
         find . -name "*.rpm" -exec cp {} RPMS/ \;
@@ -45,7 +45,7 @@ jobs:
         mv RPMS/*.rpm RPMS/*.rpm.${{matrix.rel}}${{matrix.arch}}.rpm
 
     - name: rename aarch files
-      if: ${{matrix.rel}} == '5.0.0.43' && ${{matrix.arch}} == 'aarch64'
+      if: matrix.rel == '5.0.0.43' && matrix.arch == 'aarch64'
       run: |
         mkdir -p RPMS
         find . -name "*.rpm" -exec cp {} RPMS/ \;
