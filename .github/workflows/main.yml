@@ -10,33 +10,30 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rel: [5.0.0.43, 5.1.0.11]
+        arch: [armv7hl, aarch64]
+        include:
+          - arch: armv7hl
+            libarch: armv7
+          - arch: aarch64
+            libarch: arm64
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        submodules: recursive
 
     - name: Prepare
       run: mkdir output
 
-    - name: Build aarch64
-      id: build_aarch64
+    - name: Build  ${{ matrix.arch }}
+      id: build_${{ matrix.arch }}
       uses: coderus/github-sfos-build@sfos5
-      with:
-        release: ${{ env.RELEASE }}
-        arch: aarch64
-      
-    - name: Build armv7hl
-      id: build_armv7hl
-      uses: coderus/github-sfos-build@sfos5
-      with:
-        release: ${{ env.RELEASE }}
-        arch: armv7hl
-
-    - name: Build i486
-      id: build_i486
-      uses: coderus/github-sfos-build@sfos5
-      with:
-        release: ${{ env.RELEASE }}
-        arch: i486
+      with: 
+        release: ${{ matrix.rel }}
+        arch: ${{ matrix.arch }}
 
     - name: Extract Version Name
       id: extract_name
