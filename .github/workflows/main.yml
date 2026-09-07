@@ -46,12 +46,16 @@ jobs:
     - name: Rename arm files
       if: matrix.rel == '5.0.0.43' && matrix.arch == 'armv7hl'
       run: |
-        mv /workspace/RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.armv7hl.rpm /workspace/RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.${{matrix.rel}}.${{matrix.arch}}.rpm
+        mv RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.armv7hl.rpm RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.${{matrix.rel}}.${{matrix.arch}}.rpm
+        mkdir -p /workspace/RPMS
+        cp -r RPMS/*.rpm /workspace/RPMS
 
     - name: rename aarch files
       if: matrix.rel == '5.0.0.43' && matrix.arch == 'aarch64'
       run: |
-        mv /workspace/RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.aarch64.rpm /workspace/RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.${{matrix.rel}}.${{matrix.arch}}.rpm
+        mv RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.aarch64.rpm RPMS/harbour-fintube-${{steps.extract_name.outputs.result}}-1.${{matrix.rel}}.${{matrix.arch}}.rpm
+        mkdir -p /workspace/RPMS
+        cp -r RPMS/*.rpm /workspace/RPMS
 
     - name: Create a Release
       uses: softprops/action-gh-release@v1
