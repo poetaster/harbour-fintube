@@ -35,6 +35,12 @@ jobs:
         release: ${{ matrix.rel }}
         arch: ${{ matrix.arch }}
 
+    - name: Upload RPM (${{ matrix.arch }})
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.rel }}-${{ matrix.arch }}
+        path: output
+
     - name: Extract Version Name
       id: extract_name
       uses: actions/github-script@v4
