@@ -186,6 +186,7 @@ Page {
         page.currentQuality = q.label
         var at = page.positionMs          // capture before stop() zeroes the position
         gplayer.stop()
+        gplayer.videoExt = q.ext || ""    // the new rung may change container (mp4 <-> webm)
         gplayer.videoUrl = q.video_url
         gplayer.play()
         gplayer.seekWhenReady(at)         // restored at preroll, once both branches are up
@@ -206,6 +207,7 @@ Page {
         app.backend.setAudioLang(a.lang || "")
         var at = page.positionMs          // capture before stop() zeroes the position
         gplayer.stop()
+        gplayer.audioExt = a.ext || ""    // a dub rung may change container (m4a <-> webm)
         gplayer.audioUrl = a.audio_url
         gplayer.play()
         gplayer.seekWhenReady(at)         // restored at preroll, once both branches are up
@@ -681,6 +683,10 @@ Page {
                     && info.audio_url && info.audio_url.length > 0) {
                 page.useGst = true
                 gplayer.userAgent = info.http_ua
+                // Containers before URLs: buildPipeline reads them to decide per-branch
+                // seekability (mp4/qtdemux branches need a downloadbuffer to seek at all).
+                gplayer.videoExt = info.video_ext || ""
+                gplayer.audioExt = info.audio_ext || ""
                 gplayer.audioUrl = info.audio_url
                 gplayer.videoUrl = info.video_url
                 gplayer.play()
@@ -778,8 +784,22 @@ Page {
     onPositionMsChanged: {
         if (page.playRetries > 0 && page.positionMs > page.recoverAtMs)
             page.playRetries = 0
-        page.checkSponsorSkip()
+        // Deferred, NOT called inline: the skip check SEEKS, and gplayer.seek() reflects the
+        // new position synchronously (so the scrubber doesn't snap back) — a seek issued from
+        // inside this change notification re-enters the positionMs binding and QML reports a
+        // binding loop (reproducible by spam-seeking into a sponsor segment). A zero-interval
+        // Timer restart runs it after the notification unwinds and coalesces bursts (it
+        // re-reads the live position when it fires, so nothing is skipped late). NOT
+        // Qt.callLater — that's Qt 5.8+, and SFOS ships Qt 5.6 (it threw a TypeError every
+        // position tick, killing sponsor skip entirely).
+        sponsorSkipDebounce.restart()
         page.updateCaption()
+    }
+
+    Timer {
+        id: sponsorSkipDebounce
+        interval: 0                       // next event-loop turn — Qt 5.6 stand-in for callLater
+        onTriggered: page.checkSponsorSkip()
     }
 
     Timer {

@@ -14,14 +14,16 @@ Item {
     property bool updating: false
     property bool installing: false      // downloading yt-dlp into the app data dir
     property real installPct: -1
-    // Fast resolve (experimental): run yt-dlp IN-PROCESS (imported zipapp) for the token-free hot
-    // path instead of respawning the frozen binary each resolve. Opt-in; binary stays the fallback.
-    property bool fastResolve: false         // the setting is ON
+    // Fast resolve: run yt-dlp IN-PROCESS (imported zipapp) for the token-free hot path instead
+    // of respawning the frozen binary each resolve. Not a setting — automatic wherever the
+    // device python can run it (see fastResolvePythonOk); the binary stays the fallback.
     property bool fastResolveInstalled: false// the importable yt-dlp zipapp is present
     property string fastResolveVersion: ""   // installed zipapp version
     property bool fastResolveInstalling: false
     property real fastResolvePct: -1
     property string fastResolveStatusMsg: ""
+    property bool fastResolvePythonOk: true  // device python new enough for the zipapp (>=3.10)
+    property string fastResolvePythonVersion: ""  // the device python, for the why-not text
     property bool ffmpegReady: false     // ffmpeg present (bundled/system) → HD merged downloads
     property string ffmpegVersion: ""
     property bool ffmpegInstalling: false
@@ -168,7 +170,6 @@ Item {
             backend.ytdlpChannel = s.ytdlp_channel || "stable"
             backend.defaultQuality = s.default_quality || "720"
             backend.hwDecode = !!s.hw_decode
-            backend.fastResolve = !!s.fast_resolve
             backend.keepDisplayOn = !!s.keep_display_on
             backend.backgroundAudio = (s.background_audio === undefined) ? true : !!s.background_audio
             backend.eqEnabled = !!s.eq_enabled
@@ -581,11 +582,15 @@ Item {
 
     // Download yt-dlp into the app data dir (the sandbox-reachable location). Progress +
     // completion arrive as pyotherside events (see onReceived), reusing updateFinished.
+    // The fast-resolve zipapp rides along on a capable device — it's a standard companion,
+    // not an option — so a fresh install comes up with the in-process path ready.
     function installYtdlp() {
         if (backend.installing) return
         backend.installing = true
         backend.installPct = 0
         py.call("youfish.install_ytdlp", [], function() {})
+        if (backend.fastResolvePythonOk && !backend.fastResolveInstalled)
+            installFastResolve()
     }
 
     // Self-update yt-dlp via its own `-U`. Can take a while (downloads the binary).
@@ -628,13 +633,14 @@ Item {
         py.call("youfish.install_deno", [], function() {})
     }
 
-    // --- Fast resolve (experimental): in-process yt-dlp. Status + install + on/off ---
+    // --- Fast resolve: in-process yt-dlp. Status + install (no on/off — it's automatic) ---
     function loadFastResolveStatus() {
         py.call("youfish.fast_resolve_status", [], function(s) {
             if (!s) return
-            backend.fastResolve = !!s.enabled
             backend.fastResolveInstalled = !!s.installed
             backend.fastResolveVersion = s.version || ""
+            backend.fastResolvePythonOk = (s.python_ok === undefined) ? true : !!s.python_ok
+            backend.fastResolvePythonVersion = s.python_version || ""
         })
     }
     // Fetch the small importable yt-dlp zipapp into our bin/. Progress/result arrive as
@@ -645,11 +651,6 @@ Item {
         backend.fastResolvePct = 0
         backend.fastResolveStatusMsg = "Downloading the importable yt-dlp…"
         py.call("youfish.install_ytdlp_zipapp", [], function() {})
-    }
-    function setFastResolve(on) {
-        py.call("youfish.set_setting", ["fast_resolve", !!on], function(s) {
-            if (s) backend.fastResolve = !!s.fast_resolve
-        })
     }
 
     // --- PO-token provider (bgutil): opt-in setup + on/off, all driven from Python ---

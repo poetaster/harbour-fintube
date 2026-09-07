@@ -14,6 +14,14 @@
 static const bool kYoufishDebug = qEnvironmentVariableIsSet("YOUFISH_DEBUG");
 #define YLOG if (kYoufishDebug) qDebug()
 
+// Is this stream ext ISO-BMFF, i.e. demuxed by qtdemux (which can't push-seek ACCURATE)?
+// Drives the per-branch seek flags (sendSeek) and the seek-plan log (buildPipeline).
+static bool extIsMp4(const QString &ext)
+{
+    return ext == QLatin1String("mp4") || ext == QLatin1String("m4a")
+        || ext == QLatin1String("mov") || ext == QLatin1String("m4v");
+}
+
 VideoPlayer::VideoPlayer(QQuickItem *parent)
     : QQuickPaintedItem(parent)
 {
@@ -21,6 +29,13 @@ VideoPlayer::VideoPlayer(QQuickItem *parent)
     m_posTimer = new QTimer(this);
     m_posTimer->setInterval(500);  // twice a second is smooth enough for a scrubber
     connect(m_posTimer, &QTimer::timeout, this, &VideoPlayer::updatePosition);
+
+    // Recovery for a SPLIT dual-branch seek (video= 1 audio= 0 or the reverse) — see sendSeek.
+    // 250ms gives a mid-flush / source-swapping branch time to settle before the re-send.
+    m_seekRetryTimer = new QTimer(this);
+    m_seekRetryTimer->setSingleShot(true);
+    m_seekRetryTimer->setInterval(250);
+    connect(m_seekRetryTimer, &QTimer::timeout, this, &VideoPlayer::retrySplitSeek);
 
     // Hardware decode is chosen by the hwDecode property (from Settings, set before play()),
     // or forced on for testing via YOUFISH_HWDEC=1. Either way the GL renderer needs an
@@ -69,6 +84,22 @@ void VideoPlayer::setAudioUrl(const QString &url)
         return;
     m_audioUrl = url;
     emit audioUrlChanged();
+}
+
+void VideoPlayer::setVideoExt(const QString &ext)
+{
+    if (m_videoExt == ext)
+        return;
+    m_videoExt = ext;
+    emit videoExtChanged();
+}
+
+void VideoPlayer::setAudioExt(const QString &ext)
+{
+    if (m_audioExt == ext)
+        return;
+    m_audioExt = ext;
+    emit audioExtChanged();
 }
 
 void VideoPlayer::setUserAgent(const QString &ua)
@@ -212,6 +243,8 @@ void VideoPlayer::seek(qint64 positionMs)
 {
     if (!m_pipeline || positionMs < 0)
         return;
+    m_seekRetried = false;   // a fresh user gesture gets a fresh split-recovery budget…
+    m_seekRebuilt = false;   // …including a fresh one-rebuild allowance
     sendSeek(positionMs);
     if (m_ended) {
         // Scrubbing after the video finished resumes playback from the new position.
@@ -240,6 +273,7 @@ void VideoPlayer::seekWhenReady(qint64 positionMs)
     if (positionMs < 0)
         return;
     if (m_prerolled) {
+        m_seekRetried = false;   // fresh restore intent → fresh split-recovery budget
         sendSeek(positionMs);
         m_position = positionMs;
         emit positionChanged();
@@ -267,28 +301,92 @@ void VideoPlayer::sendSeek(qint64 positionMs)
     // own uridecodebin. A single pipeline-level seek only reaches one branch and returns
     // FALSE, so send the flush-seek to BOTH sinks — each carries it up its own branch to
     // that branch's source, keeping the two tracks aligned.
-    // Both branches are WebM/matroskademux now (VP9 video + Opus audio, see _audio_candidates in
-    // youfish.py), each fed by its own uridecodebin — so send the flush-seek to BOTH sinks; each
-    // carries it up its own branch to that branch's source. FLUSH|ACCURATE lands both on the IDENTICAL
-    // timestamp t (matroskademux decodes-and-discards to the exact sample), keeping lip-sync tight.
-    // matroskademux push-seeks accurately over the range-seekable proxy, so neither branch needs a
-    // downloadbuffer. (History: audio used KEY_UNIT while it was AAC/qtdemux — qtdemux won't push-seek
-    // on this platform at all; and on WebM, KEY_UNIT snapped audio to its nearest CLUSTER, seconds
-    // before t, desyncing despite "audio= 1". ACCURATE fixes that.)
+    // Each branch is fed by its own uridecodebin — so send the flush-seek to BOTH sinks; each
+    // carries it up its own branch to that branch's source. Flags fit the branch's DEMUXER:
+    // matroska (webm) takes FLUSH|ACCURATE and lands exactly on t; qtdemux (mp4/m4a) rejects
+    // push-mode ACCURATE, so those branches get FLUSH|KEY_UNIT — the one flush-seek its push
+    // path accepts (one range restart, starts at the keyframe). An mp4 VIDEO branch therefore
+    // lands at/before t, so its audio partner is NOT seeked here: it follows to the video's
+    // ACTUAL landing position at this seek's ASYNC_DONE (audio-align, see onBusMessage) —
+    // both tracks then share one spot and lip-sync stays exact. m4a AUDIO needs no align
+    // (every AAC frame is a sync point → KEY_UNIT is effectively sample-granular). (History:
+    // on WebM, KEY_UNIT snapped audio to its nearest CLUSTER, seconds before t — hence
+    // ACCURATE wherever the demuxer allows it; and the downloadbuffer route to mp4-ACCURATE
+    // cost 10-50s per seek on-device — see buildPipeline.)
     // Carry m_rate so scrubbing keeps the chosen speed; scaletempo on the audio branch keeps pitch.
-    const GstSeekFlags dflags =
+    const GstSeekFlags accurate =
         (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE);
+    const GstSeekFlags keyunit =
+        (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT);
+    const bool videoMp4 = extIsMp4(m_videoExt);
     gboolean vok = FALSE, aok = FALSE;
     if (m_videoSink)
         vok = gst_element_send_event(m_videoSink,
-            gst_event_new_seek(m_rate, GST_FORMAT_TIME, dflags,
+            gst_event_new_seek(m_rate, GST_FORMAT_TIME, videoMp4 ? keyunit : accurate,
                 GST_SEEK_TYPE_SET, t, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE));
-    if (m_pulsesink)
+    if (videoMp4 && vok) {
+        m_pendingAudioAlignMs = positionMs;   // audio follows to the landed keyframe at ASYNC_DONE
+        aok = vok;                            // one logical seek in flight — recovery stays quiet
+    } else if (m_pulsesink) {
         aok = gst_element_send_event(m_pulsesink,
-            gst_event_new_seek(m_rate, GST_FORMAT_TIME, dflags,
+            gst_event_new_seek(m_rate, GST_FORMAT_TIME,
+                extIsMp4(m_audioExt) ? keyunit : accurate,
                 GST_SEEK_TYPE_SET, t, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE));
+    }
     YLOG << "[youfish] seek" << positionMs << "ms rate=" << m_rate
          << ": video=" << vok << "audio=" << aok;
+    // SPLIT result — one branch took the seek, the other refused, so they are now playing
+    // DIFFERENT positions (users report this as A/V desync after scrubbing) and nothing else
+    // ever realigns them. Hand it to the recovery timer: one in-place re-send (a mid-flush /
+    // source-swapping branch usually accepts once settled), then a rebuild at the target.
+    // Both-FALSE is NOT desync (neither branch moved), and both-TRUE clears any pending
+    // recovery — this seek already realigned the branches.
+    if (vok != aok) {
+        m_seekRetryMs = positionMs;
+        m_seekRetryTimer->start();
+    } else {
+        m_seekRetryMs = -1;
+        m_seekRetried = false;
+        m_seekRebuilt = false;   // aligned again — the split episode is over
+        m_seekRetryTimer->stop();
+    }
+}
+
+void VideoPlayer::retrySplitSeek()
+{
+    if (m_seekRetryMs < 0 || !m_pipeline)
+        return;
+    const qint64 t = m_seekRetryMs;
+    if (!m_seekRetried) {
+        // Stage 1: re-send the same dual seek. Re-seeking the branch that DID move is harmless
+        // (identical ACCURATE target); the refusing branch usually accepts by now. sendSeek's
+        // result re-arms the timer (still split) or clears the state (realigned).
+        m_seekRetried = true;
+        YLOG << "[youfish] split seek — retrying both branches at" << t << "ms";
+        sendSeek(t);
+        return;
+    }
+    // Stage 2: the retry split too — this branch genuinely can't seek in place. Rebuild at
+    // the target ONCE per episode: stop()+play() reuses the same URLs (and the proxy's
+    // on-disk cache, so re-preroll is cheap), and seekWhenReady() lands BOTH branches on t
+    // together at preroll — a one-time hiccup instead of a permanently desynced video. The
+    // cap exists because a STRUCTURAL refusal survives the rebuild too (measured 2026-09-07:
+    // an unseekable mp4 branch looped build→refused-seek→rebuild ~8× in 6s and the sink
+    // churn ended in EGL errors); one rebuild is recovery, more is a storm.
+    if (m_seekRebuilt) {
+        m_seekRetried = false;
+        m_seekRetryMs = -1;
+        YLOG << "[youfish] split seek STILL persists after a rebuild — giving up at" << t
+             << "ms (this stream's refusing branch cannot seek; playback continues)";
+        return;
+    }
+    m_seekRebuilt = true;
+    m_seekRetried = false;
+    m_seekRetryMs = -1;
+    YLOG << "[youfish] split seek persisted — rebuilding pipeline at" << t << "ms";
+    stop();
+    play();
+    seekWhenReady(t);
 }
 
 void VideoPlayer::setRate(qreal rate)
@@ -435,14 +533,37 @@ void VideoPlayer::buildPipeline()
         if (m_audioBin)
             g_object_set(m_audioBin, "buffer-duration", (gint64)(3 * GST_SECOND), nullptr);
 
-        // BOTH bins seek in PUSH mode over the range-seekable proxy: no downloadbuffer, no eager
-        // whole-file pull (the audio downloadbuffer used to greedily fetch the entire track before
-        // preroll). Video uses an ACCURATE seek (lands exactly on t); AUDIO uses a KEY_UNIT seek
-        // (see sendSeek) which qtdemux's push-mode path accepts where it rejects ACCURATE -> audio no
-        // longer needs a downloadbuffer. SELF-DIAGNOSING: if a build's qtdemux still returns "audio= 0"
-        // on the KEY_UNIT push-seek (watch the sendSeek log), revert this patch to restore download=TRUE
-        // on m_audioBin (the whole-audio greedy prefetch is the price of reliable audio seeking there).
-        YLOG << "[youfish] push-mode seek both bins (audio KEY_UNIT); no downloadbuffer";
+        // Container-aware seek strategy (the flags live in sendSeek). matroskademux (VP9/opus
+        // WebM — the common picks) push-seeks FLUSH|ACCURATE over the range-seekable proxy:
+        // exact landing, nothing extra needed. qtdemux (h264 .mp4 video / AAC .m4a audio) is
+        // the hard case — BOTH halves below are load-bearing, and each was measured alone
+        // on-device (2026-09-07) so the dead ends don't come back:
+        //  - flags alone (KEY_UNIT *or* ACCURATE, no downloadbuffer): qtdemux in push mode
+        //    over stream-buffering queue2 refuses EVERY flush-seek ("video= 0" structurally
+        //    → the rebuild-loop storm). It needs a byte-seekable upstream, full stop.
+        //  - downloadbuffer + ACCURATE: seeks WORKED but cost 10s (WiFi) to 50s (4G) each —
+        //    qtdemux fetched and decode-discarded the whole keyframe→target span through the
+        //    watermark-gated window (5-6 refill cycles per seek).
+        // So mp4/m4a branches get BOTH: uridecodebin download=TRUE (the downloadbuffer's temp
+        // file, TMPDIR → flash mediabuf per main.cpp, is the byte-seekable upstream) *and*
+        // KEY_UNIT seeks (jump straight to the keyframe byte offset — no discard span), with
+        // a small window so one ~1.5 MB refill is all a seek waits for. mp4 VIDEO lands
+        // at/before the target; the audio branch follows to the video's actual landing spot
+        // at the seek's ASYNC_DONE (audio-align) so lip-sync stays exact. m4a AUDIO alone
+        // needs no align: every AAC frame is a sync point → KEY_UNIT is sample-granular.
+        const bool videoMp4 = extIsMp4(m_videoExt);
+        const bool audioMp4 = extIsMp4(m_audioExt);
+        if (videoMp4)
+            g_object_set(m_videoBin, "download", TRUE,
+                         "buffer-duration", (gint64)(1 * GST_SECOND),
+                         "buffer-size", (gint)(1536 * 1024), nullptr);
+        if (audioMp4 && m_audioBin)
+            g_object_set(m_audioBin, "download", TRUE,
+                         "buffer-duration", (gint64)(1 * GST_SECOND),
+                         "buffer-size", (gint)(1536 * 1024), nullptr);
+        YLOG << "[youfish] seek plan: video"
+             << (videoMp4 ? "mp4 downloadbuffer+KEY_UNIT+align" : "webm ACCURATE") << "| audio"
+             << (audioMp4 ? "m4a downloadbuffer+KEY_UNIT" : "webm ACCURATE");
     } else {
         YLOG << "[youfish] local file — skipping network buffering (native pull-mode seek)";
     }
@@ -624,6 +745,11 @@ void VideoPlayer::teardown()
     m_muxed = false;
     m_prerolled = false;
     m_pendingSeekMs = -1;    // a deferred seek belongs to the torn-down pipeline; drop it
+    m_pendingAudioAlignMs = -1;   // ditto a half-done mp4 seek's audio-align phase
+    if (m_seekRetryTimer)
+        m_seekRetryTimer->stop();
+    m_seekRetryMs = -1;      // ditto a pending split-seek recovery
+    m_seekRetried = false;
 }
 
 void VideoPlayer::setError(const QString &message)
@@ -829,6 +955,32 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
                 player->m_position = target;
                 emit player->positionChanged();
                 YLOG << "[youfish] deferred seek ->" << target << "ms at preroll (both branches up)";
+            } else if (player->m_pendingAudioAlignMs >= 0 && player->m_pulsesink) {
+                // Audio-align, phase 2 of an mp4-video seek (see sendSeek): the video branch's
+                // KEY_UNIT seek just finished prerolling on its keyframe — ask it where it
+                // actually landed and bring the audio branch to the SAME spot. Query failure
+                // degrades to the originally requested t (offset bounded by one keyframe
+                // interval, one-time). The audio seek itself re-prerolls → its own ASYNC_DONE
+                // is a no-op here (align cleared).
+                const qint64 req = player->m_pendingAudioAlignMs;
+                player->m_pendingAudioAlignMs = -1;
+                qint64 landed = req;
+                gint64 pos = -1;
+                if (player->m_videoSink
+                        && gst_element_query_position(player->m_videoSink, GST_FORMAT_TIME, &pos)
+                        && pos >= 0)
+                    landed = pos / GST_MSECOND;
+                const gboolean alignOk = gst_element_send_event(player->m_pulsesink,
+                    gst_event_new_seek(player->m_rate, GST_FORMAT_TIME,
+                        (GstSeekFlags)(GST_SEEK_FLAG_FLUSH |
+                            (extIsMp4(player->m_audioExt) ? GST_SEEK_FLAG_KEY_UNIT
+                                                          : GST_SEEK_FLAG_ACCURATE)),
+                        GST_SEEK_TYPE_SET, (gint64)landed * GST_MSECOND,
+                        GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE));
+                player->m_position = landed;
+                emit player->positionChanged();
+                YLOG << "[youfish] audio-align -> video landed" << landed << "ms (requested"
+                     << req << "ms) audio seek:" << alignOk;
             } else if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, 1.0)) {
                 player->m_rateEngaged = true;
                 gint64 pos = 0;

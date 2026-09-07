@@ -12,7 +12,7 @@ Item {
     // feedback that the drawn glyphs — especially fullscreen — were too small to hit reliably
     // (issue #4); everything else (bar height, label centering, menu placement) anchors to the
     // buttons and follows automatically.
-    property real controlScale: 1.3
+    property real controlScale: 1.5
 
     property int positionMs: 0
     property int durationMs: 0

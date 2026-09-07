@@ -27,18 +27,21 @@ import youfish  # noqa: E402
 
 
 def vf(fid, height, vcodec, fps=30, url="v", note=None):
-    """A video-only format."""
+    """A video-only format. ext mirrors YouTube reality: avc1 ships in mp4, vp9/av01 in webm —
+    resolve() forwards it (video_ext / qualities[].ext) for the player's seek strategy."""
     f = {"format_id": fid, "height": height, "vcodec": vcodec, "acodec": "none",
-         "fps": fps, "url": url, "http_headers": {"User-Agent": "UA"}}
+         "fps": fps, "url": url, "http_headers": {"User-Agent": "UA"},
+         "ext": "mp4" if vcodec.startswith("avc") else "webm"}
     if note is not None:
         f["format_note"] = note
     return f
 
 
 def af(fid, abr, acodec, url="a", note=None, lang_pref=None, lang=None):
-    """An audio-only format."""
+    """An audio-only format. ext mirrors YouTube reality: mp4a ships in m4a, opus in webm."""
     f = {"format_id": fid, "abr": abr, "acodec": acodec, "vcodec": "none", "url": url,
-         "http_headers": {"User-Agent": "UA"}}
+         "http_headers": {"User-Agent": "UA"},
+         "ext": "m4a" if acodec.startswith("mp4a") else "webm"}
     if note is not None:
         f["format_note"] = note
     if lang_pref is not None:
@@ -230,7 +233,7 @@ class ResolveSmoke(unittest.TestCase):
     def setUp(self):
         self._saved = {}
         for name in ("_ytdlp_path", "_ensure_pot_server", "_pot_ytdlp_args",
-                     "_yt_extractor_args", "_proxied", "get_settings"):
+                     "_yt_extractor_args", "_proxied", "get_settings", "_import_yt_dlp"):
             self._saved[name] = getattr(youfish, name)
         self._saved["run"] = youfish.subprocess.run
 
@@ -240,6 +243,7 @@ class ResolveSmoke(unittest.TestCase):
         youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
         youfish._proxied = lambda url, *a, **k: url
         youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}
+        youfish._import_yt_dlp = lambda: None   # pin the BINARY path (no zipapp), whatever's on disk
         youfish.invalidate_resolve_cache()   # resolve() is cache-first (keyed by video id); every
                                              # test reuses id "vid", so isolate each test's fixture
 
@@ -266,6 +270,11 @@ class ResolveSmoke(unittest.TestCase):
         self.assertEqual(res["info"]["audio_itag"], "251-0")       # source, not the dub
         self.assertEqual(res["info"]["video_itag"], "137")
         self.assertTrue(res["info"]["qualities"])                  # quality menu populated
+        # Containers surface everywhere a URL does — the player keys per-branch
+        # downloadbuffers off these (qtdemux/mp4 can't push-seek; matroska can).
+        self.assertEqual(res["info"]["video_ext"], "mp4")          # avc1 pick → mp4 branch
+        self.assertEqual(res["info"]["audio_ext"], "webm")         # opus pick → webm branch
+        self.assertTrue(all(q.get("ext") for q in res["info"]["qualities"]))
 
     def test_quality_menu_dedups_by_height(self):
         self._mock_ytdlp([vf("137", 1080, "avc1"), vf("248", 1080, "vp09"),
@@ -1722,20 +1731,20 @@ class ZipappVersion(unittest.TestCase):
 
 class FastResolveStatusAndGate(unittest.TestCase):
     def setUp(self):
-        self._gs, self._zp, self._imp = (youfish.get_settings, youfish._ytdlp_zipapp_path,
-                                         youfish._import_yt_dlp)
+        self._zp, self._imp, self._pyok = (youfish._ytdlp_zipapp_path,
+                                           youfish._import_yt_dlp,
+                                           youfish._FAST_RESOLVE_PY_OK)
         self._tmp = tempfile.mkdtemp(prefix="frs-")
 
     def tearDown(self):
-        (youfish.get_settings, youfish._ytdlp_zipapp_path,
-         youfish._import_yt_dlp) = self._gs, self._zp, self._imp
+        (youfish._ytdlp_zipapp_path, youfish._import_yt_dlp,
+         youfish._FAST_RESOLVE_PY_OK) = self._zp, self._imp, self._pyok
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_status_not_installed(self):
-        youfish.get_settings = lambda: {"fast_resolve": False}
         youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")
         st = youfish.fast_resolve_status()
-        self.assertEqual((st["enabled"], st["installed"], st["version"]), (False, False, ""))
+        self.assertEqual((st["installed"], st["version"]), (False, ""))
 
     def test_status_installed_reports_version(self):
         import zipfile
@@ -1743,27 +1752,87 @@ class FastResolveStatusAndGate(unittest.TestCase):
         with zipfile.ZipFile(p, "w") as z:
             z.writestr("yt_dlp/__init__.py", "")
             z.writestr("yt_dlp/version.py", "__version__ = '2026.08.19'\n")
-        youfish.get_settings = lambda: {"fast_resolve": True}
         youfish._ytdlp_zipapp_path = lambda: p
         st = youfish.fast_resolve_status()
-        self.assertEqual((st["enabled"], st["installed"], st["version"]), (True, True, "2026.08.19"))
+        self.assertEqual((st["installed"], st["version"]), (True, "2026.08.19"))
 
-    def test_ready_false_when_off_never_imports(self):
-        called = [0]
-        youfish.get_settings = lambda: {"fast_resolve": False}
-        youfish._import_yt_dlp = lambda: (called.__setitem__(0, called[0] + 1) or object())
+    def test_ready_false_when_python_too_old_never_touches_zip(self):
+        # The REAL _import_yt_dlp with the gate forced off: returns None before ever looking
+        # at the zipapp (path mock would explode if consulted), and burns no import cache.
+        youfish._FAST_RESOLVE_PY_OK = False
+        youfish._ytdlp_zipapp_path = lambda: (_ for _ in ()).throw(AssertionError("touched zip"))
+        self.assertIsNone(youfish._import_yt_dlp())
         self.assertFalse(youfish._fast_resolve_ready())
-        self.assertEqual(called[0], 0)          # opted out short-circuits: no import attempt
 
     def test_ready_false_when_import_unavailable(self):
-        youfish.get_settings = lambda: {"fast_resolve": True}
         youfish._import_yt_dlp = lambda: None
         self.assertFalse(youfish._fast_resolve_ready())
 
-    def test_ready_true_when_on_and_importable(self):
-        youfish.get_settings = lambda: {"fast_resolve": True}
+    def test_ready_true_when_importable(self):
         youfish._import_yt_dlp = lambda: object()
         self.assertTrue(youfish._fast_resolve_ready())
+
+    def test_status_reports_device_python_gate(self):
+        # The UI's honest why-not text keys off these; python_ok mirrors the module gate,
+        # which itself reflects THIS interpreter (yt-dlp needs >= 3.10).
+        youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")
+        st = youfish.fast_resolve_status()
+        self.assertEqual(st["python_ok"], youfish._FAST_RESOLVE_PY_OK)
+        self.assertEqual(st["python_ok"], sys.version_info >= (3, 10))
+        self.assertEqual(st["python_version"], "%d.%d" % sys.version_info[:2])
+
+    def test_fast_resolve_is_not_a_setting(self):
+        # Deliberate: in-process yt-dlp is plumbing, not a preference — no defaults key
+        # (a stale stored "fast_resolve" from older builds is ignored, never consulted).
+        self.assertNotIn("fast_resolve", youfish._SETTINGS_DEFAULTS)
+
+
+class ZipappAutofetch(unittest.TestCase):
+    """_autofetch_zipapp: launch-time self-heal — fetch the missing copy exactly once per
+    process, only on a capable python, only when the consented-to binary is already there."""
+
+    def setUp(self):
+        self._saved = dict(zp=youfish._ytdlp_zipapp_path, yp=youfish._ytdlp_path,
+                           inst=youfish.install_ytdlp_zipapp, done=youfish._ZIPAPP_AUTOFETCH_DONE,
+                           pyok=youfish._FAST_RESOLVE_PY_OK)
+        youfish._ZIPAPP_AUTOFETCH_DONE = False
+        youfish._FAST_RESOLVE_PY_OK = True
+        self.calls = []
+        youfish.install_ytdlp_zipapp = lambda: self.calls.append(1)
+        self._tmp = tempfile.mkdtemp(prefix="zaf-")
+
+    def tearDown(self):
+        (youfish._ytdlp_zipapp_path, youfish._ytdlp_path, youfish.install_ytdlp_zipapp) = (
+            self._saved["zp"], self._saved["yp"], self._saved["inst"])
+        youfish._ZIPAPP_AUTOFETCH_DONE = self._saved["done"]
+        youfish._FAST_RESOLVE_PY_OK = self._saved["pyok"]
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_fetches_once_when_missing_and_binary_present(self):
+        youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")
+        youfish._ytdlp_path = lambda: os.path.join(self._tmp, "yt-dlp")
+        youfish._autofetch_zipapp()
+        youfish._autofetch_zipapp()      # second prewarm nudge in the same process
+        self.assertEqual(len(self.calls), 1)
+
+    def test_skips_when_python_too_old(self):
+        youfish._FAST_RESOLVE_PY_OK = False
+        youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")
+        youfish._ytdlp_path = lambda: os.path.join(self._tmp, "yt-dlp")
+        youfish._autofetch_zipapp()
+        self.assertEqual(self.calls, [])
+
+    def test_skips_when_already_present_or_no_binary(self):
+        p = os.path.join(self._tmp, "have.zip")
+        open(p, "wb").close()
+        youfish._ytdlp_zipapp_path = lambda: p
+        youfish._ytdlp_path = lambda: os.path.join(self._tmp, "yt-dlp")
+        youfish._autofetch_zipapp()      # zipapp already there
+        youfish._ZIPAPP_AUTOFETCH_DONE = False
+        youfish._ytdlp_zipapp_path = lambda: os.path.join(self._tmp, "absent.zip")
+        youfish._ytdlp_path = lambda: ""
+        youfish._autofetch_zipapp()      # no binary yet (fresh install pre-consent)
+        self.assertEqual(self.calls, [])
 
 
 class _FakeJar:
@@ -1800,7 +1869,7 @@ class _FakeYDL:
 
 
 class FastResolveRouting(unittest.TestCase):
-    """resolve() runs the token-free hot dump IN-PROCESS when fast_resolve is on + importable, and
+    """resolve() runs the token-free hot dump IN-PROCESS whenever the zipapp is importable, and
     falls back to the binary on any in-process failure or for the token (fetch_pot) path."""
     def setUp(self):
         self._saved = {}
@@ -1815,8 +1884,7 @@ class FastResolveRouting(unittest.TestCase):
         youfish._pot_ytdlp_args = lambda: []
         youfish._pot_active = lambda: False          # no probe / token path in the common case
         youfish._proxied = lambda url, *a, **k: url
-        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False,
-                                        "fast_resolve": True}
+        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}
         youfish._import_yt_dlp = lambda: types.SimpleNamespace(YoutubeDL=_FakeYDL)
         youfish._inproc_tls = youfish.threading.local()   # fresh warm-instance store per test
         youfish.invalidate_resolve_cache()
@@ -1880,9 +1948,8 @@ class FastResolveRouting(unittest.TestCase):
         self.assertEqual(res["info"]["title"], "BIN")
         self.assertEqual(_FakeYDL.instances, [])               # in-process path skipped entirely
 
-    def test_disabled_setting_uses_binary(self):
-        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False,
-                                        "fast_resolve": False}
+    def test_no_zipapp_uses_binary(self):
+        youfish._import_yt_dlp = lambda: None   # copy absent / not importable → binary path
         youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
         res = youfish.resolve("vid")
         self.assertTrue(res.get("ok"), res)
@@ -1893,11 +1960,11 @@ class FastResolveRouting(unittest.TestCase):
 class AnonymousPrimary(unittest.TestCase):
     """The token-free PRIMARY dump resolves WITHOUT cookies (anonymous) — YouTube gates authenticated
     token-free requests but not anonymous ones. Only the fallback re-runs WITH cookies (restricted
-    content). Exercised on the binary path (fast_resolve off)."""
+    content). Exercised on the binary path (zipapp pinned absent)."""
     def setUp(self):
         self._saved = {}
         for name in ("_ytdlp_path", "_ensure_pot_server", "_pot_ytdlp_args", "_yt_extractor_args",
-                     "_proxied", "get_settings", "_cookies_args", "_pot_active"):
+                     "_proxied", "get_settings", "_cookies_args", "_pot_active", "_import_yt_dlp"):
             self._saved[name] = getattr(youfish, name)
         self._run = youfish.subprocess.run
         youfish._ytdlp_path = lambda: "/fake/yt-dlp"
@@ -1905,7 +1972,8 @@ class AnonymousPrimary(unittest.TestCase):
         youfish._pot_ytdlp_args = lambda: []
         youfish._pot_active = lambda: False
         youfish._proxied = lambda url, *a, **k: url
-        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}   # fast off → binary
+        youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}
+        youfish._import_yt_dlp = lambda: None   # zipapp pinned absent → binary path
 
         import contextlib
 
@@ -1961,7 +2029,9 @@ class ReresolveAnonFirst(unittest.TestCase):
         self.calls = []
         self._saved = dict(path=youfish._ytdlp_path, run=youfish.subprocess.run,
                            pot=youfish._pot_active, ens=youfish._ensure_pot_server,
-                           ck=youfish._write_cookies_temp, gs=youfish.get_settings)
+                           ck=youfish._write_cookies_temp, gs=youfish.get_settings,
+                           imp=youfish._import_yt_dlp)
+        youfish._import_yt_dlp = lambda: None   # zipapp pinned absent → binary path
         youfish._ytdlp_path = lambda: "/bin/yt-dlp"
         youfish._pot_active = lambda: True
         youfish._ensure_pot_server = lambda: True
@@ -1977,6 +2047,7 @@ class ReresolveAnonFirst(unittest.TestCase):
         youfish._ensure_pot_server = self._saved["ens"]
         youfish._write_cookies_temp = self._saved["ck"]
         youfish.get_settings = self._saved["gs"]
+        youfish._import_yt_dlp = self._saved["imp"]
         youfish._url_cache.clear()
         youfish._reresolve_spawns[:] = []
 
@@ -2479,6 +2550,41 @@ class PotBindLocalhost(unittest.TestCase):
         self.assertEqual(out1, out2)                             # second run changes nothing
         odd = "serve({ hostname: cfg.host })"
         self.assertEqual(self._patch(odd), odd)                  # unknown shape → untouched
+
+
+class ParseYoutubeUrl(unittest.TestCase):
+    """The D-Bus link opener's classifier. The list-input cases are a regression guard: the
+    URL dispatcher hands openUrl a ONE-ELEMENT ARRAY on a warm app (cold start masked it via
+    QML string coercion), which used to crash on url.strip()."""
+
+    def test_watch_and_short_forms(self):
+        for u in ("https://www.youtube.com/watch?v=abcdefghijk",
+                  "https://youtu.be/abcdefghijk",
+                  "https://www.youtube.com/shorts/abcdefghijk"):
+            r = youfish.parse_youtube_url(u)
+            self.assertEqual((r["kind"], r["id"]), ("video", "abcdefghijk"), u)
+
+    def test_video_wins_over_list_param(self):
+        r = youfish.parse_youtube_url(
+            "https://www.youtube.com/watch?v=abcdefghijk&list=PLxyz")
+        self.assertEqual(r["kind"], "video")
+
+    def test_playlist_and_channel(self):
+        r = youfish.parse_youtube_url("https://www.youtube.com/playlist?list=PLxyz-123")
+        self.assertEqual((r["kind"], r["id"]), ("playlist", "PLxyz-123"))
+        r = youfish.parse_youtube_url("https://www.youtube.com/channel/UCabc_123")
+        self.assertEqual((r["kind"], r["id"]), ("channel", "UCabc_123"))
+        r = youfish.parse_youtube_url("https://www.youtube.com/@somecreator")
+        self.assertEqual(r["kind"], "channel")
+
+    def test_list_input_unwrapped(self):
+        r = youfish.parse_youtube_url(["https://youtu.be/abcdefghijk"])
+        self.assertEqual((r["kind"], r["id"]), ("video", "abcdefghijk"))
+
+    def test_empty_inputs(self):
+        for u in ("", None, [], ()):
+            r = youfish.parse_youtube_url(u)
+            self.assertEqual(r, {"kind": "", "id": "", "url": ""})
 
 
 if __name__ == "__main__":

@@ -22,6 +22,11 @@ class VideoPlayer : public QQuickPaintedItem
     Q_PROPERTY(QString videoUrl READ videoUrl WRITE setVideoUrl NOTIFY videoUrlChanged)
     Q_PROPERTY(QString audioUrl READ audioUrl WRITE setAudioUrl NOTIFY audioUrlChanged)
     Q_PROPERTY(QString userAgent READ userAgent WRITE setUserAgent NOTIFY userAgentChanged)
+    // Per-branch container ext ("mp4"/"m4a"/"webm"/…) of the stream behind each URL, from the
+    // resolve picks. Drives seekability: qtdemux (mp4/m4a) can't push-seek, so those branches
+    // get a downloadbuffer; matroska (webm) branches stay lean. Set BEFORE the url properties.
+    Q_PROPERTY(QString videoExt READ videoExt WRITE setVideoExt NOTIFY videoExtChanged)
+    Q_PROPERTY(QString audioExt READ audioExt WRITE setAudioExt NOTIFY audioExtChanged)
     Q_PROPERTY(bool playing READ playing NOTIFY playingChanged)
     // Position and duration are in milliseconds, polled off the pipeline clock.
     Q_PROPERTY(qint64 position READ position NOTIFY positionChanged)
@@ -41,6 +46,8 @@ public:
     QString videoUrl() const { return m_videoUrl; }
     QString audioUrl() const { return m_audioUrl; }
     QString userAgent() const { return m_userAgent; }
+    QString videoExt() const { return m_videoExt; }
+    QString audioExt() const { return m_audioExt; }
     bool playing() const { return m_playing; }
     qint64 position() const { return m_position; }
     qint64 duration() const { return m_duration; }
@@ -50,6 +57,8 @@ public:
     void setVideoUrl(const QString &url);
     void setAudioUrl(const QString &url);
     void setUserAgent(const QString &ua);
+    void setVideoExt(const QString &ext);
+    void setAudioExt(const QString &ext);
     void setRate(qreal rate);
     void setHwDecode(bool on);
 
@@ -84,6 +93,8 @@ signals:
     void videoUrlChanged();
     void audioUrlChanged();
     void userAgentChanged();
+    void videoExtChanged();
+    void audioExtChanged();
     void playingChanged();
     void positionChanged();
     void durationChanged();
@@ -98,6 +109,7 @@ private:
     void setError(const QString &message);
     void updatePosition();
     void sendSeek(qint64 positionMs);
+    void retrySplitSeek();        // recover a dual-branch seek that only ONE branch accepted
     void applyEqBands();          // push m_eqBands (or flat, when disabled) onto the live element
 
     static void onSourceSetup(GstElement *bin, GstElement *source, gpointer self);
@@ -113,6 +125,8 @@ private:
     QString m_videoUrl;
     QString m_audioUrl;
     QString m_userAgent;
+    QString m_videoExt;
+    QString m_audioExt;
     bool m_playing = false;
     bool m_ended = false;
     qint64 m_position = 0;
@@ -121,6 +135,17 @@ private:
     bool m_rateEngaged = false;   // non-default start speed engaged once, during preroll
     bool m_prerolled = false;     // pipeline has finished preroll (both branches' pads linked)
     qint64 m_pendingSeekMs = -1;  // deferred seekWhenReady() target, applied at preroll (-1 = none)
+    QTimer *m_seekRetryTimer = nullptr;  // one-shot: re-send / recover a SPLIT dual-branch seek
+    qint64 m_seekRetryMs = -1;    // the split seek's target (-1 = none pending)
+    bool m_seekRetried = false;   // the single in-place retry has been spent for this target
+    // The one rebuild per split episode is spent (see retrySplitSeek). Cleared only by a
+    // fresh USER seek or a seek that comes back aligned — deliberately NOT by teardown,
+    // which runs INSIDE the rebuild itself.
+    bool m_seekRebuilt = false;
+    // mp4-video seek, phase 2: the audio branch is re-seeked to the video's actual (keyframe)
+    // landing position at the seek's ASYNC_DONE. -1 = no align pending. Holds the REQUESTED
+    // target as the fallback when the landed-position query fails.
+    qint64 m_pendingAudioAlignMs = -1;
     bool m_videoActive = true;
     bool m_muxed = false;   // single-source mode: m_videoBin carries both video + audio
     bool m_hwDecode = false;// effective mode this build (m_hwDecodeReq, reset each buildPipeline)

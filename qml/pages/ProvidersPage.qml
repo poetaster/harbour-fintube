@@ -121,10 +121,12 @@ Page {
                         } else {
                             // Keep the in-process zipapp in lockstep with the binary so a YouTube
                             // breakage fix reaches the fast path too (else it silently stays stale).
-                            page.ytdlpStatus = app.backend.fastResolveInstalled
+                            // On a capable device this also (re)fetches a missing copy — Update is
+                            // the self-heal lever, since fast resolve has no row of its own.
+                            page.ytdlpStatus = app.backend.fastResolvePythonOk
                                 ? "Updating yt-dlp + fast-resolve copy…" : "Updating yt-dlp…"
                             app.backend.updateYtdlp()
-                            if (app.backend.fastResolveInstalled)
+                            if (app.backend.fastResolvePythonOk)
                                 app.backend.installFastResolve()
                         }
                     }
@@ -183,34 +185,32 @@ Page {
                 }
             }
 
-            // Experimental: run yt-dlp IN-PROCESS for the token-free hot path — no ~1.3s binary
-            // respawn per resolve, and the player-JS / n-sig caches stay warm. First enable fetches
-            // a small importable yt-dlp; the binary above stays the default AND the fallback.
-            TextSwitch {
+            // Fast resolve is plumbing, not a preference — no toggle. The importable yt-dlp
+            // arrives with the install, refreshes with Update, and backfills itself at launch
+            // (engine-side _autofetch_zipapp); this label just tells the truth about its state.
+            // On an older OS python it explains why the binary is used instead.
+            Label {
                 visible: app.backend.ready
-                text: "Fast resolve (experimental)"
-                description: app.backend.fastResolveInstalling
-                    ? ("Downloading the importable yt-dlp… "
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                text: !app.backend.fastResolvePythonOk
+                    ? ("Fast resolve unavailable: needs OS Python 3.10 or newer to run yt-dlp "
+                       + "in-process — this device has "
+                       + (app.backend.fastResolvePythonVersion || "an older one")
+                       + ". The self-contained binary (with its own bundled Python) is used instead.")
+                    : app.backend.fastResolveInstalling
+                    ? ("Fast resolve: downloading the importable yt-dlp… "
                        + Math.round(app.backend.fastResolvePct) + "%")
                     : (app.backend.fastResolveInstalled
-                       ? ("Runs yt-dlp in-process (no per-resolve respawn) using the imported yt-dlp "
-                          + app.backend.fastResolveVersion
-                          + ". Any error falls back to the binary above.")
-                       : "Downloads a small importable yt-dlp, then runs it in-process for faster "
-                         + "resolves. The binary stays the fallback.")
-                automaticCheck: false
-                checked: app.backend.fastResolve
-                enabled: !app.backend.fastResolveInstalling
-                onClicked: {
-                    if (app.backend.fastResolve) {
-                        app.backend.setFastResolve(false)
-                    } else if (app.backend.fastResolveInstalled) {
-                        app.backend.setFastResolve(true)
-                    } else {
-                        app.backend.installFastResolve()   // fetch the zipapp…
-                        app.backend.setFastResolve(true)   // …and switch on (activates once it lands)
-                    }
-                }
+                       ? ("Fast resolve active — yt-dlp " + app.backend.fastResolveVersion
+                          + " runs in-process (no per-resolve respawn). Any error falls back to "
+                          + "the binary above.")
+                       : "Fast resolve: the importable copy isn't here yet — it downloads "
+                         + "automatically, or rides along with the next Update.")
+                color: Theme.secondaryColor
+                font.pixelSize: Theme.fontSizeExtraSmall
             }
 
             Label {

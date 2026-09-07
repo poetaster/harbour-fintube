@@ -269,7 +269,14 @@ ApplicationWindow {
              '  <method name="openUrl"><arg type="s" name="url" direction="in"/></method>\n' +
              '</interface>'
         function openUrl(url) {
-            app.routeUrl(url)   // route first so a link still opens even if activate() is a no-op
+            // The URL dispatcher can deliver the argument as a ONE-ELEMENT ARRAY of strings
+            // rather than a plain string. Cold start masked this: the link gets buffered into
+            // the string property pendingUrl, and QML's string coercion flattens ["url"] to
+            // "url" — while the warm path handed the raw array straight to Python (
+            // 'list' object has no attribute 'strip'). Normalize at the D-Bus boundary.
+            var u = (typeof url === "string") ? url
+                    : (url && url.length > 0 ? String(url[0]) : "")
+            app.routeUrl(u)   // route first so a link still opens even if activate() is a no-op
             app.activate()
         }
     }

@@ -52,6 +52,16 @@ public:
 
 int main(int argc, char *argv[])
 {
+    // Under YOUFISH_DEBUG, stamp every Qt log line (qDebug from C++ *and* QML console.log)
+    // with wall-clock time, so field logs expose gaps between lines — a stall in untimed
+    // code is invisible when only per-step durations are printed. Overwrite the ENVIRONMENT
+    // var, not qSetMessagePattern(): SFOS already exports a QT_MESSAGE_PATTERN (the familiar
+    // "[D] unknown:0 -" prefix) and the env var beats any in-code pattern — verified on
+    // device, where the qSetMessagePattern variant changed nothing. Normal runs keep the
+    // platform's default format.
+    if (!qEnvironmentVariableIsEmpty("YOUFISH_DEBUG"))
+        qputenv("QT_MESSAGE_PATTERN", "[%{time hh:mm:ss.zzz}] [%{type}] %{message}");
+
     redirectMediaBufferToFlash();
     gst_init(&argc, &argv);
 

@@ -17,9 +17,11 @@ FinTune, its sibling YouTube **Music** client, runs an audio-only cut of this en
   proxy (no helper spawned per playback; ~250 ms preroll), with self-healing
   re-resolve on stream 403s. Format selection is **property-based** (resolution /
   fps / codec) — never hardcoded itags, so it doesn't go stale.
-- **Fast resolve** *(opt-in)* — runs yt-dlp in-process from an importable copy,
-  skipping the per-resolve binary spawn. The binary stays the default *and* the
-  fallback for any failure.
+- **Fast resolve** — runs yt-dlp in-process from an importable copy, skipping the
+  per-resolve binary spawn. Not a setting: automatic wherever the OS Python can run
+  it (SFOS 5.1+), with the copy installed and updated alongside the binary; older
+  devices just use the self-contained binary, which stays the fallback for any
+  failure everywhere.
 - **Subscriptions** + feed, channel pages, search (filters, autocomplete,
   infinite scroll), related videos, comments, SponsorBlock auto-skip, Shorts filter.
 - **Account import** — subscriptions/playlists from your YouTube login
