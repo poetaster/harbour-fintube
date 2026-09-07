@@ -10,6 +10,7 @@ Item {
     // True once we've confirmed a working yt-dlp is present.
     property bool ready: false
     property bool pyReady: false         // Python module imported and callable
+    property bool fastLaneReady: false   // pyFast (the playback lane) imported and callable
     property string ytdlpVersion: ""
     property bool updating: false
     property bool installing: false      // downloading yt-dlp into the app data dir
@@ -109,11 +110,17 @@ Item {
 
     // Classify an incoming youtube.com/youtu.be link → {kind, id, url} for the URL handler.
     function parseUrl(url, callback) {
-        py.call("youfish.parse_youtube_url", [url], function(res) { callback(res || {}) })
+        var lane = backend.fastLaneReady ? pyFast : py   // pure parsing feeding a video open — don't queue it
+        lane.call("youfish.parse_youtube_url", [url], function(res) { callback(res || {}) })
     }
 
     function resolve(videoId) {
-        py.call("youfish.resolve", [videoId], function(res) {
+        // Ride the fast lane: the main worker's queue can be held for minutes by feed
+        // housekeeping (the duration/Shorts backfill spawns 2 yt-dlp listings per unclassified
+        // channel) or a comments walk — field log 2026-09-07 showed a tap-to-play queued ~3.5
+        // minutes for ~6 s of actual resolve work. Starting playback never waits in that line.
+        var lane = backend.fastLaneReady ? pyFast : py
+        lane.call("youfish.resolve", [videoId], function(res) {
             // Tag the broadcast with the id it's FOR, so a VideoPage only consumes the result that
             // matches its own video — a slow/abandoned resolve for another video (or an info-only
             // page still mid-fetch) must never grab the shared pipeline or poison the reattach cache. (M8)
@@ -127,7 +134,10 @@ Item {
     // blocks, safe to spam (Python dedupes + caps concurrency). resolve() itself is unchanged.
     function prefetchResolve(videoId) {
         if (!videoId) return
-        py.call("youfish.prefetch_resolve", [videoId], function() {})
+        // Python-side it returns instantly (work moves to a python thread), but the CALL still
+        // queues — behind a dammed main worker the warm-up would fire minutes late. Fast lane.
+        var lane = backend.fastLaneReady ? pyFast : py
+        lane.call("youfish.prefetch_resolve", [videoId], function() {})
     }
 
     // Tell the engine a video's playback is being torn down (or a track swapped) so it can kill the
@@ -275,7 +285,11 @@ Item {
 
     // --- Resume points + SponsorBlock (per-video, from Python) ---
     function resumePosition(videoId, callback) {
-        py.call("youfish.get_position", [videoId], function(sec) { callback(sec || 0) })
+        // Fast lane: this is the FIRST hop of tap-to-play (VideoPage fetches the saved position,
+        // then resolves in the callback) — on the main worker it would still queue the whole
+        // start behind feed chores. It's a local watch-state read, so it can't dam the lane.
+        var lane = backend.fastLaneReady ? pyFast : py
+        lane.call("youfish.get_position", [videoId], function(sec) { callback(sec || 0) })
     }
     function savePosition(videoId, seconds) {
         py.call("youfish.set_position", [videoId, seconds], function() {})
@@ -790,5 +804,23 @@ Item {
             }
         }
         onError: console.log("python error: " + traceback)
+    }
+
+    // The playback fast lane: a second PyOtherSide element = its OWN worker thread (the
+    // interpreter underneath is shared, so module state and caches are the same objects).
+    // Every py.call above shares py's single queue, where one slow background job dams
+    // everything behind it — resolve()/prefetchResolve()/parseUrl() ride here instead.
+    // youfish is built for cross-thread use (per-thread YoutubeDL; the prefetch threads
+    // already exercise it). Declared AFTER py so pyotherside.send events keep arriving at
+    // py's onReceived whichever instance pyotherside routes them to.
+    Python {
+        id: pyFast
+        Component.onCompleted: {
+            addImportPath(Qt.resolvedUrl("../python").toString().replace("file://", ""))
+            // Same module as py — python's import lock guarantees exactly one full module
+            // initialization no matter which element's import wins the race.
+            importModule("youfish", function() { backend.fastLaneReady = true })
+        }
+        onError: console.log("python error (fast lane): " + traceback)
     }
 }

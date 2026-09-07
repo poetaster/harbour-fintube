@@ -2767,16 +2767,28 @@ def _set_pdeathsig():
         pass
 
 
-def _ensure_pot_server():
+def _ensure_pot_server(wait=25.0):
     """Start the token server if the provider is active and it isn't already listening.
     Returns True once something is listening on the port. No-op (returns False) when the
-    provider isn't installed/enabled, so normal calls are entirely unaffected."""
+    provider isn't installed/enabled, so normal calls are entirely unaffected. `wait`
+    bounds the TOTAL time this caller may spend here (lock join + port wait): the resolve
+    hot path passes a short grace so it never owns a slow boot — False there just means
+    the dump runs token-free (its gate re-checks the port), while the in-flight boot keeps
+    going on the owner thread and serves the next call."""
     if not _pot_active():
         return False
     if _pot_ready_on_port():
         return True
     global _pot_proc, _pot_last_error
-    with _pot_lock:
+    deadline = time.time() + wait
+    # A boot may already be in flight under the lock (prewarm's call, usually). Join it only
+    # within this caller's budget: the 2026-09-08 field log showed a resolve on a CPU-starved
+    # device blocking ~11s on the lock, then burning its OWN full window on a server that never
+    # came up — 40s spent to conclude "proceed token-free". Timing out here abandons nothing:
+    # the holder's boot continues regardless.
+    if not _pot_lock.acquire(timeout=max(0.1, deadline - time.time())):
+        return _pot_ready_on_port()
+    try:
         if _pot_ready_on_port():
             return True
         if not _deno_path():
@@ -2829,9 +2841,9 @@ def _ensure_pot_server():
             spawned.wait(5)              # the Popen is near-instant; let it happen before we poll
             if _pot_proc is None:
                 return False             # Popen failed — _pot_last_error already set by the owner
-        # The server LISTENS quickly; the BotGuard VM warms on the first token request,
-        # which the yt-dlp plugin waits out itself — so we only wait for the port to open.
-        deadline = time.time() + 25
+        # The server LISTENS quickly (on an unloaded device); the BotGuard VM warms on the first
+        # token request, which the yt-dlp plugin waits out itself — so we only wait for the port
+        # to open, and only within this caller's remaining budget.
         while time.time() < deadline:
             if _pot_ready_on_port():
                 _pot_last_error = ""
@@ -2842,8 +2854,10 @@ def _ensure_pot_server():
                                    % (_pot_proc.poll() if _pot_proc is not None else "?"))
                 return False   # died during startup — see potprovider/server.log
             time.sleep(0.3)
-        _pot_last_error = "Provider server didn't open port %d within 25s." % _POT_PORT
+        _pot_last_error = "Provider server didn't open port %d within %.0fs." % (_POT_PORT, wait)
         return _pot_ready_on_port()
+    finally:
+        _pot_lock.release()
 
 
 def _pot_rotate_log():
@@ -3465,7 +3479,10 @@ def _resolve_uncached(video_id):
     if "://" not in url:
         url = "https://www.youtube.com/watch?v=" + video_id
     _t0 = time.time()
-    _ensure_pot_server()  # bring the PO-token sidecar up (no-op unless installed+enabled)
+    # Bring the PO-token sidecar up (no-op unless installed+enabled) — with a short grace, never
+    # owning the boot: the primary tv_embedded ladder is token-free, so when the server isn't up
+    # in time the dump proceeds without it and the still-booting server serves the next resolve.
+    _ensure_pot_server(wait=4)
     _tlog("pot_ensure %.2fs" % (time.time() - _t0))
     def _dump(extra, anon=False):
         """Run yt-dlp --dump-single-json with extra args; return (data, error).
@@ -5612,6 +5629,7 @@ def _save_shorts(s):
         pass
 
 
+@_timed_fn("feed.durations")
 def feed_durations(limit_per_channel=30, force=False):
     """For the current subscription feed: {"durations": {video_id: seconds}, "shorts": [video_id]}.
     RSS carries neither, so this pulls them from yt-dlp's flat channel listing — the /videos tab
@@ -5710,6 +5728,10 @@ def feed_durations(limit_per_channel=30, force=False):
         return durs, sh
 
     bases = list(need.values())
+    # This is the launch-time "quiet minutes" candidate on a slow device/link (2 spawns per
+    # channel below) — announce the work up front so a field log shows a job in progress
+    # instead of a silent gap (2026-09-07 report: ~3 min of invisible classification).
+    _tlog("feed.durations: classifying %d channel(s), 2 yt-dlp listings each" % len(bases))
     try:
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(bases))) as ex:
