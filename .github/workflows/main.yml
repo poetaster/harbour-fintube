@@ -35,11 +35,22 @@ jobs:
         release: ${{ matrix.rel }}
         arch: ${{ matrix.arch }}
 
-    - name: Upload RPM (${{ matrix.arch }})
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.rel }}-${{ matrix.arch }}
-        path: output
+
+    - name: Rename arm files
+      if: matrix.rel == 5.0.0.43 && matrix.arch == armv7hl
+      run: |
+        mkdir -p RPMS
+        find . -name "*.rpm" -exec cp {} RPMS/ \;
+        ls -la RPMS/ || echo "No files in RPMS directory"
+        mv RPMS/*.rpm RPMS/*.rpm.${{matrix.rel}}${{matrix.arch}}
+
+    - name: rename aarch files
+      if: matrix.rel == 5.0.0.43 && matrix.arch == aarch64
+      run: |
+        mkdir -p RPMS
+        find . -name "*.rpm" -exec cp {} RPMS/ \;
+        ls -la RPMS/ || echo "No files in RPMS directory"
+        mv RPMS/*.rpm RPMS/*.rpm.${{matrix.rel}}${{matrix.arch}}
 
     - name: Extract Version Name
       id: extract_name
