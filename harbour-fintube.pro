@@ -60,6 +60,7 @@ DISTFILES += \
     qml/pages/KeepDisplayOn.qml \
     qml/cover/CoverPage.qml \
     python/youfish.py \
+    python/innertube.py \
     harbour-fintube.desktop \
     harbour.fintube.service \
     rpm/harbour-fintube.spec

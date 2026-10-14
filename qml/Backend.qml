@@ -11,6 +11,7 @@ Item {
     property bool ready: false
     property bool pyReady: false         // Python module imported and callable
     property bool fastLaneReady: false   // pyFast (the playback lane) imported and callable
+    property bool bgLaneReady: false     // pyBg (the background-chores lane) imported and callable
     property string ytdlpVersion: ""
     property bool updating: false
     property bool installing: false      // downloading yt-dlp into the app data dir
@@ -99,7 +100,7 @@ Item {
         })
     }
 
-    // Recommendations for a video (its autoplay Mix), via the flat-playlist path — see RelatedPage.
+    // Recommendations for a video (InnerTube watch-next, else its autoplay Mix) — see RelatedPage.
     function relatedVideos(videoId, callback) {
         if (!videoId) { callback({}); return }
         py.call("youfish.related", [videoId, 20], function(res) {
@@ -109,7 +110,9 @@ Item {
 
     // Search autocomplete → caller's callback (page-scoped; called on every keystroke).
     function suggest(query, callback) {
-        py.call("youfish.search_suggestions", [query], function(res) {
+        // Fast lane: a keystroke's suggestions are stale the moment they queue behind anything.
+        var lane = backend.fastLaneReady ? pyFast : py
+        lane.call("youfish.search_suggestions", [query], function(res) {
             callback(res && res.suggestions ? res.suggestions : [])
         })
     }
@@ -348,7 +351,10 @@ Item {
         })
     }
     function sponsorSegments(videoId, callback) {
-        py.call("youfish.sponsor_segments", [videoId], function(res) {
+        // Fast lane: a short HTTP call whose answer decides the first skip — on py it could land
+        // after the segment it was meant to skip.
+        var lane = backend.fastLaneReady ? pyFast : py
+        lane.call("youfish.sponsor_segments", [videoId], function(res) {
             callback(res && res.ok ? (res.segments || []) : [])
         })
     }
@@ -356,7 +362,8 @@ Item {
     // Fetch + parse one caption track (json3 URL from resolve()'s tracks/translations) into
     // [{start,dur,text}] seconds. The player caches per (video,lang), so this runs once per pick.
     function captionCues(url, callback) {
-        py.call("youfish.caption_cues", [url], function(res) {
+        var lane = backend.fastLaneReady ? pyFast : py   // the user just picked a track: show it now
+        lane.call("youfish.caption_cues", [url], function(res) {
             callback(res && res.ok ? (res.cues || []) : [])
         })
     }
@@ -382,7 +389,10 @@ Item {
     // yt-dlp /videos + RSS fallback). `force` refreshes DUE channels (adaptive per-channel TTL);
     // `refreshAll` (pull-to-refresh) re-fetches every channel. Served stale-while-revalidate.
     function subscriptionFeed(force, refreshAll, callback) {
-        py.call("youfish.subscription_feed", [100, !!force, !!refreshAll], function(res) {
+        // Background lane: a refresh walks every due channel, and must never hold up a channel
+        // open / settings / search queued on the main worker meanwhile.
+        var lane = backend.bgLaneReady ? pyBg : py
+        lane.call("youfish.subscription_feed", [100, !!force, !!refreshAll], function(res) {
             callback(res || {})
         })
     }
@@ -391,7 +401,8 @@ Item {
     // both). Called after the feed shows so length badges fill in — and Shorts drop out — without
     // slowing the initial load.
     function feedDurations(force, callback) {
-        py.call("youfish.feed_durations", [30, !!force], function(res) {
+        var lane = backend.bgLaneReady ? pyBg : py   // same lane as the feed → runs after its refresh
+        lane.call("youfish.feed_durations", [30, !!force], function(res) {
             callback((res && res.durations) ? res.durations : {},
                      (res && res.shorts) ? res.shorts : [])
         })
@@ -537,7 +548,8 @@ Item {
         // 50 top-level comments per video. This is a NETWORK cap: yt-dlp's max_parents stops the
         // continuation walk once it has this many (it does not fetch the rest), so it also bounds the
         // walk's latency. The UI still reveals them a few at a time (VideoPage reveal window).
-        py.call("youfish.comments", [videoId, 50, true], function(res) {
+        var lane = backend.bgLaneReady ? pyBg : py   // a multi-second walk: keep it off the main lane
+        lane.call("youfish.comments", [videoId, 50, true], function(res) {
             var cbs = _commentsPending[videoId] || []
             delete _commentsPending[videoId]
             if (res && res.ok) {
@@ -788,6 +800,9 @@ Item {
             addImportPath(Qt.resolvedUrl("../python").toString().replace("file://", ""))
             importModule("youfish", function() {
                 backend.pyReady = true
+                // First: prewarm only spawns threads (visitor id, yt-dlp import, PO sidecar) and
+                // returns, so it shouldn't wait behind the version checks' process spawns.
+                py.call("youfish.prewarm", [], function() {})
                 backend.recheck()
                 backend.recheckFfmpeg()
                 backend.loadSubscriptions()
@@ -799,7 +814,6 @@ Item {
                 backend.loadWatchState()
                 backend.loadPotStatus()
                 backend.loadFastResolveStatus()
-                py.call("youfish.prewarm", [], function() {})  // POT server up before first play
             })
         }
         // Background-download progress/completion events from the Python thread.
@@ -878,5 +892,18 @@ Item {
             importModule("youfish", function() { backend.fastLaneReady = true })
         }
         onError: console.log("python error (fast lane): " + traceback)
+    }
+
+    // The background lane: the feed refresh, its duration/Shorts classification and comment walks —
+    // the slow chores that used to share py's queue, so opening a channel while the feed refreshed
+    // waited for the whole refresh. Same shared interpreter as py/pyFast; declared after py for the
+    // same pyotherside.send reason as pyFast.
+    Python {
+        id: pyBg
+        Component.onCompleted: {
+            addImportPath(Qt.resolvedUrl("../python").toString().replace("file://", ""))
+            importModule("youfish", function() { backend.bgLaneReady = true })
+        }
+        onError: console.log("python error (background lane): " + traceback)
     }
 }

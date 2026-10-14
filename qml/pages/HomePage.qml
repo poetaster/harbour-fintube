@@ -49,16 +49,17 @@ Page {
             var items = (res && res.items) ? res.items : []
             for (var i = 0; i < items.length; i++)
                 feedModel.append(items[i])
-            // The feed is built from each channel's RSS (fast, spawn-free) which carries no video
-            // length or Shorts flag — backfill both from yt-dlp in the background so the length
-            // badges appear a beat after the feed and any Shorts drop out.
-            if (feedModel.count > 0)
-                page.fillDurations(force)
             // Stale-while-revalidate: the response may be a cached (even hours-old) feed shown
             // instantly on a cold launch. If it's stale, fetch a fresh one in the background and
             // swap it in silently — so the user never stares at a spinner while a refresh runs.
+            // The length/Shorts backfill runs AFTER that refresh (both share one lane, in call
+            // order) — queued first, it used to hold the refresh behind the whole classification.
             if (!force && res && res.cached && res.stale)
                 page.refreshFeedInBackground()
+            else if (feedModel.count > 0)
+                // RSS carries no video length or Shorts flag — backfill both in the background so
+                // the length badges appear a beat after the feed and any Shorts drop out.
+                page.fillDurations(force)
         })
     }
 
@@ -78,12 +79,13 @@ Page {
             for (var j = 0; !changed && j < items.length; j++)
                 if (feedModel.get(j).id !== items[j].id)
                     changed = true
-            if (!changed)
-                return
-            feedModel.clear()
-            for (var i = 0; i < items.length; i++)
-                feedModel.append(items[i])
-            page.fillDurations(false)   // fresh RSS rows carry no length/Shorts flag → backfill again
+            if (changed) {
+                feedModel.clear()
+                for (var i = 0; i < items.length; i++)
+                    feedModel.append(items[i])
+            }
+            page.fillDurations(false)   // RSS rows carry no length/Shorts flag → backfill (cheap no-op
+                                        // when everything is already classified)
         })
     }
 

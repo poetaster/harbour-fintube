@@ -13,10 +13,10 @@ bounded, backpressured on-disk download job.
 PO tokens (2026 reality): YouTube increasingly binds a Proof-of-Origin token to the
 stream URLs — without one many clients return nothing fetchable. The bgutil
 provider (OPT-IN, user-installed; see install_pot_provider) mints them on a
-sandboxed Deno sidecar. The common path avoids the mint entirely: resolve()'s
-primary dump is the TOKEN-FREE tv_embedded client, run anonymously; the token
-machinery is only the safety net for gated/restricted videos (see
-_resolve_uncached / _default_client).
+sandboxed Deno sidecar. The common path avoids the mint entirely: resolve() asks
+the InnerTube fast path first and its yt-dlp fallback's primary dump is the TOKEN-FREE
+JS-less client (_token_free_client), run anonymously; the token machinery is only
+the safety net for gated/restricted videos (see _resolve_uncached / _default_client).
 """
 
 import atexit
@@ -142,11 +142,11 @@ def _codec_family(vcodec):
 
 def _is_manifest(f):
     """1 if this is an HLS/manifest variant (m3u8) rather than a direct progressive/DASH URL, else 0.
-    tv_embedded exposes BOTH at every resolution; the direct URL is preferred as a pure tiebreaker —
+    Some clients expose BOTH at every resolution; the direct URL is preferred as a pure tiebreaker —
     it needs no manifest round-trip before media (faster preroll) and rides the app's proven
     range-seekable proxy path (proxying a manifest is the fragile case the proxy code warns about).
     Without this the manifest variant can win the pick purely by list order (measured 2026-09-06:
-    anonymous tv_embedded picked manifest v=617 over the direct equivalent)."""
+    the anonymous token-free primary picked manifest v=617 over the direct equivalent)."""
     return 1 if ("m3u8" in (f.get("protocol") or "").lower()
                  or "manifest.googlevideo" in (f.get("url") or "")) else 0
 
@@ -419,17 +419,19 @@ def _spawn_tax_probe():
     if not path:
         _tlog("spawn_tax: yt-dlp not found")
         return
-    best = None
+    best, ver = None, "?"
     for _ in range(3):                       # min of a few runs → the warm-FS best case, the fair floor
         _t0 = time.time()
         try:
-            subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+            ver = (subprocess.run([path, "--version"], capture_output=True, text=True,
+                                  timeout=30).stdout or "?").strip()
         except Exception as ex:
             _tlog("spawn_tax: probe failed (%s)" % ex)
             return
         dt = time.time() - _t0
         best = dt if best is None else min(best, dt)
-    _tlog("spawn_tax %.2fs  (min of 3x `yt-dlp --version`; ~pure process launch)" % best)
+    _tlog("spawn_tax %.2fs  (min of 3x `yt-dlp --version`; ~pure process launch) — yt-dlp %s"
+          % (best, ver))
 
 
 def _clen(url):
@@ -461,7 +463,7 @@ def _proxy_url_ok(url):
 
 
 def _probe_url_ok(url, ua, timeout=3):
-    """Fast pre-flight for the token-free→token fallback (today: tv_embedded→mweb): does this
+    """Fast pre-flight for the token-free→token fallback (token-free primary → mweb): does this
     googlevideo URL actually SERVE bytes, or 403 at byte 0? A gated token-free stream looks fine
     at resolve but 403s the instant the player fetches it, so resolve probes one chosen URL and,
     on a real 403, re-extracts with the token client BEFORE playback. Returns False ONLY on a definite HTTP 403 (the escalation trigger);
@@ -537,6 +539,18 @@ def _reap_proc(proc):
         pass
 
 
+def _gv_request(url, ua, start, end):
+    """A googlevideo Range GET with the proven 6-header set (see _spawn) and the format's own UA."""
+    return urllib.request.Request(url, headers={
+        "User-Agent": ua or _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-us,en;q=0.5",
+        "Sec-Fetch-Mode": "navigate",
+        "Accept-Encoding": "identity",
+        "Range": "bytes=%d-%d" % (start, end),
+    })
+
+
 class _DirectFetch:
     """In-process googlevideo streamer — a duck-typed stand-in for the yt-dlp child (_spawn):
     same `.stdout.read(n)` / `.kill()` / `.poll()` / `.wait()` surface, so _reader and the reap
@@ -566,21 +580,14 @@ class _DirectFetch:
         self.chunk_end = -1          # last offset of the open bounded chunk; None = open-ended 200
         self.reopens = 0             # consecutive ZERO-PROGRESS reopens (truncation guard)
         self.returncode = None       # duck: None while live, 0 clean EOF / killed, 1 error death
+        self.err = ""                # why it died ("HTTP 403", "timeout", ...) — for the debug log
         self.stdout = self           # _reader drains proc.stdout.read(n)
 
     def _open_next(self):
         end = self.pos + _DIRECT_CHUNK - 1
         if self.total is not None:
             end = min(end, self.total - 1)
-        req = urllib.request.Request(self.url, headers={
-            "User-Agent": self.ua or _BROWSER_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-us,en;q=0.5",
-            "Sec-Fetch-Mode": "navigate",
-            "Accept-Encoding": "identity",
-            "Range": "bytes=%d-%d" % (self.pos, end),
-        })
-        resp = urllib.request.urlopen(req, timeout=30)
+        resp = urllib.request.urlopen(_gv_request(self.url, self.ua, self.pos, end), timeout=30)
         code = getattr(resp, "status", None) or resp.getcode()
         if code == 200:              # server ignored the Range: stream this one response to EOF
             self.chunk_end = None
@@ -603,9 +610,11 @@ class _DirectFetch:
                     self._open_next()
                 except urllib.error.HTTPError as ex:
                     self.returncode = 0 if ex.code == 416 else 1   # 416: past EOF (no-clen case)
+                    self.err = "HTTP %s" % ex.code
                     return b""
-                except Exception:
+                except Exception as ex:
                     self.returncode = 1                   # DNS / TLS / timeout / reset / ...
+                    self.err = repr(ex)[:120]
                     return b""
             try:
                 buf = self.resp.read(n)
@@ -775,6 +784,10 @@ def _reader(s, gen):
             with s.cond:
                 s.edge_ts = time.time()   # B4: recovery in progress — don't let the stall watchdog abort re-resolve
             _reap_proc(proc)                                 # off-lock reap of the exited child
+            if isinstance(proc, _DirectFetch) and _DEBUG:
+                _tlog("direct-fetch itag=%s died after %d bytes at=%d: %s [%s]"
+                      % (s.itag, nproc, s.dl_start, proc.err or "eof", _url_shape(s.url)))
+            refused = False
             if isinstance(proc, _DirectFetch) and nproc == 0:
                 # The direct fetch produced NOTHING (403/expired/blocked at byte 0). Flip this
                 # stream to the binary child before the resume respawn — the fallback doctrine:
@@ -782,6 +795,16 @@ def _reader(s, gen):
                 # also hand the next spawn a fresh URL; the child gets first go at it.)
                 s.use_binary = True
                 _plog("direct-fetch dead at byte 0 (itag=%s) -> binary child" % s.itag)
+                # An unexpired InnerTube-minted URL refused at byte 0 is evidence against the fast
+                # path itself on this network — enough of them and resolve goes back to yt-dlp.
+                # Only an HTTP answer counts: a network failure is no verdict on the URL. The
+                # recovery then skips the fast client, and the cached resolve that handed out
+                # this URL is dropped so a replay doesn't start from it again.
+                if proc.returncode == 1 and proc.err.startswith("HTTP ") \
+                        and _fast_client_url(s.url) and _expire_ts(s.url) > time.time() + 60:
+                    refused = True
+                    _fast_strike("itag %s refused at byte 0 (%s)" % (s.itag, proc.err))
+                    _drop_resolved(s.vid)
             if s.cursor > s.cursor_at_last_death:            # R9: credit REAL playback advance (cursor
                 tries = 0                                    #     survives a False resume's edge=0),
             s.cursor_at_last_death = s.cursor                #     cap only genuinely stuck streams
@@ -790,7 +813,7 @@ def _reader(s, gen):
                 with s.cond:
                     s.state = "FAIL"; s.cond.notify_all()
                 return
-            fresh = _reresolve(s.vid, s.itag, s.url)         # reuse the rate-limited 403 refresh
+            fresh = _reresolve(s.vid, s.itag, s.url, refused)  # reuse the rate-limited 403 refresh
             if fresh and _proxy_url_ok(fresh):
                 s.url = fresh
             with s.cond:
@@ -1250,7 +1273,7 @@ def _ytdlp_formats(video_id, anon=False):
         return {}
 
 
-def _reresolve(video_id, itag, failed_url):
+def _reresolve(video_id, itag, failed_url, refused=False):
     """Fresh direct URL for (video_id, itag), re-running yt-dlp at most once per stale
     generation. Concurrent video+audio 403s share one refresh: whoever takes the lock
     first re-extracts; the other sees a cached URL that differs from its failed one and
@@ -1263,12 +1286,16 @@ def _reresolve(video_id, itag, failed_url):
     gated-fallback whose shapes a token-free dump may not reproduce). Both dumps count
     against the spawn rate-limit; worst case this holds _url_cache_lock across two 90s
     dumps — acceptable for a rare recovery path where reliability beats latency.
+
+    `refused`: googlevideo refused the failed URL, an unexpired fast-path one, at byte 0. Asking
+    the same client again only hands back another URL it refuses (on device: three rounds, ~6s,
+    each probing fine), so this skips the fast client and any cached fast URL and goes to yt-dlp.
     """
     with _url_cache_lock:
         ent = _url_cache.get(video_id)
         if ent and time.time() - ent["ts"] < _URL_CACHE_TTL:
             cached = ent["fmts"].get(itag)
-            if cached and cached != failed_url:
+            if cached and cached != failed_url and not (refused and _fast_client_url(cached)):
                 return cached  # another track already refreshed this generation
         now = time.time()
         _reresolve_spawns[:] = [t for t in _reresolve_spawns if now - t < _RERESOLVE_WINDOW]
@@ -1276,7 +1303,14 @@ def _reresolve(video_id, itag, failed_url):
             _plog("reresolve rate-limited (%d in %.0fs)" % (len(_reresolve_spawns), _RERESOLVE_WINDOW))
             return None
         _reresolve_spawns.append(now)
-        fresh = _ytdlp_formats(video_id, anon=True)
+        # A stream the InnerTube fast path started: re-ask the same client first (one cheap POST,
+        # same itag naming + UA) before paying for a yt-dlp run.
+        fresh = _fast_formats_map(video_id) if _fast_client_url(failed_url) and not refused else {}
+        if fresh.get(itag) and not _fast_urls_ok([fresh[itag]], _it().player_client()[2]):
+            fresh = {}
+        src = "innertube" if fresh.get(itag) else (_default_client() or "auto")
+        if not fresh.get(itag):
+            fresh = _ytdlp_formats(video_id, anon=True)
         if not fresh.get(itag):
             if len(_reresolve_spawns) < _RERESOLVE_BURST:      # the fallback spawn pays the limit too
                 _reresolve_spawns.append(time.time())
@@ -1289,13 +1323,277 @@ def _reresolve(video_id, itag, failed_url):
             return None
         if _DEBUG:   # the WARM re-resolve's token + client for the exact itag that 403'd
             _tlog("reresolve itag=%s %s client=%s"
-                  % (itag, _pot_of(fresh.get(itag, "")), _default_client() or "auto"))
+                  % (itag, _pot_of(fresh.get(itag, "")), src))
         _url_cache[video_id] = {"ts": time.time(), "fmts": fresh}
         if len(_url_cache) > _URL_CACHE_MAX:  # evict oldest beyond the cap
             for k, _ in sorted(_url_cache.items(),
                                key=lambda kv: kv[1]["ts"])[:len(_url_cache) - _URL_CACHE_MAX]:
                 _url_cache.pop(k, None)
         return fresh.get(itag)
+
+
+# --------------------------------------------------------------------------- #
+# InnerTube fast path (innertube.py): the NewPipe approach — ask YouTube's own JSON API one small
+# question instead of running yt-dlp. Used IN FRONT of yt-dlp for resolve, the 403 self-heal,
+# channel listings, avatars and the feed's duration/Shorts classification; every caller falls back
+# to the yt-dlp path that existed before on ANY failure, so the worst case is the old behaviour
+# plus one cheap failed request. On-device yt-dlp costs a 1.3s spawn or a multi-second in-process
+# HTML parse per question; the InnerTube answer is one ~100-300 ms POST.
+# --------------------------------------------------------------------------- #
+_INNERTUBE = {"mod": None, "tried": False}
+# Circuit breaker for the fast PLAYER: a bot-check answer means the client/visitor is burned (not
+# that this one video is restricted), so after a couple in a row stop trying for a while — every
+# resolve would otherwise pay a doomed request before its yt-dlp fallback.
+_FAST_PLAYER_BOT_LIMIT = 2
+_FAST_PLAYER_COOLDOWN = 30 * 60
+_fast_player_state = {"bot_fails": 0, "off_until": 0.0, "strikes": []}
+# The same breaker also trips on googlevideo REFUSING fast-path URLs (probe or byte-0 403): the
+# request shape is fine on most networks, but if this one rejects it, yt-dlp's URLs are the cure.
+_FAST_URL_STRIKES = 2
+_FAST_URL_WINDOW = 10 * 60
+
+
+def _it():
+    """The innertube module, or None when it isn't shipped (the shared engine also runs in FinTune)
+    or failed to import — callers then go straight to yt-dlp."""
+    if not _INNERTUBE["tried"]:
+        # Before its pool can open a single connection: a pooled IPv6 socket would mint player
+        # URLs bound to an address the (IPv4-pinned) proxy never fetches from.
+        _force_ipv4()
+        try:
+            import innertube as _m
+            _INNERTUBE["mod"] = _m
+        except Exception as ex:
+            _plog("innertube unavailable (%s) — yt-dlp only" % ex)
+        _INNERTUBE["tried"] = True
+    return _INNERTUBE["mod"]
+
+
+_it_fallbacks = {}             # area -> [count, last reason]: InnerTube answers yt-dlp had to cover
+
+
+def _it_note(area, ex):
+    """Count an InnerTube fallback that points at OUR side (a layout or API change the parsers
+    don't know yet), for the diagnostics report. Unplayable videos and network errors aren't
+    counted: those fall back for reasons no parser update would fix."""
+    it = _INNERTUBE.get("mod")
+    if it is None or not isinstance(ex, it.InnertubeError) or isinstance(ex, it.Unplayable):
+        return
+    ent = _it_fallbacks.setdefault(area, [0, ""])
+    ent[0] += 1
+    ent[1] = str(ex)[:120]
+
+
+def _it_fallback_report():
+    """Diagnostics lines for the InnerTube fast path."""
+    it = _INNERTUBE.get("mod")
+    if it is None:
+        return ["InnerTube fast path: unavailable (yt-dlp only)"]
+    try:
+        client = it.player_client()[0]
+    except Exception:
+        client = "?"
+    L = ["InnerTube fast path: player client %s" % client]
+    if not _it_fallbacks:
+        L.append("  no layout fallbacks this session")
+    for area in sorted(_it_fallbacks):
+        n, why = _it_fallbacks[area]
+        L.append("  %-12s fell back to yt-dlp %dx (last: %s)" % (area, n, why))
+    if _it_fallbacks:
+        L.append("  (repeated fallbacks = YouTube changed a page layout: the app keeps working via "
+                 "yt-dlp, a newer innertube.py makes it fast again)")
+    return L
+
+
+def _fast_player():
+    """The innertube module if the fast PLAYER path may run now, else None. A user-chosen
+    player_client is an explicit troubleshooting choice that only yt-dlp can honour, so it
+    disables the fast path; so does the bot-check circuit breaker."""
+    it = _it()
+    if it is None:
+        return None
+    if (get_settings().get("player_client") or "").strip().lower() not in ("", "auto"):
+        return None
+    if time.time() < _fast_player_state["off_until"]:
+        return None
+    return it
+
+
+def _fast_player_raw(video_id):
+    """innertube.player_info() with the circuit-breaker bookkeeping, or None on any failure."""
+    it = _fast_player()
+    if it is None or not re.fullmatch(r"[\w-]{11}", video_id or ""):
+        return None
+    _force_ipv4()          # googlevideo URLs are IP-bound: extract on the family the proxy streams on
+    _t = time.time()
+    try:
+        data = it.player_info(video_id)
+    except Exception as ex:
+        if getattr(ex, "bot", False):
+            _fast_player_state["bot_fails"] += 1
+            if _fast_player_state["bot_fails"] >= _FAST_PLAYER_BOT_LIMIT:
+                _fast_player_state["bot_fails"] = 0
+                _fast_player_state["off_until"] = time.time() + _FAST_PLAYER_COOLDOWN
+                _plog("fast player bot-walled twice — yt-dlp only for %ds" % _FAST_PLAYER_COOLDOWN)
+        _it_note("player", ex)
+        _tlog("fast player failed %.2fs → yt-dlp: %s" % (time.time() - _t, str(ex)[:120]))
+        return None
+    _fast_player_state["bot_fails"] = 0
+    _tlog("fast player %.2fs (%d formats)" % (time.time() - _t, len(data.get("formats") or [])))
+    return data
+
+
+def _fast_strike(why):
+    """One piece of evidence that googlevideo won't serve fast-path URLs on this network. Two
+    within _FAST_URL_WINDOW open the same breaker the bot-check uses: resolve goes back to
+    yt-dlp (whose URLs this network demonstrably accepted) for _FAST_PLAYER_COOLDOWN."""
+    now = time.time()
+    st = _fast_player_state
+    st["strikes"] = [t for t in st.get("strikes") or [] if now - t < _FAST_URL_WINDOW] + [now]
+    _tlog("fast path strike %d/%d: %s" % (len(st["strikes"]), _FAST_URL_STRIKES, why))
+    if len(st["strikes"]) >= _FAST_URL_STRIKES:
+        st["strikes"] = []
+        st["off_until"] = now + _FAST_PLAYER_COOLDOWN
+        _tlog("fast player off for %ds — yt-dlp resolves meanwhile" % _FAST_PLAYER_COOLDOWN)
+
+
+def _probe_status(url, ua, timeout=3):
+    """HTTP status of the first request playback will make (same header set, same Range: byte 0
+    to the end of _DirectFetch's first bounded chunk), reading only 2 bytes of it, or None when
+    the network itself failed (no verdict on the URL). A 2-byte Range was too lenient: on device
+    (2026-10-15) four fast-path URLs in a row answered it 206 while playback's own 0-clen request
+    got 403 at byte 0 the same second, costing a 12s start."""
+    end, total = _DIRECT_CHUNK - 1, _clen(url)
+    if total:
+        end = min(end, total - 1)
+    try:
+        _force_ipv4()
+        with urllib.request.urlopen(_gv_request(url, ua, 0, end), timeout=timeout) as r:
+            r.read(2)
+            return getattr(r, "status", None) or r.getcode()
+    except urllib.error.HTTPError as ex:
+        return ex.code
+    except Exception:
+        return None
+
+
+def _fast_urls_ok(urls, ua):
+    """Probe fast-path URLs in parallel (~one RTT) before anything plays them. Any HTTP refusal
+    is a strike and a False — the caller then uses yt-dlp instead."""
+    urls = [u for u in urls if u]
+    codes = [None] * len(urls)
+
+    def run(i, u):
+        codes[i] = _probe_status(u, ua)
+    _t = time.time()
+    ts = [threading.Thread(target=run, args=(i, u), daemon=True) for i, u in enumerate(urls)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+    ok = all(c is None or 200 <= c < 300 for c in codes)
+    _tlog("fast probe %.2fs %s%s" % (time.time() - _t, codes, "" if ok else " → yt-dlp"))
+    if not ok:
+        _fast_strike("probe answered %s" % codes)
+    return ok
+
+
+def _url_shape(u):
+    """DEBUG: the identity-free shape of a googlevideo URL — minting client, IP family, whether it
+    carries an n-challenge / PO token, time to expiry, and which params are signed."""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+        ip, exp = q.get("ip", [""])[0], _expire_ts(u)
+        return "c=%s ip=%s n=%s pot=%s exp=%+ds sparams=%s" % (
+            q.get("c", ["?"])[0], "v6" if ":" in ip else ("v4" if ip else "-"),
+            "y" if q.get("n") else "-", "y" if q.get("pot") else "-",
+            (exp - int(time.time())) if exp else 0, q.get("sparams", [""])[0])
+    except Exception:
+        return "?"
+
+
+def _fast_player_data(video_id):
+    """yt-dlp-shaped resolve data from ONE InnerTube player request, or None to use yt-dlp. A
+    plain on-demand video qualifies with a playable HD pair; a running livestream goes to the live
+    client's muxed HLS (_fast_live_data). Upcoming streams and anything without a pair stay on
+    yt-dlp. The pair resolve() will actually pick is probed first, so a URL googlevideo refuses
+    never reaches the player."""
+    data = _fast_player_raw(video_id)
+    if data is not None and data.get("live_status") == "is_live":
+        return _fast_live_data(video_id)
+    if data is None or data.get("live_status") != "not_live":
+        return None
+    fs = data.get("formats") or []
+    _s = get_settings()
+    try:
+        cap = int(_s.get("default_quality") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    video, audio = _pick_video(fs, cap), _pick_audio(fs, _s.get("audio_lang") or "")
+    if not (video and audio):
+        return None
+    ua = (video.get("http_headers") or {}).get("User-Agent", "")
+    if not _fast_urls_ok([video.get("url"), audio.get("url")], ua):
+        return None
+    return data
+
+
+def _fast_live_data(video_id):
+    """A running livestream from the live client's muxed HLS master (innertube.live_info), or None
+    to use yt-dlp. GStreamer fetches HLS itself (unproxied, invariant 1), so there's no probe: the
+    manifest fetch inside live_info already proved googlevideo answers this client here."""
+    it = _fast_player()
+    if it is None:
+        return None
+    _t = time.time()
+    try:
+        data = it.live_info(video_id)
+    except Exception as ex:
+        _it_note("live", ex)
+        _tlog("fast live failed %.2fs → yt-dlp: %s" % (time.time() - _t, str(ex)[:120]))
+        return None
+    if not _pick(data.get("formats") or [], _MUXED_ITAGS):
+        _tlog("fast live: no playable muxed rung → yt-dlp")
+        return None
+    _tlog("fast live %.2fs (%d variants)" % (time.time() - _t, len(data.get("formats") or [])))
+    return data
+
+
+def _fast_client_url(url):
+    """True if a googlevideo URL was minted for the fast path's player client (its `c=` param), so
+    a 403 refresh can re-ask the same client and get the same itag shapes + UA back."""
+    it = _it()
+    if it is None or not url:
+        return False
+    try:
+        cname = it.player_client()[1]
+    except Exception:
+        return False
+    return bool(cname) and re.search(r"[?&]c=%s(?:&|$)" % re.escape(cname), url) is not None
+
+
+def _fast_formats_map(video_id):
+    """{format_id: url} from a fresh fast-path player request ({} on failure) — _reresolve's
+    cheap first try for a stream the fast path started."""
+    data = _fast_player_raw(video_id)
+    if not data:
+        return {}
+    return {f["format_id"]: f["url"] for f in (data.get("formats") or [])
+            if f.get("format_id") and f.get("url")}
+
+
+def _innertube_prewarm():
+    """Mint the player visitor id (and open a pooled keep-alive connection) off the UI path at
+    launch, so the first tap-to-play is a single request."""
+    it = _it()
+    if it is None:
+        return
+    _tlog("innertube prewarm: python %s, %s" % (sys.version.split()[0], ssl.OPENSSL_VERSION))
+    try:
+        _force_ipv4()
+        it.visitor_data()
+    except Exception as ex:
+        _plog("innertube prewarm failed: %s" % ex)
 
 
 # --------------------------------------------------------------------------- #
@@ -1401,6 +1699,14 @@ def invalidate_resolve_cache():
     login/logout (cheap — small dict, refills on demand)."""
     with _resolve_cache_lock:
         _resolve_cache.clear()
+
+
+def _drop_resolved(video_id):
+    """Forget every cached resolve of one video (any settings key): googlevideo refused its URLs."""
+    pre = str(video_id) + "\x1f"
+    with _resolve_cache_lock:
+        for k in [k for k in _resolve_cache if k.startswith(pre)]:
+            _resolve_cache.pop(k, None)
 
 
 def _resolve_and_cache(video_id, key=None, speculative=False):
@@ -1563,17 +1869,43 @@ def _ytdlp_path():
     return _system_binary("yt-dlp")
 
 
-def ytdlp_version():
-    """Installed yt-dlp version string, or '' if missing/broken."""
+def _ytdlp_version_path():
+    return os.path.join(_data_dir(), "ytdlp_version.json")
+
+
+def ytdlp_version(fresh=False):
+    """Installed yt-dlp version string, or '' if missing/broken. Remembered per binary (path +
+    size + mtime): `--version` is a full frozen-binary cold start (~1.1s+ on device) that used to
+    hold the main lane at every launch. An update or reinstall changes the stat, so a stale answer
+    can't outlive the binary; `fresh` forces the run (install uses it to prove the binary works)."""
     path = _ytdlp_path()
     if not path:
         return ""
     try:
+        st = os.stat(path)
+        sig = [path, st.st_size, st.st_mtime_ns]
+    except OSError:
+        sig = None
+    if sig and not fresh:
+        try:
+            with open(_ytdlp_version_path()) as f:
+                c = json.load(f)
+            if c.get("sig") == sig and c.get("version"):
+                return c["version"]
+        except Exception:
+            pass
+    try:
         out = subprocess.run([path, "--version"], capture_output=True,
                              text=True, timeout=15)
-        return out.stdout.strip()
+        v = out.stdout.strip()
     except Exception:
         return ""
+    if v and sig:
+        try:
+            _atomic_write_json(_ytdlp_version_path(), {"sig": sig, "version": v})
+        except Exception:
+            pass
+    return v
 
 
 def ytdlp_update():
@@ -1696,7 +2028,7 @@ def install_ytdlp():
                 return
             os.chmod(tmp, 0o755)
             os.replace(tmp, dest)
-            ver = ytdlp_version()  # exercises the binary — confirms it actually runs
+            ver = ytdlp_version(fresh=True)  # exercises the binary — confirms it actually runs
             if ver:
                 note = "Installed yt-dlp " + ver
                 if not expected:
@@ -1727,7 +2059,7 @@ def install_ytdlp():
 # stays the resilient DEFAULT (self-updating, needs no device Python/deps) AND the
 # fallback: ANY failure here (missing/broken/incompatible zip, import or extraction
 # error) falls through to the binary, so opting in can never make a resolve fail that the
-# binary would have served. Scope: only the TOKEN-FREE hot dump (tv_embedded, no PO
+# binary would have served. Scope: only the TOKEN-FREE hot dump (_token_free_client, no PO
 # token) runs in-process; every token / widen / gated dump keeps using the binary, so the
 # bgutil PO-token PLUGIN machinery is untouched and never needed in-process.
 # --------------------------------------------------------------------------- #
@@ -1920,6 +2252,17 @@ def _import_yt_dlp():
             _ensure_deno_on_path()   # in-process n-sig also uses Deno when it's present
             import yt_dlp as _m
             mod = _m
+            # The InnerTube fast path follows this yt-dlp's client definitions (web version + its
+            # JS-less default player client), so a YouTube-forced client change arrives with a
+            # yt-dlp update instead of needing an app release.
+            it = _it()
+            if it is not None:
+                try:
+                    _tlog("yt-dlp %s in-process; innertube player client: %s"
+                          % (getattr(getattr(mod, "version", None), "__version__", "?"),
+                             it.configure_from_ytdlp(mod)))
+                except Exception as ex:
+                    _plog("innertube client sync failed: %s" % ex)
         except Exception as ex:
             _plog("fast-resolve: yt-dlp import failed (%s) — using binary" % ex)
             mod = None
@@ -2085,6 +2428,46 @@ def _inproc_dump(url, extra, anon=False):
         _inproc_tls.deno = [0, 0.0]  # [n_spawns, total_seconds]
     info = ydl.extract_info(url, download=False)
     return ydl.sanitize_info(info)
+
+
+def _ytdlp_run(path, argv, timeout):
+    """`yt-dlp <argv>` for a call that ends in --dump-single-json, as a CompletedProcess. Runs
+    in-process on the imported zipapp when it loaded: the SAME argv goes through
+    yt_dlp.parse_options, so the two forms can't drift apart, and it skips the frozen binary's
+    cold start (~1.1s on device). Any in-process failure re-runs the binary, whose answer and
+    error text the callers already handle; so does a device where the zipapp can't load. This is
+    the middle tier behind the InnerTube fast paths: yt-dlp's parsers, maintained upstream."""
+    mod = _import_yt_dlp()
+    if mod is not None:
+        _t = time.time()
+        try:
+            data = _inproc_json(mod, argv)
+            _tlog("yt-dlp in-process %.2fs: %s" % (time.time() - _t, str(argv[-1])[:80]))
+            return subprocess.CompletedProcess([path, *argv], 0, json.dumps(data), "")
+        except Exception as ex:
+            _tlog("yt-dlp in-process failed %.2fs → binary: %s" % (time.time() - _t, str(ex)[:120]))
+    return subprocess.run([path, *argv], capture_output=True, text=True, timeout=timeout)
+
+
+def _inproc_json(mod, argv):
+    """What `yt-dlp <argv>` would print for --dump-single-json, computed in-process on a fresh
+    YoutubeDL (a fresh one per call, so per-call options like --playlist-items can't leak into
+    the warm resolve instance). Raises on any failure."""
+    po = mod.parse_options(list(argv))
+    if len(po.urls) != 1:
+        raise ValueError("expected one URL, got %d" % len(po.urls))
+    opts = dict(po.ydl_opts)
+    for k in ("dump_single_json", "forcejson", "forceprint", "print_to_file"):
+        opts.pop(k, None)                   # the answer comes back as a value, not on stdout
+    opts.update(quiet=True, no_warnings=True, noprogress=True, logger=_InprocLogger())
+    if not opts.get("socket_timeout"):
+        opts["socket_timeout"] = 20         # the binary's aggregate timeout has no in-process twin
+    with mod.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(po.urls[0], download=False)
+        # Exactly what the binary prints for -J (post_extract + sanitize_info, no key stripping:
+        # clean_infojson's stripping is for .info.json files and would drop "entries").
+        ydl.post_extract(info)
+        return ydl.sanitize_info(info)
 
 
 def _inproc_comments(url, extra):
@@ -2687,8 +3070,8 @@ def _pot_http_ping(timeout=1.5):
 def _pot_of(u):
     """DEBUG: the streaming PO-token (`pot=`) state of a googlevideo URL, WITHOUT leaking the
     token — 'no-url' when the pick has no URL at all (a genuinely dead pick), 'no-pot' when the
-    URL just carries no pot= param (NORMAL for token-free clients like the anonymous tv_embedded
-    primary — only suspect when that same stream 403s at byte 0), else the token's length +
+    URL just carries no pot= param (NORMAL for token-free clients like the anonymous primary
+    — only suspect when that same stream 403s at byte 0), else the token's length +
     8-char prefix. The old single 'MISSING' label conflated those two very different states."""
     if not u:
         return "no-url"
@@ -2878,19 +3261,36 @@ def _pot_rotate_log():
         pass
 
 
+_YTDLP_WARM_DELAY = 5.0       # seconds after launch: past the launch feed refresh + classification
+_ytdlp_warm_armed = False
+
+
+def _delayed_ytdlp_warm():
+    _import_yt_dlp()
+    if _DEBUG:          # profiling: log the isolated yt-dlp spawn tax once per launch
+        _spawn_tax_probe()
+
+
 def prewarm():
     """Start the PO-token server in the background at app launch, so the first resolve doesn't pay
     the ~2s Deno startup on its critical path. No-op unless the provider is installed + enabled.
     Runs on its OWN daemon thread so the PyOtherSide worker (and the UI behind it) never blocks on
     the port wait — fire-and-forget from QML at startup."""
-    if _DEBUG:          # profiling: log the isolated yt-dlp spawn tax once per launch, off-thread
-        threading.Thread(target=_spawn_tax_probe, daemon=True).start()
-    # Fast resolve: import the yt-dlp zipapp NOW, on a throwaway thread, so the first resolve of the
-    # session doesn't pay the ~1.5s `import yt_dlp` on its critical path. The import is module-global
-    # (see _import_yt_dlp), so any thread warms it; a no-op on a too-old device python, before the
-    # zipapp arrives, or once already imported. _autofetch_zipapp then backfills a missing copy in
-    # the background (once per launch) so fast resolve just exists wherever it can run.
-    threading.Thread(target=_import_yt_dlp, daemon=True, name="ytdlp-import-prewarm").start()
+    global _ytdlp_warm_armed
+    # Warm the yt-dlp zipapp import (and, under debug, the spawn-tax probe) a few seconds AFTER
+    # launch, once per process (prewarm is also the provider "nudge"): the import is ~1.4s of CPU-bound Python on device, and run at once it starved the
+    # launch feed refresh (9 parallel RSS fetches took 1.1–1.4s each, finishing as it finished).
+    # Nothing at launch needs it: resolve, lists and the feed go through InnerTube first, and any
+    # fallback that does need yt-dlp imports it on demand (the import is module-global and locked).
+    # _autofetch_zipapp then backfills a missing copy in the background (once per launch).
+    if not _ytdlp_warm_armed:
+        _ytdlp_warm_armed = True
+        _t = threading.Timer(_YTDLP_WARM_DELAY, _delayed_ytdlp_warm)
+        _t.daemon = True
+        _t.name = "ytdlp-import-prewarm"
+        _t.start()
+    # InnerTube fast path: mint the player visitor id now so the first tap-to-play is ONE request.
+    threading.Thread(target=_innertube_prewarm, daemon=True, name="innertube-prewarm").start()
     _autofetch_zipapp()
     _pot_rotate_log()   # fresh server.log per launch (keeps the previous one as server.log.prev)
     if not _pot_active():
@@ -2987,6 +3387,8 @@ def pot_diagnostics():
     L.append("yt-dlp : " + ((ytdlp + "  (" + (ytdlp_version() or "?") + ")") if ytdlp else "NOT FOUND"))
     L.append("ffmpeg : " + ((ffmpeg + "  (" + (ffmpeg_version() or "?") + ")") if ffmpeg
                             else "not installed (HD merge unavailable)"))
+    L.append("")
+    L.extend(_it_fallback_report())
     L.append("")
     L.append("provider installed : " + (("yes (" + _pot_effective_tag() + ")") if installed else "no"))
     L.append("provider enabled   : " + ("yes" if enabled else "no"))
@@ -3278,6 +3680,109 @@ def parse_youtube_url(url):
     return {"kind": "", "id": "", "url": u}
 
 
+# InnerTube search pages: the web app's own /search, paged by continuation like the channel tabs
+# (_it_channel). Page 1 is fetched once per query; scrolling deeper only fetches what's new —
+# the yt-dlp path re-downloaded the whole window (ytsearch<end>) for every page.
+_search_pages = {}             # (query, params, kind) -> {"ts", "items": [innertube items], "cont"}
+_search_pages_lock = threading.Lock()
+_SEARCH_PAGES_TTL = 600
+_SEARCH_FIRST_FRESH = 120      # a new search (start=1) reuses a page 1 younger than this
+_SEARCH_PAGES_MAX = 8
+
+
+def _it_search_window(query, params, want, end, fresh_first):
+    """innertube.search results of kind `want` for (query, params), at least `end` of them when
+    the results run that deep. Raises on failure; search() then falls back to yt-dlp."""
+    it = _it()
+    key = (query, params, want)
+    now = time.time()
+    with _search_pages_lock:
+        ent = _search_pages.get(key)
+        if ent and (now - ent["ts"] > _SEARCH_PAGES_TTL
+                    or (fresh_first and now - ent["ts"] > _SEARCH_FIRST_FRESH)):
+            ent = None
+        ent = dict(ent, items=list(ent["items"])) if ent else None
+    if ent is None:
+        r = it.search(query, params=params)
+        ent = {"ts": now, "items": [e for e in r["items"] if e.get("kind") == want],
+               "cont": r["continuation"]}
+        if not ent["items"]:
+            # Almost always a YouTube layout change our parser doesn't know yet; yt-dlp's (kept
+            # current upstream) gets the query. A genuinely empty search just pays one yt-dlp run.
+            raise it.InnertubeError("search page parsed empty")
+    pages = 0
+    while len(ent["items"]) < end and ent["cont"] and pages < 8:
+        r = it.search(continuation=ent["cont"])
+        pages += 1
+        ent["items"] += [e for e in r["items"] if e.get("kind") == want]
+        ent["cont"] = r["continuation"]
+        if not r["items"]:
+            break
+    with _search_pages_lock:
+        _search_pages[key] = ent
+        for k in sorted(_search_pages, key=lambda k: _search_pages[k]["ts"])[
+                :max(0, len(_search_pages) - _SEARCH_PAGES_MAX)]:
+            _search_pages.pop(k, None)
+    return ent
+
+
+def _it_list_video(e, now):
+    """An innertube search/related item → the list-row shape _video_entry produces."""
+    ago = e.get("ago")
+    return {
+        "type": "video",
+        "id": e["id"],
+        "title": e.get("title") or "(untitled)",
+        "uploader": e.get("channel") or "",
+        "duration": e.get("duration") or 0,
+        "thumbnail": _video_thumb(e["id"]),
+        "url": "",
+        "subscribers": 0,
+        "views": e.get("views") or 0,
+        "posted": _rel_from_ts(now - ago) if ago is not None else "",
+        "live": 1 if e.get("live") else 0,
+    }
+
+
+def _it_is_short(e):
+    d = e.get("duration") or 0
+    return bool(e.get("short")) or 0 < d <= _SHORT_MAX_SECS
+
+
+def _search_innertube(query, n, kind, start, sp):
+    """search() through innertube, or None to fall back to yt-dlp."""
+    if _it() is None:
+        return None
+    want = "channel" if kind == "channel" else "video"
+    end = start + n - 1
+    _t = time.time()
+    try:
+        ent = _it_search_window(query, sp, want, end, fresh_first=(start <= 1))
+    except Exception as ex:
+        _it_note("search", ex)
+        _tlog("search innertube failed %.2fs → yt-dlp: %s" % (time.time() - _t, str(ex)[:120]))
+        return None
+    _tlog("search innertube %.2fs [%d:%d] of %d" % (time.time() - _t, start, end, len(ent["items"])))
+    raw = ent["items"]
+    page = raw[start - 1:end]
+    has_more = len(page) >= n and (bool(ent["cont"]) or len(raw) > end)
+    if want == "channel":
+        items = [{"type": "channel", "id": e["id"], "title": e.get("title") or "(channel)",
+                  "uploader": "", "duration": 0,
+                  "thumbnail": _pick_avatar({"thumbnails": e.get("avatars") or []}, 176),
+                  "url": e.get("url") or "", "subscribers": e.get("subscribers") or 0,
+                  "views": 0, "posted": ""} for e in page]
+        return {"ok": True, "items": items, "kind": kind, "has_more": has_more,
+                "filtered_members": 0}
+    kept = [e for e in page if not e.get("members")]
+    filtered_members = len(page) - len(kept)
+    if _hide_shorts():
+        kept = [e for e in kept if not _it_is_short(e)]
+    now = time.time()
+    return {"ok": True, "items": [_it_list_video(e, now) for e in kept], "kind": kind,
+            "has_more": has_more, "filtered_members": filtered_members}
+
+
 @_timed_fn("q.search")
 def search(query, n=15, kind="video", start=1, filters=None):
     """One page of search results. `start` is the 1-based index of the first result wanted, so
@@ -3285,10 +3790,9 @@ def search(query, n=15, kind="video", start=1, filters=None):
     dropped (they can't be played without the membership); Shorts too when hide_shorts is on.
 
     `filters` (video kind only) = {"sort","date","dur"} in yt `sp` values; when any is set the
-    query runs through the results page with an `sp=` filter instead of plain ytsearch."""
+    query runs through the results page with an `sp=` filter instead of plain ytsearch.
+    InnerTube /search answers first (_search_innertube); yt-dlp is the fallback."""
     path = _ytdlp_path()
-    if not path:
-        return {"ok": False, "error": "yt-dlp not found"}
     if kind not in ("video", "channel"):
         kind = "video"
     f = filters or {}
@@ -3301,6 +3805,18 @@ def search(query, n=15, kind="video", start=1, filters=None):
     try:
         start = max(1, int(start))
         n = max(1, int(n))
+    except (TypeError, ValueError):
+        start, n = 1, 15
+    # Fast path: InnerTube /search with the same sp= filter. Video searches always pin
+    # type=video, matching ytsearch's video-only results. Any failure → yt-dlp below.
+    fast = _search_innertube(query, n, kind, start,
+                             _SEARCH_SP["channel"] if kind == "channel" else
+                             _search_filter_sp(fsort, fdate, fdur, video_only=True))
+    if fast is not None:
+        return fast
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found"}
+    try:
         end = start + n - 1
         if kind == "channel":
             target = ("https://www.youtube.com/results?search_query=%s&sp=%s"
@@ -3322,11 +3838,10 @@ def search(query, n=15, kind="video", start=1, filters=None):
         # a harmless no-op on the channel-results path, which carries no per-item date.)
         xargs = ["--extractor-args", "youtubetab:approximate_date"]
         with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, *xargs, "--flat-playlist",
-                 "--playlist-items", "%d:%d" % (start, end),
-                 "--dump-single-json", "--", target],
-                capture_output=True, text=True, timeout=90)
+            proc = _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs, *xargs, "--flat-playlist",
+                       "--playlist-items", "%d:%d" % (start, end),
+                       "--dump-single-json", "--", target], 90)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "search failed")}
         data = json.loads(proc.stdout)
@@ -3350,14 +3865,59 @@ def search(query, n=15, kind="video", start=1, filters=None):
         return {"ok": False, "error": str(ex)}
 
 
+# watch-next answers (related videos, likes, upload date), shared by related() and video_info().
+_next_cache = {}               # video id -> (ts, innertube.watch_next result)
+_next_cache_lock = threading.Lock()
+_next_inflight = {}            # video id -> Event: the info view asks for details and comments at once
+_NEXT_TTL = 600
+_NEXT_MAX = 32
+
+
+def _watch_next(vid):
+    """innertube.watch_next(vid), cached briefly and single-flight; None when unavailable or it
+    failed."""
+    it = _it()
+    if it is None or not re.fullmatch(r"[\w-]{11}", vid or ""):
+        return None
+    now = time.time()
+    with _next_cache_lock:
+        hit = _next_cache.get(vid)
+        if hit and now - hit[0] < _NEXT_TTL:
+            return hit[1]
+        ev = _next_inflight.get(vid)
+        leader = ev is None
+        if leader:
+            ev = _next_inflight[vid] = threading.Event()
+    if not leader:                      # join the request already out instead of sending a twin
+        ev.wait(15)
+        with _next_cache_lock:
+            hit = _next_cache.get(vid)
+        return hit[1] if hit else None
+    _t = time.time()
+    try:
+        r = it.watch_next(vid)
+        _tlog("watch_next %.2fs (%d related)" % (time.time() - _t, len(r.get("related") or [])))
+        with _next_cache_lock:
+            _next_cache[vid] = (now, r)
+            for k in sorted(_next_cache, key=lambda k: _next_cache[k][0])[
+                    :max(0, len(_next_cache) - _NEXT_MAX)]:
+                _next_cache.pop(k, None)
+        return r
+    except Exception as ex:
+        _it_note("watch-next", ex)
+        _tlog("watch_next failed %.2fs: %s" % (time.time() - _t, str(ex)[:120]))
+        return None
+    finally:
+        with _next_cache_lock:
+            _next_inflight.pop(vid, None)
+        ev.set()
+
+
 @_timed_fn("q.related")
 def related(video_id, n=20):
-    """Recommendations for a video via its YouTube autoplay Mix (watch?v=ID&list=RD<ID>), pulled
-    flat. Cheap — the same flat-playlist path search/channels use, no InnerTube. The seed video
-    (item 1 of the mix) is dropped; Shorts are filtered when hide_shorts is on."""
-    path = _ytdlp_path()
-    if not path:
-        return {"ok": False, "error": "yt-dlp not found"}
+    """Recommendations for a video: the InnerTube watch-next sidebar first (one POST, shared with
+    video_info), else its YouTube autoplay Mix (watch?v=ID&list=RD<ID>) pulled flat through
+    yt-dlp. The seed video is dropped; Shorts are filtered when hide_shorts is on."""
     vid = video_id or ""
     if "://" in vid:                     # accept a full watch URL too → pull its v= id for the RD list
         try:
@@ -3366,17 +3926,30 @@ def related(video_id, n=20):
             pass
     if not vid:
         return {"ok": False, "error": "no video id"}
+    nx = _watch_next(vid)
+    if nx and nx.get("related"):
+        try:
+            n = max(1, int(n))
+        except (TypeError, ValueError):
+            n = 20
+        ents = [e for e in nx["related"] if e.get("id") != vid and not e.get("members")]
+        if _hide_shorts():
+            ents = [e for e in ents if not _it_is_short(e)]
+        now = time.time()
+        return {"ok": True, "items": [_it_list_video(e, now) for e in ents[:n]]}
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False, "error": "yt-dlp not found"}
     try:
         n = max(1, int(n))
         url = "https://www.youtube.com/watch?v=%s&list=RD%s" % (
             urllib.parse.quote(vid), urllib.parse.quote(vid))
         with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs,
-                 "--extractor-args", "youtubetab:approximate_date",
-                 "--flat-playlist", "--playlist-items", "1:%d" % (n + 1),   # +1: seed is item 1
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=90)
+            proc = _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs,
+                       "--extractor-args", "youtubetab:approximate_date",
+                       "--flat-playlist", "--playlist-items", "1:%d" % (n + 1),   # +1: seed is item 1
+                       "--dump-single-json", "--", url], 90)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "no recommendations")}
         data = json.loads(proc.stdout)
@@ -3392,21 +3965,43 @@ def related(video_id, n=20):
         return {"ok": False, "error": str(ex)}
 
 
+_sugg_cache = {}               # query -> (ts, [suggestions]); backspacing over a prefix is free
+_SUGG_TTL = 600
+_SUGG_MAX = 128
+
+
 def search_suggestions(query):
     """YouTube search autocomplete via Google's public suggest endpoint — a cheap HTTP
-    call, no yt-dlp. Returns ["term", ...]."""
+    call, no yt-dlp. Returns ["term", ...]. Rides innertube's keep-alive pool when present, so a
+    keystroke costs one request on a warm connection instead of a fresh TLS handshake."""
     q = (query or "").strip()
     if not q:
         return {"ok": True, "suggestions": []}
+    hit = _sugg_cache.get(q)
+    if hit and time.time() - hit[0] < _SUGG_TTL:
+        return {"ok": True, "suggestions": list(hit[1])}
     _force_ipv4()
     url = ("https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=%s"
            % urllib.parse.quote(q))
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
+        it = _it()
+        if it is not None:
+            status, body = it._transport("GET", url, None, {"User-Agent": _BROWSER_UA}, 5)
+            if status != 200:
+                raise IOError("HTTP %s" % status)
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                body = r.read()
+        data = json.loads(body.decode("utf-8", "replace"))
         sugg = data[1] if isinstance(data, list) and len(data) > 1 else []
-        return {"ok": True, "suggestions": [s for s in sugg if isinstance(s, str)][:10]}
+        out = [s for s in sugg if isinstance(s, str)][:10]
+        _sugg_cache[q] = (time.time(), out)
+        if len(_sugg_cache) > _SUGG_MAX:
+            for k in sorted(_sugg_cache, key=lambda k: _sugg_cache[k][0])[
+                    :len(_sugg_cache) - _SUGG_MAX]:
+                _sugg_cache.pop(k, None)
+        return {"ok": True, "suggestions": out}
     except Exception:
         return {"ok": False, "suggestions": []}
 
@@ -3473,17 +4068,22 @@ def _resolve_uncached(video_id):
     player; the raw `video_url` + `audio_url` pair is for the dual-source pipeline.
     """
     path = _ytdlp_path()
-    if not path:
-        return {"ok": False, "error": "yt-dlp not found"}
     url = video_id
     if "://" not in url:
         url = "https://www.youtube.com/watch?v=" + video_id
     _t0 = time.time()
-    # Bring the PO-token sidecar up (no-op unless installed+enabled) — with a short grace, never
-    # owning the boot: the primary tv_embedded ladder is token-free, so when the server isn't up
-    # in time the dump proceeds without it and the still-booting server serves the next resolve.
-    _ensure_pot_server(wait=4)
-    _tlog("pot_ensure %.2fs" % (time.time() - _t0))
+    # FAST PATH: one InnerTube player request (see _fast_player_data). When it yields a playable HD
+    # pair, yt-dlp, the PO-token sidecar and the probe below are skipped entirely; anything it
+    # can't serve (live, restricted, bot-walled, ciphered) drops to the unchanged yt-dlp ladder.
+    fast = _fast_player_data(video_id) if "://" not in video_id else None
+    if fast is None:
+        if not path:
+            return {"ok": False, "error": "yt-dlp not found"}
+        # Bring the PO-token sidecar up (no-op unless installed+enabled) — with a short grace, never
+        # owning the boot: the primary ladder is token-free, so when the server isn't up
+        # in time the dump proceeds without it and the still-booting server serves the next resolve.
+        _ensure_pot_server(wait=4)
+        _tlog("pot_ensure %.2fs" % (time.time() - _t0))
     def _dump(extra, anon=False):
         """Run yt-dlp --dump-single-json with extra args; return (data, error).
 
@@ -3494,7 +4094,7 @@ def _resolve_uncached(video_id):
         (Provider INACTIVE → a widen retry carries no fetch_pot marker and may run in-process
         too; equivalent by construction, since without the provider the binary loads no plugin.)
 
-        anon=True resolves WITHOUT the login cookies. YouTube gates token-free clients (tv_embedded)
+        anon=True resolves WITHOUT the login cookies. YouTube gates token-free clients
         HARD for AUTHENTICATED requests but not anonymous ones — confirmed on-device 2026-09-05: the
         same videos that 403'd (→ ~10s mweb+token fallback) signed-in resolved token-free in ~1.3s
         signed OUT. So the primary dump goes anonymous (public videos skip the gate entirely) and only
@@ -3540,10 +4140,17 @@ def _resolve_uncached(video_id):
 
     try:
         _client_used = _default_client() or "auto"   # which client actually produced the URLs (debug)
-        # Primary = token-free AND cookie-free. Authenticated token-free requests get gated by YouTube;
-        # anonymous ones don't. Public videos resolve here fast + un-gated; a restricted video fails
-        # this and drops to the cookie'd (+token) fallback below. (on-device confirmed 2026-09-05)
-        data, err = _dump(_yt_extractor_args(), anon=True)
+        if fast is not None:
+            # Fast-path data carries a probed HD pair (or, live, a muxed HLS rung): none of the
+            # widen/probe branches below may fire for it.
+            data, err = fast, ""
+            _client_used = "innertube:" + ("live" if fast.get("is_live")
+                                           else _it().player_client()[0])
+        else:
+            # Primary = token-free AND cookie-free. Authenticated token-free requests get gated by
+            # YouTube; anonymous ones don't. Public videos resolve here fast + un-gated; a restricted
+            # video fails this and drops to the cookie'd (+token) fallback below. (on-device 2026-09-05)
+            data, err = _dump(_yt_extractor_args(), anon=True)
         # A hard failure (data is None) is usually YouTube's "confirm you're not a bot" check
         # tripping this client — retry once with the wider set. tv/android_vr use different
         # attestation and often pass where web/web_embedded get bot-checked.
@@ -3553,11 +4160,11 @@ def _resolve_uncached(video_id):
                 data = data2; _client_used = _RETRY_CLIENTS + "(widen)"
             else:
                 err = err or err2
-        # The primary (tv_embedded) usually returns the full fetchable ladder. If SABR
+        # The token-free primary usually returns the full fetchable ladder. If SABR
         # degraded it to muxed-only (no HD dual-source pair), widen the client net once to
         # hunt for a fetchable HD pair elsewhere — only switch if the result is actually
         # better (HD found, or the primary had nothing playable at all).
-        elif not _hd_pair(data):
+        elif fast is None and not _hd_pair(data):
             data2, _ = _dump(_yt_extractor_args(client_override=_RETRY_CLIENTS, want_pot=True))
             if data2 is not None and _hd_pair(data2):
                 data = data2; _client_used = _RETRY_CLIENTS + "(widen)"
@@ -3566,15 +4173,15 @@ def _resolve_uncached(video_id):
         if data is None:
             return {"ok": False, "error": err}
         formats = data.get("formats", [])
-        # Token-free fast-path probe: tv_embedded is the fast default and needs NO token, but token-free
+        # Token-free probe: the primary client is the fast default and needs NO token, but token-free
         # clients are the ones YouTube gates unpredictably — when gated the stream 403s the instant
         # playback fetches it. Probe one chosen URL; on a real 403 re-extract with the reliable TOKEN
         # path (mweb + a minted PO token) — done HERE, before playback, so the itags stay consistent
-        # (a mid-stream client switch can't: clients emit different itag shapes). Only when tv_embedded
-        # is OUR default choice (provider set up, no user-set player_client, no widen fired) — a user who
+        # (a mid-stream client switch can't: clients emit different itag shapes). Only when the
+        # token-free client is OUR default choice (provider set up, no user-set player_client, no widen fired) — a user who
         # explicitly picks a client keeps it, and a widen result already left _client_used != it.
         _manual_client = (get_settings().get("player_client") or "").strip().lower() not in ("", "auto")
-        if _pot_active() and not _manual_client and _client_used == "tv_embedded":
+        if _pot_active() and not _manual_client and _client_used == _token_free_client():
             _pt = (_pick_audio(formats, "") or _pick_video(formats, 0)
                    or _pick(formats, _MUXED_ITAGS) or {})
             if _pt.get("url") and "m3u8" not in (_pt.get("protocol") or ""):
@@ -3618,11 +4225,13 @@ def _resolve_uncached(video_id):
         http_ua = ((video or audio or muxed or {}).get("http_headers") or {}).get(
             "User-Agent", "") or _BROWSER_UA
         if _DEBUG:   # instant-403 probe: which client, and does the COLD dump carry a valid pot= token?
-            _tlog("resolve picks [client=%s]: v=%s %s | a=%s %s | m=%s %s"
-                  % (_client_used,
+            _tlog("resolve picks %s [client=%s]: v=%s %s | a=%s %s | m=%s %s"
+                  % (video_id, _client_used,
                      (video or {}).get("format_id"), _pot_of((video or {}).get("url", "")),
                      (audio or {}).get("format_id"), _pot_of((audio or {}).get("url", "")),
                      (muxed or {}).get("format_id"), _pot_of((muxed or {}).get("url", ""))))
+            _tlog("resolve urls: v[%s] a[%s]" % (_url_shape((video or {}).get("url", "")),
+                                                  _url_shape((audio or {}).get("url", ""))))
             if _pot_active():   # a first-mint crash/OOM shows here as an exit-code line between dumps
                 _tlog("pot log: " + ((_pot_server_log_tail(6) or "(none)").replace("\n", " | ")))
         # HLS (m3u8) plays fine directly, and proxying the manifest breaks segment
@@ -3745,6 +4354,45 @@ def _resolve_uncached(video_id):
         return {"ok": False, "error": str(ex)}
 
 
+def _video_info_innertube(video_id):
+    """video_info() from innertube (player_info + watch_next concurrently), or None to use yt-dlp —
+    which still returns metadata for videos the player won't serve here (age/geo walls)."""
+    it = _it()
+    vid = video_id or ""
+    if "://" in vid:
+        pu = parse_youtube_url(vid) or {}
+        vid = pu.get("id") or "" if pu.get("kind") == "video" else ""
+    if it is None or not re.fullmatch(r"[\w-]{11}", vid):
+        return None
+    box = {}
+    th = threading.Thread(target=lambda: box.update(nx=_watch_next(vid)), daemon=True)
+    th.start()
+    _t = time.time()
+    try:
+        d = it.player_info(vid)
+    except Exception as ex:
+        _tlog("video_info innertube failed %.2fs → yt-dlp: %s" % (time.time() - _t, str(ex)[:120]))
+        return None
+    th.join(8)
+    nx = box.get("nx") or {}
+    _tlog("video_info innertube %.2fs" % (time.time() - _t))
+    return {"ok": True, "info": {
+        "title": d.get("title", ""),
+        "is_live": bool(d.get("is_live")),
+        "uploader": d.get("uploader") or "",
+        "channel_id": d.get("channel_id") or "",
+        "channel_url": d.get("channel_url") or "",
+        "description": d.get("description") or "",
+        "duration": d.get("duration") or 0,
+        "chapters": [{"start": c.get("start_time") or 0, "title": c.get("title") or ""}
+                     for c in (d.get("chapters") or []) if c.get("start_time") is not None],
+        "thumbnail": "https://i.ytimg.com/vi/%s/hqdefault.jpg" % vid,
+        "view_count": d.get("view_count") or 0,
+        "like_count": nx.get("likes") or 0,
+        "upload_date": nx.get("upload_date") or "",
+    }}
+
+
 @_timed_fn("q.video_info")
 def video_info(video_id):
     """Lightweight metadata for the info-only view (title, channel, description, chapters, stats)
@@ -3758,7 +4406,13 @@ def video_info(video_id):
     faster (measured ~1.5s vs ~1.6–2.9s on the dev host; a bigger gap on ARM). Falls back to the
     default client set if android ever fails (age/region edge cases), so this is never SLOWER to
     succeed than the plain extraction, only faster in the common case. (player_skip=js was tried and
-    REJECTED — it makes the web response invalid → "Video unavailable"; the JS is load-bearing.)"""
+    REJECTED — it makes the web response invalid → "Video unavailable"; the JS is load-bearing.)
+
+    InnerTube answers first (_video_info_innertube: one player POST + watch-next in parallel,
+    ~0.5s); everything above is the fallback for what it can't answer."""
+    fast = _video_info_innertube(video_id)
+    if fast is not None:
+        return fast
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found"}
@@ -3768,10 +4422,9 @@ def video_info(video_id):
 
     def _dump(extra):
         with _cookies_args() as cargs:
-            return subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, *extra, "--skip-download",
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=90)
+            return _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs, *extra, "--skip-download",
+                       "--dump-single-json", "--", url], 90)
 
     try:
         proc = _dump(["--extractor-args", "youtube:player_client=android"])
@@ -4152,7 +4805,7 @@ _SETTINGS_DEFAULTS = {"hide_shorts": True, "sponsorblock": True,
 # launch by _autofetch_zipapp); the binary stays the fallback for every failure. A stale
 # "fast_resolve" key from older builds may linger in settings.json — it is simply ignored.
 
-# Widened client net, tried in ONE extra yt-dlp pass when the primary (tv_embedded, or
+# Widened client net, tried in ONE extra yt-dlp pass when the primary (token-free client, or
 # yt-dlp's auto pick when no provider is set up) hard-fails on a bot-wall or comes back
 # SABR-thin (no fetchable HD pair). yt-dlp queries them all and merges formats; the
 # url-presence filter in _pick keeps only the ones a SABR client can't serve. Unknown names
@@ -4194,24 +4847,36 @@ def set_setting(key, value):
     return get_settings()
 
 
+def _token_free_client():
+    """The TOKEN-FREE, JS-less client the yt-dlp primary dump asks for: the installed yt-dlp's own
+    JS-less default (visionos as of 2026.08), as adopted by innertube.configure_from_ytdlp — the
+    same client the InnerTube fast path uses, so both paths mint the same itag shapes.
+    (This was a hardcoded `tv_embedded` until 2026-10: yt-dlp removed that client in 2026.01.31 and
+    silently skips unknown names, so the dump quietly ran yt-dlp's default set while the probe
+    gating and every log line still said tv_embedded.)"""
+    it = _it()
+    try:
+        return (it.player_client()[0] if it is not None else "") or "visionos"
+    except Exception:
+        return "visionos"
+
+
 def _default_client():
-    """Which YouTube client resolve() uses by default.
+    """Which YouTube client resolve()'s yt-dlp path uses by default.
 
     A user-set player_client always wins. Otherwise, when the PO-token provider is set up we default
-    to `tv_embedded` — a TOKEN-FREE client: it returns the full range-fetchable HD ladder with the
-    ORIGINAL audio (no DRC variants) and, crucially, needs NO Proof-of-Origin token, so resolve skips
-    the ~4-5s on-device BotGuard mint entirely (measured 2026-09-05: tv_embedded ≈1.5s incl. spawn +
-    HTTP 206 fetchable, vs web_embedded's ~5.5s dump — this is how NewPipe stays fast). Token-free
-    clients are the ones YouTube gates unpredictably, so resolve PROBES tv_embedded's URL once and,
-    only on a real 403 (gated), falls back to the reliable token path (`mweb` + a minted token). The
+    to the TOKEN-FREE JS-less client (_token_free_client): the full range-fetchable HD ladder with
+    NO Proof-of-Origin token, so resolve skips the ~4-5s on-device BotGuard mint entirely. Token-free
+    clients are the ones YouTube gates unpredictably, so resolve PROBES the picked URL once and, only
+    on a real 403 (gated), falls back to the reliable token path (`mweb` + a minted token). The
     provider is thus a SAFETY NET for the rare gated video, not a per-resolve tax. (History: default was
     web_embedded, then mweb-as-blanket-default on 2026-09-03 which put the mint on EVERY resolve — the
-    "slow as of late" reports; tv_embedded-first removes it from the common path.) With no provider set
+    "slow as of late" reports; token-free-first removes it from the common path.) With no provider set
     up we leave yt-dlp on its own auto pick. resolve() also widens to _RETRY_CLIENTS if SABR-thin."""
     c = (get_settings().get("player_client") or "").strip()
     if c and c.lower() != "auto":
         return c
-    return "tv_embedded" if _pot_active() else ""
+    return _token_free_client() if _pot_active() else ""
 
 
 def _yt_extractor_args(client_override=None, want_pot=False):
@@ -4564,11 +5229,30 @@ _SB_CATEGORIES = ('["sponsor","selfpromo","interaction","intro","outro","preview
                   '"filler","music_offtopic"]')
 
 
+_sb_cache = {}                 # video id -> (ts, segments); VideoPage asks on every (re)open
+_SB_TTL = 600
+_SB_MAX = 64
+
+
 def sponsor_segments(video_id):
     """SponsorBlock skip segments for a video: [{start, end, category}] in seconds. Uses the
-    public sponsor.ajay.app API; 404 just means nobody's submitted any."""
+    public sponsor.ajay.app API; 404 just means nobody's submitted any. Answers are cached
+    briefly (failures aren't), so re-opening a video doesn't re-ask."""
     if not video_id:
         return {"ok": True, "segments": []}
+    hit = _sb_cache.get(video_id)
+    if hit and time.time() - hit[0] < _SB_TTL:
+        return {"ok": True, "segments": list(hit[1])}
+    res = _sponsor_segments_fetch(video_id)
+    if res.get("ok"):
+        _sb_cache[video_id] = (time.time(), list(res["segments"]))
+        if len(_sb_cache) > _SB_MAX:
+            for k in sorted(_sb_cache, key=lambda k: _sb_cache[k][0])[:len(_sb_cache) - _SB_MAX]:
+                _sb_cache.pop(k, None)
+    return res
+
+
+def _sponsor_segments_fetch(video_id):
     _force_ipv4()
     url = ("https://sponsor.ajay.app/api/skipSegments?videoID=%s&categories=%s"
            % (urllib.parse.quote(video_id), urllib.parse.quote(_SB_CATEGORIES)))
@@ -4736,9 +5420,8 @@ def _subscription_channels():
         raise RuntimeError("yt-dlp not found")
     url = _with_authuser("https://www.youtube.com/feed/channels")
     with _cookies_args() as cargs:
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, *cargs, "--flat-playlist", "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=120)
+        proc = _ytdlp_run(
+            path, [*_COMMON_ARGS, *cargs, "--flat-playlist", "--dump-single-json", "--", url], 120)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip()[:300] or "subscription fetch failed")
     data = json.loads(proc.stdout)
@@ -4820,9 +5503,8 @@ def _library_playlists():
         raise RuntimeError("yt-dlp not found")
     url = _with_authuser("https://www.youtube.com/feed/playlists")
     with _cookies_args() as cargs:
-        proc = subprocess.run(
-            [path, *_COMMON_ARGS, *cargs, "--flat-playlist", "--dump-single-json", "--", url],
-            capture_output=True, text=True, timeout=120)
+        proc = _ytdlp_run(
+            path, [*_COMMON_ARGS, *cargs, "--flat-playlist", "--dump-single-json", "--", url], 120)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip()[:300] or "playlist fetch failed")
     data = json.loads(proc.stdout)
@@ -5297,21 +5979,126 @@ def _avatar_hydrate():
         _avatar_state["loaded"] = True
 
 
+def _avatar_store(keys, res):
+    """Cache an avatar result under every given key (the channel ref as asked + its UC id), and
+    persist only when something actually changed — channel_videos calls this on every page 1."""
+    now = time.time()
+    with _avatar_cache_lock:
+        _avatar_hydrate()
+        changed = False
+        for k in keys:
+            if not k:
+                continue
+            ent = _avatar_cache.get(k)
+            if not ent or ent["res"] != res or now - ent["ts"] > _AVATAR_CACHE_TTL / 2:
+                _avatar_cache[k] = {"ts": now, "res": res}
+                changed = True
+        if not changed:
+            return
+        if len(_avatar_cache) > _AVATAR_CACHE_MAX:  # evict oldest beyond the cap
+            for k, _ in sorted(_avatar_cache.items(),
+                               key=lambda kv: kv[1]["ts"])[:len(_avatar_cache) - _AVATAR_CACHE_MAX]:
+                _avatar_cache.pop(k, None)
+        _save_avatar_cache()            # persist so avatars survive an app restart
+
+
+# --- InnerTube channel pages (fast path for channel_videos / channel_avatar) --------------- #
+# One `browse` POST returns a channel's newest ~30 uploads WITH lengths, views and ages plus the
+# header (avatar, subscribers, video count); continuation tokens page further. Pages are cached per
+# channel so scroll-to-load-more continues from the stored token instead of re-listing from the top
+# (each yt-dlp page used to re-walk every earlier page), and so the avatar fetch on video open
+# leaves page 1 warm for a tap on the channel name.
+_chan_pages = {}               # UC id -> {"ts", "items": [innertube items], "cont": token|None, "channel"}
+_chan_pages_lock = threading.Lock()
+_CHAN_PAGES_TTL = 600          # later pages ride the cached continuation this long
+_CHAN_FIRST_FRESH = 120        # a page 1 younger than this is reused as-is
+_CHAN_PAGES_MAX = 16
+
+
+def _it_channel(channel, need=0, fresh_first=False):
+    """(cid, entry) for a channel ref from the InnerTube page cache — fetching page 1 when missing
+    or stale, then continuation pages until it holds `need` items (or the channel runs out).
+    Raises on any failure; callers fall back to yt-dlp."""
+    it = _it()
+    if it is None:
+        raise RuntimeError("innertube unavailable")
+    _force_ipv4()
+    cid = it.resolve_channel(channel)
+    now = time.time()
+    with _chan_pages_lock:
+        ent = _chan_pages.get(cid)
+        ent = dict(ent) if ent else None
+    if ent is None or now - ent["ts"] > (_CHAN_FIRST_FRESH if fresh_first else _CHAN_PAGES_TTL):
+        tab = it.channel_tab(cid, "videos")
+        if not tab["items"]:
+            # A channel without uploads has no Videos tab (channel_tab raises for that), so an
+            # empty one is a layout change: let yt-dlp read it rather than show nothing.
+            raise it.InnertubeError("videos tab parsed empty")
+        ent = {"ts": now, "items": list(tab["items"]), "cont": tab["continuation"],
+               "channel": tab["channel"]}
+    while len(ent["items"]) < need and ent["cont"]:
+        nxt = it.continuation(ent["cont"])
+        ent["items"] = ent["items"] + nxt["items"]
+        ent["cont"] = nxt["continuation"]
+        if not nxt["items"]:
+            break
+    with _chan_pages_lock:
+        _chan_pages[cid] = ent
+        if len(_chan_pages) > _CHAN_PAGES_MAX:
+            for k, _ in sorted(_chan_pages.items(),
+                               key=lambda kv: kv[1]["ts"])[:len(_chan_pages) - _CHAN_PAGES_MAX]:
+                _chan_pages.pop(k, None)
+    # Every listing teaches lengths for free — the feed then shows them with no classification pass.
+    _learn_durations({e["id"]: e["duration"] for e in ent["items"] if e.get("duration")})
+    return cid, ent
+
+
+def _it_avatar(ch, size=176):
+    return _pick_avatar({"thumbnails": ch.get("avatars") or []}, size)
+
+
+def _it_video_item(e, uploader, now):
+    """An innertube listing item → the channel/feed row shape the QML lists use."""
+    ago = e.get("ago")
+    return {
+        "id": e["id"],
+        "title": e.get("title") or "(untitled)",
+        "uploader": uploader,
+        "duration": e.get("duration") or 0,
+        "thumbnail": _video_thumb(e["id"]),
+        "views": e.get("views") or 0,
+        "posted": _rel_from_ts(now - ago) if ago is not None else "",
+        "live": 1 if e.get("live") else 0,
+    }
+
+
 def channel_avatar(channel):
     """Just the channel's avatar URL + id — cheap enough to fetch on video open.
 
-    Fetches one flat entry so yt-dlp still hands back the channel metadata (avatar)
-    without listing the whole uploads tab. Cached for a week (_AVATAR_CACHE_TTL, persisted
-    to disk) so opening several of a channel's videos doesn't re-run yt-dlp each time.
+    InnerTube first (one browse POST, which also warms the channel's page 1); the yt-dlp fallback
+    fetches one flat entry so yt-dlp still hands back the channel metadata (avatar) without listing
+    the whole uploads tab. Cached for a week (_AVATAR_CACHE_TTL, persisted to disk) so opening
+    several of a channel's videos doesn't re-fetch each time.
     """
-    path = _ytdlp_path()
-    if not path or not channel:
+    if not channel:
         return {"ok": False}
     with _avatar_cache_lock:
         _avatar_hydrate()               # load the on-disk cache once (survives restarts)
         ent = _avatar_cache.get(channel)
         if ent and time.time() - ent["ts"] < _AVATAR_CACHE_TTL:
             return ent["res"]
+    try:
+        cid, ent = _it_channel(channel, fresh_first=True)
+        thumb = _it_avatar(ent["channel"])
+        if thumb:
+            res = {"ok": True, "id": cid, "thumbnail": thumb}
+            _avatar_store((channel, cid), res)
+            return res
+    except Exception as ex:
+        _tlog("channel_avatar innertube failed → yt-dlp: %s" % str(ex)[:120])
+    path = _ytdlp_path()
+    if not path:
+        return {"ok": False}
     url = channel
     if "://" not in url:
         url = "https://www.youtube.com/channel/%s" % channel
@@ -5319,32 +6106,64 @@ def channel_avatar(channel):
         url = url.rstrip("/") + "/videos"
     try:
         with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--flat-playlist", "--playlist-items", "1",
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=60)
+            proc = _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs, "--flat-playlist", "--playlist-items", "1",
+                       "--dump-single-json", "--", url], 60)
         if proc.returncode != 0:
             return {"ok": False}
         data = json.loads(proc.stdout)
         res = {"ok": True,
                "id": data.get("channel_id") or data.get("id") or "",
                "thumbnail": _pick_avatar(data, 176)}
-        with _avatar_cache_lock:
-            _avatar_cache[channel] = {"ts": time.time(), "res": res}
-            if len(_avatar_cache) > _AVATAR_CACHE_MAX:  # evict oldest beyond the cap
-                for k, _ in sorted(_avatar_cache.items(),
-                                   key=lambda kv: kv[1]["ts"])[:len(_avatar_cache) - _AVATAR_CACHE_MAX]:
-                    _avatar_cache.pop(k, None)
-            _save_avatar_cache()        # persist so avatars survive an app restart
+        _avatar_store((channel,), res)
         return res
     except Exception:
         return {"ok": False}
 
 
+def _channel_videos_innertube(channel, start, n):
+    """channel_videos() via the InnerTube page cache, or None to fall back to yt-dlp."""
+    try:
+        start = max(1, int(start))
+        n = max(1, int(n))
+        cid, ent = _it_channel(channel, need=start - 1 + n, fresh_first=(start <= 1))
+    except Exception as ex:
+        _it_note("channel", ex)
+        _tlog("channel_videos innertube failed → yt-dlp: %s" % str(ex)[:120])
+        return None
+    ch = ent["channel"]
+    raw = ent["items"][start - 1:start - 1 + n]
+    has_more = len(ent["items"]) > start - 1 + n or bool(ent["cont"])
+    entries = [e for e in raw if not e.get("members")]
+    if _hide_shorts():                       # the Videos tab has no Shorts; mirror the old ≤60s rule
+        entries = [e for e in entries if not (0 < (e.get("duration") or 0) <= _SHORT_MAX_SECS)]
+    if _hide_watched():
+        watched = _watched_ids()
+        entries = [e for e in entries if e["id"] not in watched]
+    now = time.time()
+    name = ch.get("name") or ""
+    thumb = _it_avatar(ch)
+    if thumb:
+        _avatar_store((channel, cid), {"ok": True, "id": cid, "thumbnail": thumb})
+    return {"ok": True, "items": [_it_video_item(e, name, now) for e in entries],
+            "has_more": has_more, "channel": {
+                "id": cid,
+                "name": name,
+                "url": ch.get("url") or "https://www.youtube.com/channel/%s" % cid,
+                "thumbnail": thumb,
+                "subscribers": ch.get("subscribers") or 0,
+                "video_count": ch.get("video_count") or 0,
+            }}
+
+
 @_timed_fn("q.channel_videos")
 def channel_videos(channel, start=1, n=30):
     """A page of a channel's uploads (a channel_id or any channel URL). `start` is the
-    1-based index of the first video wanted, so the UI can page in more as it scrolls."""
+    1-based index of the first video wanted, so the UI can page in more as it scrolls.
+    InnerTube first (see _it_channel); yt-dlp's flat listing is the fallback."""
+    res = _channel_videos_innertube(channel, start, n)
+    if res is not None:
+        return res
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found"}
@@ -5357,12 +6176,11 @@ def channel_videos(channel, start=1, n=30):
         start = max(1, int(start))
         n = max(1, int(n))
         with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
-                 "--extractor-args", "youtubetab:approximate_date",   # upload dates inline (RSS is gone)
-                 "--playlist-items", "%d:%d" % (start, start + n - 1),
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=90)
+            proc = _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs, "--flat-playlist",
+                       "--extractor-args", "youtubetab:approximate_date",   # upload dates inline (RSS is gone)
+                       "--playlist-items", "%d:%d" % (start, start + n - 1),
+                       "--dump-single-json", "--", url], 90)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "channel fetch failed")}
         data = json.loads(proc.stdout)
@@ -5455,11 +6273,48 @@ def _feed_fetch_channel(path, cid, per_channel):
     """One subscribed channel's recent uploads → [(sort_ts, item), ...]. The channel's RSS
     feed (feeds/videos.xml, spawn-free urllib) is the PRIMARY source: fast + exact dates, but no
     duration/live/Shorts flag (backfilled later by feed_durations — the NewPipe/FreeTube
-    fast-mode tradeoff). yt-dlp's /videos tab is the FALLBACK for when RSS returns nothing
-    (YouTube breaks RSS intermittently — mirrors how NewPipe/FreeTube cross-fall-back). Any
-    total failure of both contributes nothing."""
+    fast-mode tradeoff). When RSS returns nothing (YouTube breaks it intermittently — mirrors how
+    NewPipe/FreeTube cross-fall-back) the InnerTube Videos tab stands in (one POST, lengths inline,
+    approximate dates), and yt-dlp's /videos tab is the last resort. Any total failure of all
+    three contributes nothing."""
     rows = _feed_from_rss(cid, per_channel)
+    if not rows:
+        rows = _feed_from_innertube(cid, per_channel)
     return rows if rows else _feed_from_ytdlp(path, cid, per_channel)
+
+
+@_timed_fn("feed.innertube")
+def _feed_from_innertube(cid, per_channel):
+    """FALLBACK #1: a channel's Videos tab via one InnerTube browse POST. Lengths + live flag inline;
+    dates are YouTube's relative ones ("3 days ago"), so cross-channel ordering is approximate —
+    still far better than an empty channel. Same row shape as the RSS / yt-dlp paths."""
+    it = _it()
+    if it is None or not str(cid).startswith("UC"):
+        return []
+    _force_ipv4()
+    try:
+        tab = it.channel_tab(cid, "videos")
+    except Exception:
+        return []
+    now = time.time()
+    if tab["items"] and all(e.get("ago") is None and not e.get("live") for e in tab["items"]):
+        _it_note("feed", it.InnertubeError("videos tab parsed without dates"))
+        return []                              # undatable rows would sink to the bottom: yt-dlp
+    chan = tab["channel"].get("name") or ""
+    rows = []
+    for e in tab["items"][:per_channel]:
+        if e.get("members"):
+            continue
+        ago = e.get("ago")
+        if e.get("live") or e.get("upcoming"):
+            sort_ts = now                          # ride the top, like the yt-dlp path does
+        else:
+            sort_ts = (now - ago) if ago is not None else 0
+        row = _it_video_item(e, chan, now)
+        row.update({"channel_id": cid, "is_short": 0})
+        rows.append((sort_ts, row))
+    _learn_durations({e["id"]: e["duration"] for e in tab["items"] if e.get("duration")})
+    return rows
 
 
 @_timed_fn("feed.ytdlp")
@@ -5469,12 +6324,11 @@ def _feed_from_ytdlp(path, cid, per_channel):
     url = "https://www.youtube.com/channel/%s/videos" % cid
     try:
         with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
-                 "--extractor-args", "youtubetab:approximate_date",
-                 "--playlist-items", "1:%d" % per_channel,
-                 "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=60)
+            proc = _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs, "--flat-playlist",
+                       "--extractor-args", "youtubetab:approximate_date",
+                       "--playlist-items", "1:%d" % per_channel,
+                       "--dump-single-json", "--", url], 60)
         if proc.returncode != 0:
             return []
         data = json.loads(proc.stdout)
@@ -5657,7 +6511,8 @@ def subscription_feed(limit=100, force=False, refresh_all=False):
         results = {}
         try:
             import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(due))) as ex:
+            # RSS / InnerTube are plain HTTP (I/O-bound) — wider than the old spawn-sized pool.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(due))) as ex:
                 for cid, rows in zip(due, ex.map(
                         lambda c: _feed_fetch_channel(path, c, per_channel), due)):
                     results[cid] = rows
@@ -5684,6 +6539,33 @@ def subscription_feed(limit=100, force=False, refresh_all=False):
 
 
 _feed_durations_cache = {"ts": 0.0, "map": {}, "shorts": set()}
+_durations_lock = threading.Lock()        # _learn_durations runs from several workers
+# Feed ids we already tried (and failed) to classify → when. A live/upcoming item is in no tab
+# with a length, so without this every feed_durations call would re-ask for it.
+_classify_tried = {}
+_CLASSIFY_RETRY = 30 * 60
+
+
+def _learn_durations(durs, shorts=()):
+    """Fold lengths / Shorts membership learned from ANY listing (channel pages, the feed fallback,
+    classification) into the persistent caches. Both are immutable facts, so a hit is good forever.
+    Saves a snapshot only when something new arrived."""
+    if not durs and not shorts:
+        return
+    with _durations_lock:
+        dmap = _feed_durations_cache.get("map") or _load_saved_durations()
+        sh = _feed_durations_cache.get("shorts") or _load_saved_shorts()
+        new_d = {k: int(v) for k, v in (durs or {}).items() if v and dmap.get(k) != int(v)}
+        new_s = set(shorts or ()) - sh
+        dmap.update(new_d)
+        sh |= new_s
+        _feed_durations_cache["map"], _feed_durations_cache["shorts"] = dmap, sh
+        snap_d = dict(dmap) if new_d else None
+        snap_s = set(sh) if new_s else None
+    if snap_d is not None:
+        _save_durations(snap_d)
+    if snap_s is not None:
+        _save_shorts(snap_s)
 
 
 def _durations_path():
@@ -5740,11 +6622,13 @@ def _save_shorts(s):
 @_timed_fn("feed.durations")
 def feed_durations(limit_per_channel=30, force=False):
     """For the current subscription feed: {"durations": {video_id: seconds}, "shorts": [video_id]}.
-    RSS carries neither, so this pulls them from yt-dlp's flat channel listing — the /videos tab
-    for durations, and (when hide_shorts is on) the /shorts tab for a DEFINITIVE Shorts set
-    (length can't tell a 3-min Short from a 3-min video). Both are immutable, so they're cached to
-    disk and a yt-dlp spawn is only spent on channels that have a video we've never classified. A
-    fully-cached feed returns instantly with no subprocess. Called AFTER the RSS feed shows."""
+    RSS carries neither (except a /shorts/ link), so this pulls them from each channel's listing —
+    the Videos tab for durations, then only if something is still unclassified the Shorts tab (a
+    DEFINITIVE Shorts set: length can't tell a 3-min Short from a 3-min video) and the Live tab.
+    InnerTube answers each with one POST; yt-dlp's flat listing (2 spawns per channel — the old
+    multi-minute launch stall) is only the per-channel fallback. Both facts are immutable, so
+    they're cached to disk and only channels with a never-classified video are asked at all. A
+    fully-cached feed returns instantly with no network. Called AFTER the RSS feed shows."""
     subs = list_subscriptions()
     chan_base = {}
     for s in subs:
@@ -5768,57 +6652,64 @@ def feed_durations(limit_per_channel=30, force=False):
     feed_ids = [it.get("id") for it in feed_items if it.get("id")]
 
     # Shorts detected straight from the RSS <link> href are classified for free: merge them
-    # into the persistent Shorts set so _feed_shorts_filter drops them with no flash AND the
-    # /shorts-tab spawn below is never spent classifying them.
-    rss_shorts = {it.get("id") for it in feed_items if it.get("is_short")}
-    if rss_shorts - shorts:
-        shorts |= rss_shorts
-        _feed_durations_cache["shorts"] = shorts
-        _save_shorts(shorts)
+    # into the persistent Shorts set so _feed_shorts_filter drops them with no flash AND no
+    # Shorts-tab listing below is ever spent classifying them.
+    _learn_durations({}, {it.get("id") for it in feed_items if it.get("is_short")})
 
     def result():
-        return {"durations": {k: dmap[k] for k in feed_ids if k in dmap},
-                "shorts": [v for v in feed_ids if v in shorts]}
+        dm = _feed_durations_cache.get("map") or {}
+        sh = _feed_durations_cache.get("shorts") or set()
+        return {"durations": {k: dm[k] for k in feed_ids if k in dm},
+                "shorts": [v for v in feed_ids if v in sh]}
 
     # A feed video is "classified" once we have its duration OR know it's a Short.
     def classified(vid):
-        return vid in dmap or vid in shorts
+        return vid in (_feed_durations_cache.get("map") or {}) or \
+            vid in (_feed_durations_cache.get("shorts") or set())
 
-    need = {}
+    now = time.time()
+    # Ids that couldn't be classified recently (live/upcoming: in no tab with a length) aren't
+    # re-asked on every call — only on an explicit refresh or after _CLASSIFY_RETRY.
+    def retry_ok(vid):
+        return force or now - _classify_tried.get(vid, 0) > _CLASSIFY_RETRY
+
+    need = {}                                   # channel key -> base URL
+    need_ids = {}                               # channel key -> unclassified ids (None = unknown)
     for it in feed_items:
         vid, cid = it.get("id"), it.get("channel_id")
-        if vid and not classified(vid) and cid in chan_base:
+        if vid and not classified(vid) and cid in chan_base and retry_ok(vid):
             need[cid] = chan_base[cid]
+            need_ids.setdefault(cid, set()).add(vid)
     # Feed items without a matching channel_id tag (an older in-memory cache) but with unclassified
     # ids → fall back to scanning all channels. Runs BEFORE the instant-return below.
-    if not need and feed_ids and any(not classified(v) for v in feed_ids):
+    if not need and feed_ids and any(not classified(v) and retry_ok(v) for v in feed_ids):
         need = dict(chan_base)
     if not need:
-        return result()                         # nothing to fetch → instant, no yt-dlp
-    # Throttle: don't re-spawn within 5 min unless the user explicitly refreshed (also stops
-    # hammering when a channel keeps returning nothing new for an unclassified id — e.g. a
-    # live/premiere that's in neither tab).
-    now = time.time()
-    if not force and _feed_durations_cache["ts"] and now - _feed_durations_cache["ts"] < 300:
+        return result()                         # nothing to fetch → instant, no network
+    it_mod = _it()
+    # Throttle the yt-dlp fallback: don't re-spawn within 5 min unless the user explicitly
+    # refreshed. (The InnerTube path is a POST per channel, so the per-id retry gate above is
+    # all it needs.)
+    if it_mod is None and not force and _feed_durations_cache["ts"] \
+            and now - _feed_durations_cache["ts"] < 300:
         return result()
     path = _ytdlp_path()
-    if not path:
-        return result()
 
     def flat(url):
+        if not path:
+            return []
         try:
             with _cookies_args() as cargs:
-                proc = subprocess.run(
-                    [path, *_COMMON_ARGS, *cargs, "--flat-playlist",
-                     "--playlist-end", str(int(limit_per_channel)), "--dump-single-json", "--", url],
-                    capture_output=True, text=True, timeout=60)
+                proc = _ytdlp_run(
+                    path, [*_COMMON_ARGS, *cargs, "--flat-playlist",
+                           "--playlist-end", str(int(limit_per_channel)), "--dump-single-json", "--", url], 60)
             if proc.returncode != 0:
                 return []
             return json.loads(proc.stdout).get("entries", []) or []
         except Exception:
             return []
 
-    def fetch(base):
+    def fetch_ytdlp(base):
         durs, sh = {}, set()
         for e in flat(base + "/videos"):
             vid, dur = e.get("id"), e.get("duration")
@@ -5835,26 +6726,66 @@ def feed_durations(limit_per_channel=30, force=False):
                     durs[vid] = int(dur)
         return durs, sh
 
-    bases = list(need.values())
-    # This is the launch-time "quiet minutes" candidate on a slow device/link (2 spawns per
-    # channel below) — announce the work up front so a field log shows a job in progress
-    # instead of a silent gap (2026-09-07 report: ~3 min of invisible classification).
-    _tlog("feed.durations: classifying %d channel(s), 2 yt-dlp listings each" % len(bases))
+    def fetch_innertube(key, base):
+        """Videos tab (lengths) → only if ids are still unclassified, the Shorts tab, then the Live
+        tab (past streams carry a length). One POST each; None = fall back to yt-dlp."""
+        if it_mod is None:
+            return None
+        try:
+            _force_ipv4()
+            cid = key if key.startswith("UC") else it_mod.resolve_channel(base)
+            durs, sh = {}, set()
+            items = it_mod.channel_tab(cid, "videos")["items"]
+            for e in items:
+                if e.get("duration"):
+                    durs[e["id"]] = e["duration"]
+            if not durs and not any(e.get("live") or e.get("upcoming") for e in items):
+                raise it_mod.InnertubeError("videos tab parsed without lengths")
+        except Exception as ex:
+            _it_note("feed-lengths", ex)
+            _tlog("feed.durations innertube %s failed → yt-dlp: %s" % (key, str(ex)[:100]))
+            return None
+        want = need_ids.get(key)
+        left = (set(want) if want is not None else {"?"}) - set(durs)
+        for tab in ("shorts", "streams"):
+            if not left:
+                break
+            try:
+                items = it_mod.channel_tab(cid, tab)["items"]
+            except Exception:
+                continue                        # no such tab on this channel, or a blip
+            for e in items:
+                if e.get("short"):
+                    sh.add(e["id"])
+                elif e.get("duration"):
+                    durs[e["id"]] = e["duration"]
+            left -= set(durs) | sh
+        return durs, sh
+
+    def fetch(kb):
+        res = fetch_innertube(*kb)
+        return res if res is not None else fetch_ytdlp(kb[1])
+
+    jobs = list(need.items())
+    _tlog("feed.durations: classifying %d channel(s) (%s)"
+          % (len(jobs), "innertube" if it_mod is not None else "2 yt-dlp listings each"))
     try:
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(bases))) as ex:
-            for durs, sh in ex.map(fetch, bases):
-                dmap.update(durs)
-                shorts |= sh
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
+            for durs, sh in ex.map(fetch, jobs):
+                _learn_durations(durs, sh)
     except Exception:
-        for base in bases:
-            durs, sh = fetch(base)
-            dmap.update(durs)
-            shorts |= sh
+        for kb in jobs:
+            durs, sh = fetch(kb)
+            _learn_durations(durs, sh)
     _feed_durations_cache["ts"] = now
-    _feed_durations_cache["map"], _feed_durations_cache["shorts"] = dmap, shorts
-    _save_durations(dmap)
-    _save_shorts(shorts)
+    for ids in need_ids.values():               # whatever is STILL unclassified waits for a retry
+        for vid in ids:
+            if not classified(vid):
+                _classify_tried[vid] = now
+    if len(_classify_tried) > 2000:
+        for vid in [v for v, t in _classify_tried.items() if now - t > _CLASSIFY_RETRY]:
+            _classify_tried.pop(vid, None)
     return result()
 
 
@@ -5863,6 +6794,73 @@ def feed_durations(limit_per_channel=30, force=False):
 # keeping an on-demand load bounded rather than paging every thread's replies.
 _REPLIES_PER_THREAD = 12   # cap replies fetched from any one comment thread
 _REPLY_BUDGET = 150        # global reply cap across all threads for one comments() call
+
+
+def _comments_innertube(video_id, n, with_replies):
+    """comments() from InnerTube /next, or None to let yt-dlp walk them. Top-level pages are
+    sequential (each carries the next token); the first reply page of each thread is fetched in
+    parallel within the same budgets as the yt-dlp walk, which paged them one thread at a time.
+    Anonymous, like the rest of the InnerTube paths (yt-dlp's walk carried the login)."""
+    it = _it()
+    vid = video_id or ""
+    if "://" in vid:
+        pu = parse_youtube_url(vid) or {}
+        vid = pu.get("id") or "" if pu.get("kind") == "video" else ""
+    if it is None or not re.fullmatch(r"[\w-]{11}", vid):
+        return None
+    _t = time.time()
+    tok = (_watch_next(vid) or {}).get("comments_token")
+    if not tok:
+        return None                     # comments off, or no watch-next: yt-dlp has the last word
+    threads, total, pages = [], None, 0
+    try:
+        while tok and len(threads) < n and pages < 10:
+            page = it.comments(tok)
+            pages += 1
+            if total is None:
+                total = page["total"]
+            if pages == 1 and not page["comments"] and (page["total"] or page["continuation"]):
+                raise it.InnertubeError("comments page parsed empty")
+            threads += page["comments"]
+            tok = page["continuation"]
+            if not page["comments"]:
+                break
+    except Exception as ex:
+        _it_note("comments", ex)
+        _tlog("comments innertube failed %.2fs → yt-dlp: %s" % (time.time() - _t, str(ex)[:120]))
+        return None
+    threads = threads[:n]
+    plan, budget = [], _REPLY_BUDGET
+    for c in threads if with_replies else []:
+        if budget <= 0:
+            break
+        if c.get("replies_token") and c.get("reply_count"):
+            plan.append(c)
+            budget -= min(c["reply_count"], _REPLIES_PER_THREAD)
+
+    def fetch(c):
+        try:
+            return c["id"], it.comments(c["replies_token"])["comments"][:_REPLIES_PER_THREAD]
+        except Exception:
+            return c["id"], []          # a thread's replies are optional; the comment still shows
+    replies = {}
+    if plan:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(plan))) as ex:
+            for cid, rs in ex.map(fetch, plan):
+                replies[cid] = rs
+    keys = ("id", "author", "text", "likes", "time", "thumbnail", "is_uploader")
+    out = []
+    for c in threads:
+        kids = replies.get(c["id"]) or []
+        item = {k: c[k] for k in keys}
+        item["replies"] = [{k: r[k] for k in keys} for r in kids]
+        rc = c.get("reply_count") or 0
+        item["reply_count"] = rc if rc >= len(kids) else len(kids)
+        out.append(item)
+    _tlog("comments innertube %.2fs (%d threads, %d pages, %d reply fetches)"
+          % (time.time() - _t, len(out), pages, len(plan)))
+    return {"ok": True, "comments": out, "count": len(out), "total": total or 0}
 
 
 @_timed_fn("q.comments")
@@ -5884,17 +6882,23 @@ def comments(video_id, limit=20, with_replies=True):
     from erroring. Comments come from the watch page's initial data + /next continuations,
     verified unaffected. With fast-resolve on, the walk also runs IN-PROCESS on the warm
     YoutubeDL (no spawn tax, warm TLS); any failure falls back to the binary as usual.
+
+    InnerTube answers first (_comments_innertube: a few /next pages plus parallel reply pages,
+    ~1s instead of the 3–8s walk); all of the above is its fallback.
     """
+    try:
+        n = max(1, int(limit))
+    except (TypeError, ValueError):
+        n = 50
+    fast = _comments_innertube(video_id, n, with_replies)
+    if fast is not None:
+        return fast
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found"}
     url = video_id
     if "://" not in url:
         url = "https://www.youtube.com/watch?v=" + video_id
-    try:
-        n = max(1, int(limit))
-    except (TypeError, ValueError):
-        n = 50
     # max_comments = total, max-parents, max-replies (global), max-replies-per-thread.
     # The trailing LEAN profile skips everything a comment walk doesn't need (see docstring).
     _lean = ";player_skip=js,configs;skip=hls,dash,translated_subs"
@@ -6284,10 +7288,9 @@ def youtube_playlist(ref, limit=200):
     url = ref if "://" in (ref or "") else ("https://www.youtube.com/playlist?list=" + (ref or ""))
     try:
         with _cookies_args() as cargs:
-            proc = subprocess.run(
-                [path, *_COMMON_ARGS, *cargs, *_yt_extractor_args(), "--flat-playlist",
-                 "--playlist-end", str(int(limit)), "--dump-single-json", "--", url],
-                capture_output=True, text=True, timeout=120)
+            proc = _ytdlp_run(
+                path, [*_COMMON_ARGS, *cargs, *_yt_extractor_args(), "--flat-playlist",
+                       "--playlist-end", str(int(limit)), "--dump-single-json", "--", url], 120)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr.strip()[:300] or "playlist fetch failed")}
         data = json.loads(proc.stdout)
@@ -6358,10 +7361,9 @@ def channel_playlists(channel):
     def fetch(tab):
         try:
             with _cookies_args() as cargs:
-                proc = subprocess.run(
-                    [path, *_COMMON_ARGS, *cargs, *_yt_extractor_args(), "--flat-playlist",
-                     "--dump-single-json", "--", base + tab],
-                    capture_output=True, text=True, timeout=90)
+                proc = _ytdlp_run(
+                    path, [*_COMMON_ARGS, *cargs, *_yt_extractor_args(), "--flat-playlist",
+                           "--dump-single-json", "--", base + tab], 90)
             if proc.returncode != 0:
                 return []
             data = json.loads(proc.stdout)

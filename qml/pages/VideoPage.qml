@@ -603,6 +603,10 @@ Page {
     // when the video can't be played here (geo-blocked / bot-walled) — the point of the view.
     function loadInfoOnly() {
         page.resolving = true
+        // The details view exists to READ — pull comments in automatically (still on-demand on a
+        // normal watch page, where a tap-to-load keeps every playback fast). Started alongside the
+        // info fetch, not after it: the walk runs on the background lane and needs nothing from it.
+        page.loadComments()
         app.backend.videoInfo(page.videoId, function(res) {
             if (!page) return
             page.resolving = false
@@ -627,9 +631,6 @@ Page {
             if (page.channelUrl.length > 0 || page.channelId.length > 0)
                 app.backend.fetchChannelAvatar(page.channelUrl || page.channelId,
                     function(r) { if (page && r && r.thumbnail) page.channelAvatar = r.thumbnail })
-            // The details view exists to READ — pull comments in automatically (still on-demand on a
-            // normal watch page, where a tap-to-load keeps every playback fast).
-            page.loadComments()
         })
     }
 
