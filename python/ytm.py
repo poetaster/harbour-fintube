@@ -123,6 +123,8 @@ def _read_body(resp):
 # Cookie store (0600 JSON). Holds the yt-dlp Netscape text, the InnerTube Cookie header + SAPISID,
 # and the chosen account identity (authuser / page_id / datasync_id / name).
 # --------------------------------------------------------------------------- #
+# Held by every read-modify-write of the store (and by whole-store replacements, so neither can
+# undo the other). NOT reentrant: _save_cookies must not take it, since its callers already hold it.
 _cookies_lock = threading.Lock()
 
 
@@ -136,23 +138,25 @@ def _load_cookies():
 
 
 def _save_cookies(c):
-    with _cookies_lock:
+    """Atomic 0600 write of the whole store. Callers hold _cookies_lock. Taking it here as well
+    deadlocked select_account (which holds it across its read-modify-write): the PyOtherSide worker
+    hung for good, so picking an account did nothing and every later call on that lane waited."""
+    try:
+        d = _data_dir()
+        fd, tmp = tempfile.mkstemp(prefix=".youtube_login.", suffix=".tmp", dir=d)
         try:
-            d = _data_dir()
-            fd, tmp = tempfile.mkstemp(prefix=".youtube_login.", suffix=".tmp", dir=d)
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(c, f)
-                os.chmod(tmp, 0o600)
-                os.replace(tmp, _cookies_path())
-            except Exception:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-                raise
+            with os.fdopen(fd, "w") as f:
+                json.dump(c, f)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, _cookies_path())
         except Exception:
-            pass
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception:
+        pass
 
 
 def _read_cookie_jar(path):
@@ -734,9 +738,11 @@ def import_browser_login():
                          "youtube.com in the Sailfish Browser first."}
     sapisid = jar.get("__Secure-3PAPISID") or jar.get("SAPISID") or ""
     cookie_header = "; ".join("%s=%s" % (n, jar[n]) for n in _AUTH_COOKIE_NAMES if n in jar)
-    _save_cookies({"ytdlp": _netscape_from_rows(rows), "cookie": cookie_header, "sapisid": sapisid,
-                   "source": used, "count": len(rows), "imported_at": int(time.time()),
-                   "authuser": "0", "page_id": "", "datasync_id": "", "selected_name": ""})
+    with _cookies_lock:
+        _save_cookies({"ytdlp": _netscape_from_rows(rows), "cookie": cookie_header,
+                       "sapisid": sapisid, "source": used, "count": len(rows),
+                       "imported_at": int(time.time()),
+                       "authuser": "0", "page_id": "", "datasync_id": "", "selected_name": ""})
     _log("imported %d cookie rows from %s (sapisid=%s)" % (len(rows), used, "yes" if sapisid else "no"))
     return {"ok": True, "count": len(rows), "source": used}
 

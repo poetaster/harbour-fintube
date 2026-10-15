@@ -46,6 +46,18 @@ Page {
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                bottomPadding: Theme.paddingMedium
+                // With accounts listed the placeholder is hidden, so a failed switch or reload
+                // shows its error here instead of looking like the tap did nothing.
+                visible: page.errorText.length > 0 && app.backend.ytAccounts.length > 0
+                wrapMode: Text.Wrap
+                text: page.errorText
+                color: Theme.errorColor
+                font.pixelSize: Theme.fontSizeExtraSmall
+            }
         }
 
         delegate: ListItem {
@@ -91,12 +103,15 @@ Page {
                 }
             }
 
-            onClicked: app.backend.ytmSelectAccount(modelData, function(res) {
-                if (res && res.ok)
-                    pageStack.pop()
-                else
-                    page.errorText = (res && res.error) ? res.error : "Couldn't switch account."
-            })
+            onClicked: {
+                page.errorText = ""
+                app.backend.ytmSelectAccount(modelData, function(res) {
+                    if (res && res.ok)
+                        pageStack.pop()
+                    else
+                        page.errorText = (res && res.error) ? res.error : "Couldn't switch account."
+                })
+            }
         }
 
         ViewPlaceholder {

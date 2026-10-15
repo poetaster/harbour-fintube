@@ -4051,5 +4051,42 @@ class SignedInClientArgs(unittest.TestCase):
         self.assertEqual(cmds[0][cmds[0].index("-f") + 1], "140")
         self.assertFalse([a for a in cmds[0] if "player_client=" in a], cmds[0])
 
+
+class AccountSelection(unittest.TestCase):
+    """ytm.select_account (the account/brand-channel picker) persists the choice and returns. It
+    used to self-deadlock on the store lock, which hung the main Python lane for good."""
+
+    def setUp(self):
+        import importlib
+        self._prev = sys.modules.pop("ytm", None)            # other tests install a fake ytm
+        self.ytm = importlib.import_module("ytm")
+        self._tmp = tempfile.mkdtemp(prefix="acct-")
+        self._dd = self.ytm._data_dir
+        self.ytm._data_dir = lambda: self._tmp
+        with open(self.ytm._cookies_path(), "w") as f:
+            json.dump({"sapisid": "S", "ytdlp": "# Netscape", "cookie": "SAPISID=S"}, f)
+
+    def tearDown(self):
+        self.ytm._data_dir = self._dd
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        if self._prev is not None:
+            sys.modules["ytm"] = self._prev
+        else:
+            sys.modules.pop("ytm", None)
+
+    def test_select_account_returns_and_persists(self):
+        res = {}
+        t = youfish.threading.Thread(
+            target=lambda: res.update(self.ytm.select_account("1", "PAGE", "DS", "Brand")),
+            daemon=True)
+        t.start()
+        t.join(3)
+        self.assertFalse(t.is_alive(), "select_account deadlocked")
+        self.assertEqual(res, {"ok": True, "name": "Brand"})
+        self.assertEqual(self.ytm.selected_account(),
+                         {"authuser": "1", "page_id": "PAGE", "name": "Brand"})
+        with open(self.ytm._cookies_path()) as f:
+            self.assertEqual(json.load(f)["sapisid"], "S")   # the login itself is untouched
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
