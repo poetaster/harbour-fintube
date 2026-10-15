@@ -1260,7 +1260,7 @@ def _ytdlp_formats(video_id, anon=False):
     try:
         with (contextlib.nullcontext([]) if anon else _cookies_args()) as cargs:
             proc = subprocess.run([path, *_COMMON_ARGS, *cargs, *_pot_ytdlp_args(),
-                                   *_yt_extractor_args(want_pot=not anon),
+                                   *_yt_extractor_args(want_pot=not anon, cookies=bool(cargs)),
                                    "--dump-single-json", "--", url],
                                   capture_output=True, text=True, timeout=90,
                                   preexec_fn=_set_pdeathsig)   # D6: die with the app if abandoned
@@ -4873,20 +4873,35 @@ def _default_client():
     web_embedded, then mweb-as-blanket-default on 2026-09-03 which put the mint on EVERY resolve — the
     "slow as of late" reports; token-free-first removes it from the common path.) With no provider set
     up we leave yt-dlp on its own auto pick. resolve() also widens to _RETRY_CLIENTS if SABR-thin."""
+    return _user_client() or (_token_free_client() if _pot_active() else "")
+
+
+def _user_client():
+    """The player_client chosen in Settings, or "" when it's left on automatic."""
     c = (get_settings().get("player_client") or "").strip()
-    if c and c.lower() != "auto":
-        return c
-    return _token_free_client() if _pot_active() else ""
+    return c if c.lower() != "auto" else ""
 
 
-def _yt_extractor_args(client_override=None, want_pot=False):
+def _yt_extractor_args(client_override=None, want_pot=False, cookies=False):
     """`--extractor-args` for yt-dlp built from settings (or []).
 
     player_client picks a YouTube client. client_override lets resolve() widen the client set
     on a retry without touching the saved preference. want_pot forces a PO-token mint (see below).
+
+    `cookies`: the run carries login cookies. yt-dlp then drops every client that doesn't support
+    cookies, the JS-less token-free default (visionos) among them, and with none left it fails
+    ("Skipping client ... since it does not support cookies"). So a signed-in run gets no automatic
+    client and yt-dlp uses its own signed-in default set; a user-chosen client or an override
+    still goes through. (Unnoticed while the default was tv_embedded: yt-dlp skipped that unknown
+    name before its signed-in fallback, so signed-in downloads worked by accident.)
     """
     parts = []
-    client = client_override if client_override is not None else _default_client()
+    if client_override is not None:
+        client = client_override
+    elif cookies and not _user_client():
+        client = ""
+    else:
+        client = _default_client()
     if client and client.lower() != "auto":
         parts.append("player_client=" + client)
     # fetch_pot=always forces yt-dlp to actually mint a PO token even for clients it marks GVS-token
@@ -7116,7 +7131,8 @@ def download(video_id, title, kind):
             _ensure_pot_server()  # a download is just as PO-gated as playback
             proc = subprocess.Popen(
                 [binp, *_COMMON_ARGS, *(["--cookies", ck] if ck else []),
-                 *_yt_extractor_args(want_pot=True), *_pot_ytdlp_args(), *_ffmpeg_args(),
+                 *_yt_extractor_args(want_pot=True, cookies=bool(ck)), *_pot_ytdlp_args(),
+                 *_ffmpeg_args(),
                  "--no-playlist", "-f", fmt, *merge, "--no-part", "--newline",
                  "-o", base + ".%(ext)s", "--", url],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

@@ -251,7 +251,7 @@ class ResolveSmoke(unittest.TestCase):
         youfish._ytdlp_path = lambda: "/fake/yt-dlp"
         youfish._ensure_pot_server = lambda **kw: True
         youfish._pot_ytdlp_args = lambda: []
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: []
         youfish._proxied = lambda url, *a, **k: url
         youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False}
         youfish._import_yt_dlp = lambda: None   # pin the BINARY path (no zipapp), whatever's on disk
@@ -1940,7 +1940,7 @@ class FastResolveRouting(unittest.TestCase):
         youfish._inproc_tls = self._tls
 
     def test_token_free_dump_runs_in_process(self):
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: (
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: (
             ["--extractor-args", "youtube:player_client=mweb;fetch_pot=always"] if want_pot else
             ["--extractor-args", "youtube:player_client=tv_embedded"])
         res = youfish.resolve("vid")
@@ -1955,7 +1955,7 @@ class FastResolveRouting(unittest.TestCase):
         self.assertEqual(ydl.extract_calls[0][2], {"youtube": {"player_client": ["tv_embedded"]}})
 
     def test_warm_instance_reused_across_resolves(self):
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: \
             ["--extractor-args", "youtube:player_client=tv_embedded"]
         youfish.resolve("vidA")
         youfish.resolve("vidB")
@@ -1964,7 +1964,7 @@ class FastResolveRouting(unittest.TestCase):
 
     def test_inproc_failure_falls_back_to_binary(self):
         _FakeYDL.raise_on_extract = True
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: \
             ["--extractor-args", "youtube:player_client=tv_embedded"]
         res = youfish.resolve("vid")
         self.assertTrue(res.get("ok"), res)
@@ -1972,7 +1972,7 @@ class FastResolveRouting(unittest.TestCase):
         self.assertTrue(self.binary_calls)                     # fallback actually ran
 
     def test_token_path_never_runs_in_process(self):
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: \
             ["--extractor-args", "youtube:player_client=mweb;fetch_pot=always"]
         res = youfish.resolve("vid")
         self.assertTrue(res.get("ok"), res)
@@ -1981,7 +1981,7 @@ class FastResolveRouting(unittest.TestCase):
 
     def test_no_zipapp_uses_binary(self):
         youfish._import_yt_dlp = lambda: None   # copy absent / not importable → binary path
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: []
         res = youfish.resolve("vid")
         self.assertTrue(res.get("ok"), res)
         self.assertEqual(res["info"]["title"], "BIN")
@@ -2013,7 +2013,7 @@ class AnonymousPrimary(unittest.TestCase):
             yield ["--cookies", "CKFILE"]
         youfish._cookies_args = _ck
         # primary (want_pot=False) → tv_embedded; fallback (want_pot=True) → the wider retry set
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: \
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: \
             ["--extractor-args", "youtube:player_client=" + (client_override or "tv_embedded")]
         youfish.invalidate_resolve_cache()
         self.calls = []
@@ -3298,7 +3298,7 @@ class InnertubeEngineWiring(unittest.TestCase):
         youfish._ytdlp_path = lambda: "/fake/yt-dlp"
         youfish._ensure_pot_server = lambda **kw: True
         youfish._pot_ytdlp_args = lambda: []
-        youfish._yt_extractor_args = lambda client_override=None, want_pot=False: []
+        youfish._yt_extractor_args = lambda client_override=None, want_pot=False, cookies=False: []
         youfish._proxied = lambda url, *a, **k: url
         youfish.get_settings = lambda: {"default_quality": 0, "hw_decode": False,
                                         "hide_shorts": True, "hide_watched": False}
@@ -3971,6 +3971,85 @@ class YtdlpInprocessTier(unittest.TestCase):
         youfish._ytdlp_run("/fake/yt-dlp", ["--dump-single-json", "--", "u"], 90)
         self.assertEqual(len(self.spawns), 1)
 
+
+
+class SignedInClientArgs(unittest.TestCase):
+    """yt-dlp drops clients that don't support cookies (visionos among them) and fails with none
+    left, so a signed-in run must not name the automatic token-free client."""
+
+    def setUp(self):
+        self._saved = {n: getattr(youfish, n) for n in (
+            "get_settings", "_pot_active", "_write_cookies_temp", "_ytdlp_path",
+            "_ensure_pot_server", "_pot_ytdlp_args", "_set_pdeathsig")}
+        self._run = youfish.subprocess.run
+        self.settings = {}
+        youfish.get_settings = lambda: self.settings
+        youfish._pot_active = lambda: True
+        self._tmp = tempfile.mkdtemp(prefix="authed-")
+
+    def tearDown(self):
+        for n, f in self._saved.items():
+            setattr(youfish, n, f)
+        youfish.subprocess.run = self._run
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_signed_in_run_leaves_the_client_to_ytdlp(self):
+        self.assertIn("player_client=visionos", youfish._yt_extractor_args(want_pot=True)[1])
+        args = youfish._yt_extractor_args(want_pot=True, cookies=True)
+        self.assertEqual(args, ["--extractor-args", "youtube:fetch_pot=always"])
+
+    def test_user_client_and_override_still_win_when_signed_in(self):
+        self.assertIn("player_client=mweb",
+                      youfish._yt_extractor_args(client_override="mweb", cookies=True)[1])
+        self.settings = {"player_client": "tv"}
+        self.assertIn("player_client=tv", youfish._yt_extractor_args(cookies=True)[1])
+
+    def test_cookied_reresolve_dump_names_no_client(self):
+        ck = os.path.join(self._tmp, "c.txt")
+        youfish._write_cookies_temp = lambda: open(ck, "w").close() or ck
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish._ensure_pot_server = lambda **kw: True
+        youfish._pot_ytdlp_args = lambda: []
+        youfish._set_pdeathsig = lambda: None
+        cmds = []
+
+        def run(cmd, **kw):
+            cmds.append(cmd)
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        youfish.subprocess.run = run
+        youfish._ytdlp_formats("dQw4w9WgXcQ")
+        self.assertIn("--cookies", cmds[0])
+        self.assertFalse([a for a in cmds[0] if "player_client=" in a], cmds[0])
+
+    def test_signed_in_audio_download_names_no_client(self):
+        ck = os.path.join(self._tmp, "c.txt")
+        youfish._write_cookies_temp = lambda: open(ck, "w").close() or ck
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish._ensure_pot_server = lambda **kw: True
+        youfish._pot_ytdlp_args = lambda: []
+        youfish._set_pdeathsig = lambda: None
+        cmds, done = [], youfish.threading.Event()
+
+        def popen(cmd, **kw):
+            cmds.append(cmd)
+            raise RuntimeError("stop here")                # the thread reports download_done
+        saved = (youfish.subprocess.Popen, sys.modules.get("pyotherside"), youfish._downloads_dir)
+        youfish.subprocess.Popen = popen
+        youfish._downloads_dir = lambda: self._tmp
+        sys.modules["pyotherside"] = types.SimpleNamespace(
+            send=lambda *a: done.set() if a[0] == "download_done" else None)
+        try:
+            youfish.download("dQw4w9WgXcQ", "Song", "audio")
+            self.assertTrue(done.wait(5), "download thread never finished")
+        finally:
+            youfish.subprocess.Popen, prev, youfish._downloads_dir = saved
+            if prev is not None:
+                sys.modules["pyotherside"] = prev
+            else:
+                sys.modules.pop("pyotherside", None)
+        self.assertIn("--cookies", cmds[0])
+        self.assertEqual(cmds[0][cmds[0].index("-f") + 1], "140")
+        self.assertFalse([a for a in cmds[0] if "player_client=" in a], cmds[0])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

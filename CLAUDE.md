@@ -227,6 +227,10 @@ render thread, everything else under the lock.
 - **`tv_embedded` is gone.** yt-dlp 2026.01.31 removed it, and later versions skip the name
   silently. The token-free client is whatever `innertube.player_client()` reports
   (`_token_free_client`), which follows yt-dlp's JS-less default. Don't hardcode a client name.
+- **A signed-in yt-dlp run must not name the token-free client.** yt-dlp drops every client
+  without cookie support (visionos, android, ios) and fails with none left, so the download and
+  the cookie'd re-resolve pass `_yt_extractor_args(cookies=True)`, which leaves the client to
+  yt-dlp's signed-in default unless the user picked one.
 - **Qt sets the process locale from the device**, so `strptime("%b")` fails on non-English phones.
   Month names are parsed by hand (`innertube._upload_date`).
 - **Debug lines worth grepping** (`YOUFISH_DEBUG=1`, `[youfish/t …]`): `fast player`, `fast live`,
