@@ -163,9 +163,12 @@ def _read_cookie_jar(path):
     """Read google/youtube cookie rows from a Firefox/Gecko cookies.sqlite. Returns rows of
     (name, value, host, path, expiry, secure). Copies the DB (and -wal/-shm) first so a running
     browser's lock/WAL can't block us."""
-    tmp = None
+    tmpdir = None
     try:
-        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+        # A private (0700) directory: the copy, its -wal/-shm and anything SQLite adds next to
+        # them hold live login cookies, and copyfile creates files with the default umask.
+        tmpdir = tempfile.mkdtemp(prefix="cookies-")
+        tmp = os.path.join(tmpdir, "cookies.sqlite")
         shutil.copyfile(path, tmp)
         for ext in ("-wal", "-shm"):
             if os.path.exists(path + ext):
@@ -182,11 +185,8 @@ def _read_cookie_jar(path):
         _log("cookie read failed (%s): %s" % (path, ex))
         return []
     finally:
-        for p in ((tmp, tmp + "-wal", tmp + "-shm") if tmp else ()):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _netscape_from_rows(rows):
@@ -214,6 +214,9 @@ _YT_CFG_TTL = 12 * 3600
 _yt_cfg_cache = None
 _yt_cfg_lock = threading.Lock()
 _yt_cfg_warming = False
+# When the last scrape started: a failed one (consent page, layout change, no network) leaves
+# the cache stale, and without this every request would re-download the homepage.
+_yt_cfg_last_try = 0.0
 
 
 def _yt_config_path():
@@ -266,11 +269,12 @@ def _fetch_yt_identity(timeout=15):
 
 
 def _warm_yt_config():
-    global _yt_cfg_warming
+    global _yt_cfg_warming, _yt_cfg_last_try
     with _yt_cfg_lock:
-        if _yt_cfg_warming:
+        if _yt_cfg_warming or time.time() - _yt_cfg_last_try < 600:
             return
         _yt_cfg_warming = True
+        _yt_cfg_last_try = time.time()
 
     def _bg():
         global _yt_cfg_cache, _yt_cfg_warming

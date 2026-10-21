@@ -374,6 +374,44 @@ class ResolveSmoke(unittest.TestCase):
         self.assertFalse(res.get("ok"))
         self.assertIn("Sign in", res.get("error", ""))
 
+    def test_final_error_skips_the_widen_retry(self):
+        # A removed video is YouTube's final word: one extraction, not the widen re-run too.
+        calls = []
+        def fail_run(cmd, **kwargs):
+            calls.append(cmd)
+            return types.SimpleNamespace(
+                returncode=1, stdout="",
+                stderr="WARNING: [youtube] vid: some warning\n"
+                       "ERROR: [youtube] vid: Video unavailable. This video has been removed "
+                       "by the uploader")
+        youfish.subprocess.run = fail_run
+        res = youfish.resolve("vid")
+        self.assertFalse(res.get("ok"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res["error"], "Video unavailable. This video has been removed by the uploader")
+
+    def test_unclear_error_still_widens(self):
+        calls = []
+        def fail_run(cmd, **kwargs):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=1, stdout="",
+                                         stderr="ERROR: [youtube] vid: Sign in to confirm you're not a bot")
+        youfish.subprocess.run = fail_run
+        youfish.resolve("vid")
+        self.assertEqual(len(calls), 2)
+
+    def test_ytdlp_err_keeps_the_reason_only(self):
+        e = youfish._ytdlp_err
+        self.assertEqual(e("ERROR: [youtube] Tq92D6wQ1mg: Sign in to confirm your age. Use "
+                           "--cookies-from-browser or --cookies for the authentication. See  "
+                           "https://github.com/yt-dlp/yt-dlp/wiki/FAQ for how", "x"),
+                         "Sign in to confirm your age.")
+        self.assertEqual(e("ERROR: Unable to download webpage: HTTP Error 429", "x"),
+                         "Unable to download webpage: HTTP Error 429")
+        self.assertEqual(e("", "resolve failed"), "resolve failed")
+        self.assertFalse(youfish._final_error("Video unavailable. This content isn't available, "
+                                              "try again later."))
+
 
 class BinaryResolution(unittest.TestCase):
     """Binary resolution after the 2026-08-28 reversal: a managed copy WINS, but with none present
@@ -912,6 +950,22 @@ class SubscriptionFeed(unittest.TestCase):
             data = {"channel": cid, "entries": channels.get(cid, [])}
             return types.SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
         youfish.subprocess.run = fake_run
+
+    def test_a_dead_channel_does_not_take_the_feed_down(self):
+        # A terminated channel's /videos answered "null" through the in-process tier; the
+        # resulting AttributeError used to escape subscription_feed and the refresh never landed.
+        now = int(time.time())
+        self._mock({"UC_OK": [{"id": "okokokokok1", "title": "fine", "timestamp": now, "duration": 9}]})
+        good = youfish.subprocess.run
+        def run(cmd, **kw):
+            if "UC_DEAD" in cmd[-1]:
+                return types.SimpleNamespace(returncode=0, stdout="null", stderr="")
+            return good(cmd, **kw)
+        youfish.subprocess.run = run
+        youfish.list_subscriptions = lambda: [{"id": "UC_OK"}, {"id": "UC_DEAD"}]
+        res = youfish.subscription_feed(force=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual([i["title"] for i in res["items"]], ["fine"])
 
     def test_merged_newest_first_durations_inline(self):
         now = int(time.time())
@@ -2275,6 +2329,41 @@ class DirectFetchStreamer(unittest.TestCase):
         self.assertIn("Range: bytes=5-", " ".join(argvs[0]))          # resume offset forwarded
 
 
+class SweepSmallFixes(unittest.TestCase):
+    def test_inproc_json_raises_when_extraction_returned_nothing(self):
+        # yt-dlp's CLI default ignoreerrors returns None for a failed extraction; that must
+        # fall through to the binary, not come back as a successful "null".
+        class YDL:
+            def __init__(self, opts): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def extract_info(self, url, download=False): return None
+        mod = types.SimpleNamespace(
+            parse_options=lambda argv: types.SimpleNamespace(urls=["u"], ydl_opts={}),
+            YoutubeDL=YDL)
+        with self.assertRaises(RuntimeError):
+            youfish._inproc_json(mod, ["u"])
+
+    def test_safe_name_fits_the_filename_byte_limit(self):
+        name = youfish._safe_name("\u3042" * 200)
+        self.assertLessEqual(len(name.encode("utf-8")), 150)
+        self.assertTrue(name)
+
+    def test_list_downloads_skips_damaged_entries(self):
+        tmp = tempfile.mkdtemp(prefix="dls-")
+        saved = youfish._downloads_path
+        try:
+            good = os.path.join(tmp, "a.m4a")
+            open(good, "w").close()
+            youfish._downloads_path = lambda: os.path.join(tmp, "downloads.json")
+            with open(youfish._downloads_path(), "w") as f:
+                json.dump([{"id": "a", "kind": "audio", "path": good}, 1, "x", None], f)
+            self.assertEqual([d["id"] for d in youfish.list_downloads()], ["a"])
+        finally:
+            youfish._downloads_path = saved
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class DownloadNeedsFfmpeg(unittest.TestCase):
     """Video downloads REFUSE with a clear message when ffmpeg is missing — the old <=360p
     muxed fallback (-f 22/18) died with YouTube's progressive formats (verified live
@@ -3126,6 +3215,9 @@ class InnertubeParsing(unittest.TestCase):
         self.assertEqual(f("0:00 a\n1:00 b"), [])                   # need at least three
         self.assertEqual([c["title"] for c in f("Intro - 0:00\nMiddle - 2:00\nEnd - 1:00:00")],
                          ["Intro", "Middle", "End"])
+        # an emoji + VS16 + "(" before the digits (freeCodeCamp's "⌨️ (0:00) Introduction")
+        self.assertEqual([c["start_time"] for c in f("⌨️ (0:00) Intro\n⌨️ (1:45) Setup\n"
+                                                      "⌨️ (6:40) Hello")], [0, 105, 400])
 
     def test_comments_page_and_replies_page(self):
         innertube._transport = _FakeTransport({
@@ -3447,6 +3539,16 @@ class InnertubeEngineWiring(unittest.TestCase):
         fresh = youfish._reresolve("dQw4w9WgXcQ", "251", old, refused=True)
         self.assertEqual(fresh, "https://new/251")
         self.assertEqual([c for c in self.fake.calls if c[0] == "player"], [])
+
+    def test_reresolve_finds_a_fast_path_dub_track_under_ytdlp_naming(self):
+        # The fast path calls a dub "251-es.3"; yt-dlp numbers it "251-8" and keys it "251@es".
+        youfish._ytdlp_formats = lambda vid, anon=False: {"251-8": "https://new/es",
+                                                          "251@es": "https://new/es"}
+        old = "https://rr1.googlevideo.com/videoplayback?c=VISIONOS&itag=251&old=1"
+        self.assertEqual(youfish._reresolve("dQw4w9WgXcQ", "251-es.3", old, refused=True),
+                         "https://new/es")
+        self.assertEqual(youfish._track_alias("251-drc-en-US.4"), "251-drc@en-US")
+        self.assertIsNone(youfish._track_alias("251-8"))
 
     def test_drop_resolved_forgets_only_that_video(self):
         youfish._resolve_cache.update({

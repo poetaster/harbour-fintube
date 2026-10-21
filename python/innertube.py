@@ -788,8 +788,10 @@ def _captions(pr):
 
 
 _TS = r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})"
-_CH_START = re.compile(r"^\W{0,3}" + _TS + r"\W{0,3}\s*(.+?)\s*$")
-_CH_END = re.compile(r"^\s*(.+?)\s*\W{0,3}" + _TS + r"\W{0,3}$")
+# Up to 8 non-word characters around the timestamp: "⌨️ (0:00) Intro" is keycap + VS16 + space +
+# paren before the digits (freeCodeCamp's whole catalogue), and ZWJ emoji are longer still.
+_CH_START = re.compile(r"^\W{0,8}" + _TS + r"\W{0,8}\s*(.+?)\s*$")
+_CH_END = re.compile(r"^\s*(.+?)\s*\W{0,8}" + _TS + r"\W{0,8}$")
 
 
 def chapters_from_description(desc, duration=0):

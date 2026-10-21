@@ -231,6 +231,13 @@ render thread, everything else under the lock.
   without cookie support (visionos, android, ios) and fails with none left, so the download and
   the cookie'd re-resolve pass `_yt_extractor_args(cookies=True)`, which leaves the client to
   yt-dlp's signed-in default unless the user picked one.
+- **Resolve errors pass through `_ytdlp_err`**, which keeps the last `ERROR:` line minus the
+  extractor prefix and yt-dlp's desktop advice (`--cookies-from-browser`, FAQ links). Errors that
+  match `_FINAL_ERR` (removed, terminated, not yet live, geo-blocked, private while signed out) skip
+  the binary re-run and the widen retry: no client changes YouTube's answer.
+- **A just-ended livestream (`live_status == "post_live"`) is refused** with a "still processing"
+  message. Until YouTube finishes the recording, its formats are DASH segment lists that the proxy
+  can't serve as one file.
 - **Qt sets the process locale from the device**, so `strptime("%b")` fails on non-English phones.
   Month names are parsed by hand (`innertube._upload_date`).
 - **Debug lines worth grepping** (`YOUFISH_DEBUG=1`, `[youfish/t …]`): `fast player`, `fast live`,

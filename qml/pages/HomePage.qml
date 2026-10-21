@@ -147,6 +147,15 @@ Page {
                 page.loadFeed(false)
     }
 
+    // Settings → hide Shorts / hide watched: the engine filters on read, so re-reading the cached
+    // feed (no forced network refresh) applies the toggle. Skipped while the first load is in flight
+    // (the settings load at startup also flips these) so it can't double-fire the launch refresh.
+    Connections {
+        target: app.backend
+        onHideShortsChanged: if (!page.loading) page.loadFeed(false)
+        onHideWatchedChanged: if (!page.loading) page.loadFeed(false)
+    }
+
     SilicaListView {
         id: listView
         anchors.fill: parent

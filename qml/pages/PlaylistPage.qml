@@ -34,7 +34,10 @@ Page {
             app.backend.youtubePlaylist(page.ytRef, function(res) {
                 page.loading = false
                 itemsModel.clear()
-                if (!res || !res.ok) return
+                if (!res || !res.ok) {
+                    app.showToast((res && res.error) ? res.error : "Couldn't load playlist")
+                    return
+                }
                 page.playlistTitle = res.title || page.playlistTitle
                 page.playlistKind = "youtube"
                 var yits = res.items || []
@@ -87,12 +90,22 @@ Page {
                 visible: page.ytView
                 text: page.saved ? "Saved to library ✓" : "Save to library"
                 enabled: !page.saved
-                onClicked: { app.backend.saveYoutubePlaylist(page.ytRef); page.saved = true }
+                onClicked: {
+                    page.saved = true
+                    app.backend.saveYoutubePlaylist(page.ytRef, function(res) {
+                        if (res && res.ok) return
+                        if (page) page.saved = false     // let the user retry
+                        app.showToast((res && res.error) ? res.error : "Couldn't save playlist")
+                    })
+                }
             }
             MenuItem {
                 visible: page.playlistKind === "youtube" && !page.ytView
                 text: "Refresh from YouTube"
-                onClicked: app.backend.refreshPlaylist(page.playlistId, function() { page.load() })
+                onClicked: app.backend.refreshPlaylist(page.playlistId, function(pl) {
+                    if (!pl) app.showToast("Couldn't refresh playlist")
+                    if (page) page.load()
+                })
             }
             MenuItem {
                 text: "Play all"

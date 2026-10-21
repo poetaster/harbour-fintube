@@ -254,7 +254,9 @@ ApplicationWindow {
             else if (res.kind === "playlist") {
                 // Save the playlist into the library (async), then show the library — it fills in
                 // once the fetch completes since the page binds to backend.playlists.
-                backend.saveYoutubePlaylist(res.id || res.url)
+                backend.saveYoutubePlaylist(res.id || res.url, function(r) {
+                    if (!r || !r.ok) app.showToast((r && r.error) ? r.error : "Couldn't save playlist")
+                })
                 pageStack.push(Qt.resolvedUrl("pages/PlaylistsPage.qml"))
             }
         })

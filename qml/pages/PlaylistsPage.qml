@@ -37,7 +37,9 @@ Page {
                 MenuItem {
                     visible: modelData.kind === "youtube"
                     text: "Refresh from YouTube"
-                    onClicked: app.backend.refreshPlaylist(modelData.id)
+                    onClicked: app.backend.refreshPlaylist(modelData.id, function(pl) {
+                        if (!pl) app.showToast("Couldn't refresh playlist")
+                    })
                 }
                 MenuItem {
                     text: "Delete"
@@ -155,7 +157,10 @@ Page {
                     font.pixelSize: Theme.fontSizeExtraSmall
                 }
             }
-            onAccepted: app.backend.saveYoutubePlaylist(urlField.text.trim())
+            onAccepted: app.backend.saveYoutubePlaylist(urlField.text.trim(), function(res) {
+                if (!res || !res.ok)
+                    app.showToast((res && res.error) ? res.error : "Couldn't save playlist")
+            })
         }
     }
 }

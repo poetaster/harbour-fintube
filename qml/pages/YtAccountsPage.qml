@@ -17,6 +17,7 @@ Page {
         page.loading = true
         page.errorText = ""
         app.backend.ytmListAccounts(function(res) {
+            if (!page) return              // page popped before the account list came back
             page.loading = false
             if (res && !res.ok)
                 page.errorText = res.error || "Couldn't load the account list."
@@ -106,9 +107,13 @@ Page {
             onClicked: {
                 page.errorText = ""
                 app.backend.ytmSelectAccount(modelData, function(res) {
-                    if (res && res.ok)
-                        pageStack.pop()
-                    else
+                    if (!page) return          // page already gone → nothing to pop or report
+                    if (res && res.ok) {
+                        // Only pop if we're still the visible page — the user may have navigated on
+                        // during the round trip, and a blind pop would remove someone else's page.
+                        if (page.status === PageStatus.Active)
+                            pageStack.pop()
+                    } else
                         page.errorText = (res && res.error) ? res.error : "Couldn't switch account."
                 })
             }

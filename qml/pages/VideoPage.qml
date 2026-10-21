@@ -395,7 +395,11 @@ Page {
     Timer {
         id: retryTimer
         interval: 1500                    // brief backoff; a throttle 403 needs a beat to clear
-        onTriggered: app.backend.resolve(page.videoId)
+        onTriggered: {
+            // A newer page took the shared player during the backoff — don't resolve into it.
+            if (!page.holdsPlayer) { page.deferToReclaim(); return }
+            app.backend.resolve(page.videoId)
+        }
     }
     Connections {
         target: mediaPlayer
@@ -714,6 +718,14 @@ Page {
                 return                                     // page (which never plays, but does listen
                                                            // while its own videoInfo() is in flight) —
                                                            // never consume a playback resolve here (M8)
+            if (!page.holdsPlayer) {
+                // A newer page took the shared player while we resolved (we attach at open, so a
+                // live resolve always arrives holding it) — playing now would put OUR stream in ITS
+                // surface. Keep the data; the foreground-reclaim path plays it when we're back on top.
+                page.populateMetadata(info)
+                page.deferToReclaim()
+                return
+            }
             page.resolving = false
             page.reattaching = false
             // Prime the remembered speed while the pipeline doesn't exist yet (setRate is a no-op
@@ -810,7 +822,18 @@ Page {
     // could have taken the shared player. When we return to the top and the player has moved on to
     // another video, reclaim it for this page — reload our video onto it (stopping the other one).
     // Skipped on first show (still resolving) and while our own video is the one playing.
-    onStatusChanged: {
+    onStatusChanged: page.reclaimPlayer()
+
+    // A resolve/recovery finished while another page owned the player: stop waiting on it and mark
+    // the page reclaimable (_played). If we're already on top again (the newer page was popped
+    // meanwhile) no status change will come, so reclaim right away.
+    function deferToReclaim() {
+        page.resolving = false
+        page.reattaching = false
+        page._played = true
+        page.reclaimPlayer()
+    }
+    function reclaimPlayer() {
         if (status !== PageStatus.Active || page.infoOnly || page.resolving || !page._played)
             return                              // never loaded a video yet (first show) → nothing to reclaim
         if (app.nowPlaying.videoId === page.videoId)
@@ -821,6 +844,11 @@ Page {
         app.nowPlaying.stopRequested()          // stop whatever took the player
         gplayer.stop()
         page.attachPlayer()
+        app.lastVideo = null                    // the newer page's destruction may have set it → hide the resume bar
+        if (app.backend.sponsorBlock)           // onStopRequested cleared our segments → re-fetch
+            app.backend.sponsorSegments(page.videoId, function(segs) {
+                if (page) page.sponsorSegments = segs || []
+            })
         app.backend.resumePosition(page.videoId, function(sec) {
             if (!page) return
             page.resumeMs = (sec || 0) * 1000
@@ -1297,7 +1325,9 @@ Page {
                 // contentY > 0 gates out the at-open case where a
                 // short panel already shows the header with nothing to scroll (tap it to load);
                 // loadComments() is idempotent, so a repeated trigger while it's in flight is a no-op.
-                if (contentY > 0 && !page.commentsLoading
+                // A failed load leaves commentsError set: don't auto-retry on every scroll tick
+                // (tapping the header still retries — loadComments() clears the error).
+                if (contentY > 0 && !page.commentsLoading && page.commentsError.length === 0
                         && contentHeight - (contentY + height) < height)
                     page.loadComments()
                 return
