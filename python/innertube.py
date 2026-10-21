@@ -128,10 +128,13 @@ def _put_conn(host, conn):
         pass
 
 
-def _transport(method, url, body=None, headers=None, timeout=10):
-    """One HTTP request → (status, body bytes, decoded). A reused keep-alive connection that turns
-    out to be dead is retried once on a fresh one. An env proxy (rare on a phone) disables pooling
-    and goes through urllib, which honours it."""
+def request(method, url, body=None, headers=None, timeout=10):
+    """One HTTP request on the keep-alive pool → (status, body bytes, response headers). The body
+    comes back gunzipped and the headers as an http.client.HTTPMessage (.get / .get_all). Any
+    status is returned, not raised, and redirects are not followed. A reused keep-alive connection
+    that turns out to be dead is retried once on a fresh one. An env proxy (rare on a phone)
+    disables pooling and goes through urllib, which honours it. Public so other callers on the
+    same hosts (FinTune's ytm, the subscription feed's RSS) skip a TLS handshake per request too."""
     p = urllib.parse.urlsplit(url)
     hdrs = dict(headers or {})
     hdrs.setdefault("Accept-Encoding", "gzip")
@@ -139,10 +142,11 @@ def _transport(method, url, body=None, headers=None, timeout=10):
         req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                data, status, enc = r.read(), r.status, r.headers.get("Content-Encoding", "")
+                data, status, rh = r.read(), r.status, r.headers
         except urllib.error.HTTPError as ex:
-            data, status, enc = ex.read() or b"", ex.code, ex.headers.get("Content-Encoding", "")
-        return status, (gzip.decompress(data) if enc == "gzip" and data else data)
+            data, status, rh = ex.read() or b"", ex.code, ex.headers
+        enc = rh.get("Content-Encoding", "") if rh is not None else ""
+        return status, (gzip.decompress(data) if enc == "gzip" and data else data), rh
     path = p.path + ("?" + p.query if p.query else "")
     for attempt in (0, 1):
         conn, reused = _get_conn(p.netloc, timeout)
@@ -164,8 +168,15 @@ def _transport(method, url, body=None, headers=None, timeout=10):
             _put_conn(p.netloc, conn)
         if (resp.getheader("Content-Encoding") or "") == "gzip" and data:
             data = gzip.decompress(data)
-        return resp.status, data
+        return resp.status, data, resp.msg
     raise InnertubeError("unreachable")
+
+
+def _transport(method, url, body=None, headers=None, timeout=10):
+    """request() without the headers: (status, body bytes). The one seam this module's own calls
+    go through, so tests can swap it."""
+    status, data, _ = request(method, url, body, headers, timeout)
+    return status, data
 
 
 def _post(endpoint, body, context_client, ua, client_number, visitor=None, timeout=10,

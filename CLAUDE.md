@@ -193,7 +193,8 @@ python3 python/test_youfish.py   # offline engine tests — pure stdlib, externa
   the yt-dlp walk. Imports: `import_youtube_account:5539`,
   `import_newpipe:5640`.
 
-**InnerTube (`python/innertube.py`)** — transport `_transport:131` / `_post:171`, client config
+**InnerTube (`python/innertube.py`)** — transport `request` (the keep-alive pool, public: the feed's
+RSS `_rss_get` and FinTune's `ytm._innertube` use it too) / `_transport` / `_post`, client config
 `configure_from_ytdlp:219` (adopts yt-dlp's WEB version, JS-less player client and android_vr
 when the zipapp is imported), visitor ids `_mint_visitor:306`, `player_info:824`,
 `live_info:943`, `channel_tab:581`, `search:1035`, `comments:1105`, `watch_next:1137`. Comment

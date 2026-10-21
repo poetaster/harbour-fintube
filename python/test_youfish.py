@@ -4190,5 +4190,57 @@ class AccountSelection(unittest.TestCase):
         with open(self.ytm._cookies_path()) as f:
             self.assertEqual(json.load(f)["sapisid"], "S")   # the login itself is untouched
 
+class RssPooled(unittest.TestCase):
+    """_rss_get: the feed's RSS goes through innertube's keep-alive pool when the module is there,
+    a refusal raises (so the channel counts as failed, as with urlopen), and a redirect is left to
+    urllib, which follows it."""
+    XML = "<feed><entry><yt:videoId>abc</yt:videoId></entry></feed>"
+
+    def setUp(self):
+        self.saved_it = youfish._it
+        self.saved_open = youfish.urllib.request.urlopen
+        self.calls = []
+
+    def tearDown(self):
+        youfish._it = self.saved_it
+        youfish.urllib.request.urlopen = self.saved_open
+
+    def _pool(self, status, body=b""):
+        def request(method, url, body_=None, headers=None, timeout=10):
+            self.calls.append((method, url, headers))
+            return status, body, None
+        youfish._it = lambda: types.SimpleNamespace(request=request)
+
+    def _urllib(self, text):
+        import io
+
+        class R(io.BytesIO):
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+        youfish.urllib.request.urlopen = lambda req, timeout=0: R(text.encode())
+
+    def test_pooled_get(self):
+        self._pool(200, self.XML.encode())
+        self._urllib("<feed>WRONG</feed>")
+        self.assertEqual(youfish._rss_get("UC_X"), self.XML)
+        method, url, headers = self.calls[0]
+        self.assertEqual(method, "GET")
+        self.assertTrue(url.endswith("/feeds/videos.xml?channel_id=UC_X"))
+        self.assertIn("User-Agent", headers)
+
+    def test_refusal_raises(self):
+        self._pool(404)
+        with self.assertRaises(IOError):
+            youfish._rss_get("UC_GONE")
+        self.assertEqual(youfish._feed_from_rss("UC_GONE", 5), [])
+
+    def test_redirect_and_no_module_use_urllib(self):
+        self._pool(302)
+        self._urllib(self.XML)
+        self.assertEqual(youfish._rss_get("UC_X"), self.XML)
+        youfish._it = lambda: None
+        self.assertEqual(youfish._rss_get("UC_X"), self.XML)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

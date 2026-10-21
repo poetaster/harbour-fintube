@@ -6322,6 +6322,24 @@ def channel_videos(channel, start=1, n=30):
         return {"ok": False, "error": str(ex)}
 
 
+def _rss_get(cid):
+    """A channel's RSS feed XML, or raise. A feed refresh fetches dozens of channels from the same
+    host, so this goes through innertube's keep-alive pool (one TLS handshake per pooled socket
+    instead of one per channel), and through urllib without the module or on a redirect."""
+    _force_ipv4()
+    url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % cid
+    it = _it()
+    if it is not None and hasattr(it, "request"):
+        status, data, _ = it.request("GET", url, None, {"User-Agent": _BROWSER_UA}, 10)
+        if status == 200:
+            return data.decode("utf-8", "replace")
+        if not 300 <= status < 400:
+            raise IOError("feed HTTP %d" % status)
+    req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.read().decode("utf-8", "replace")
+
+
 @_timed_fn("q.channel_rss")
 def channel_feed_rss(channel):
     """Fast first paint for the channel view: the latest ~15 uploads from the channel's RSS feed
@@ -6337,12 +6355,8 @@ def channel_feed_rss(channel):
         cid = m.group(1) if m else ""
     if not cid:
         return {"ok": False, "items": []}
-    _force_ipv4()
-    url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % cid
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            xml = r.read().decode("utf-8", "replace")
+        xml = _rss_get(cid)
     except Exception:
         return {"ok": False, "items": []}
     ents = _parse_feed_entries(xml)
@@ -6478,12 +6492,8 @@ def _feed_from_rss(cid, per_channel):
     item shape as the yt-dlp path so the merged feed stays uniform."""
     if not str(cid).startswith("UC"):
         return []
-    _force_ipv4()
-    url = "https://www.youtube.com/feeds/videos.xml?channel_id=%s" % cid
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            ents = _parse_feed_entries(r.read().decode("utf-8", "replace"))
+        ents = _parse_feed_entries(_rss_get(cid))
     except Exception:
         return []
     rows = []
