@@ -75,9 +75,11 @@ DISTFILES += \
 TRANSLATIONS += translations/harbour-fintube-en.ts
 
 # Ship the Python backend alongside the QML. sailfishapp.prf already installs the
-# qml/ tree and the .desktop file; this adds our python/ module.
-python.files = python
-python.path = /usr/share/$${TARGET}
+# qml/ tree and the .desktop file; this adds our python/ modules. Listed one by one so the
+# test suite and any local __pycache__ stay out of the package (the RPM's own byte-compile
+# step adds bytecode for the device's Python).
+python.files = python/youfish.py python/innertube.py python/ytm.py
+python.path = /usr/share/$${TARGET}/python
 INSTALLS += python
 
 # Launcher icon (rasterised from S3.svg) at the four Sailfish densities.
