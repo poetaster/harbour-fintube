@@ -120,18 +120,18 @@ Page {
         if (status === PageStatus.Active && !_moreAttached) {
             _moreAttached = true
             pageStack.pushAttached(Qt.resolvedUrl("MorePage.qml"), {
-                heading: "More",
+                heading: qsTr("More"),
                 entries: [
-                    { title: "Downloads", desc: "Saved videos for offline", page: "DownloadsPage.qml" },
-                    { title: "Playlists", desc: "Your local playlists", page: "PlaylistsPage.qml" },
-                    { title: "History", desc: "Recently watched", page: "HistoryPage.qml" },
-                    { title: "Channels", desc: "Manage subscriptions", page: "SubscriptionsPage.qml" },
-                    { title: "Settings", desc: "Playback + content", page: "SettingsPage.qml" },
-                    { title: "Providers", desc: "yt-dlp, ffmpeg, PO-token provider", page: "ProvidersPage.qml" },
-                    { title: "SponsorBlock", desc: "Skip sponsors and other segments", page: "SponsorBlockPage.qml" },
-                    { title: "Import from NewPipe", desc: "Subs, history & playlists from a backup",
+                    { title: qsTr("Downloads"), desc: qsTr("Saved videos for offline"), page: "DownloadsPage.qml" },
+                    { title: qsTr("Playlists"), desc: qsTr("Your local playlists"), page: "PlaylistsPage.qml" },
+                    { title: qsTr("History"), desc: qsTr("Recently watched"), page: "HistoryPage.qml" },
+                    { title: qsTr("Channels"), desc: qsTr("Manage subscriptions"), page: "SubscriptionsPage.qml" },
+                    { title: qsTr("Settings"), desc: qsTr("Playback + content"), page: "SettingsPage.qml" },
+                    { title: qsTr("Providers"), desc: qsTr("yt-dlp, ffmpeg, PO-token provider"), page: "ProvidersPage.qml" },
+                    { title: qsTr("SponsorBlock"), desc: qsTr("Skip sponsors and other segments"), page: "SponsorBlockPage.qml" },
+                    { title: qsTr("Import from NewPipe"), desc: qsTr("Subs, history & playlists from a backup"),
                       action: "import-newpipe" },
-                    { title: "Import from YouTube", desc: "Your subscriptions & playlists (needs sign-in)",
+                    { title: qsTr("Import from YouTube"), desc: qsTr("Your subscriptions & playlists (needs sign-in)"),
                       action: "youtube-import" }
                 ]
             })
@@ -167,8 +167,8 @@ Page {
             MenuItem {
                 visible: !app.backend.ready
                 text: app.backend.installing
-                      ? ("Installing yt-dlp… " + Math.round(app.backend.installPct) + "%")
-                      : "Install yt-dlp"
+                      ? qsTr("Installing yt-dlp… %1%").arg(Math.round(app.backend.installPct))
+                      : qsTr("Install yt-dlp")
                 enabled: !app.backend.installing
                 onClicked: {
                     app.backend.installYtdlp()
@@ -176,11 +176,11 @@ Page {
                 }
             }
             MenuItem {
-                text: "Search"
+                text: qsTr("Search")
                 onClicked: pageStack.push(Qt.resolvedUrl("SearchPage.qml"))
             }
             MenuItem {
-                text: page.refreshing ? "Refreshing…" : "Refresh"
+                text: page.refreshing ? qsTr("Refreshing…") : qsTr("Refresh")
                 enabled: !page.refreshing        // don't stack a second forced walk over a live one
                 onClicked: page.loadFeed(true)
             }
@@ -192,7 +192,7 @@ Page {
         header: Item {
             width: listView.width
             height: subsHeader.height
-            PageHeader { id: subsHeader; title: "Subscriptions" }
+            PageHeader { id: subsHeader; title: qsTr("Subscriptions") }
             BusyIndicator {
                 anchors {
                     left: parent.left; leftMargin: Theme.horizontalPageMargin
@@ -216,37 +216,37 @@ Page {
             menu: ContextMenu {
                 MenuItem {
                     text: (app.backend.watchMap && app.backend.watchMap[model.id]
-                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                           && app.backend.watchMap[model.id].w) ? qsTr("Mark as unwatched") : qsTr("Mark as watched")
                     onClicked: {
                         var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
                         app.backend.setWatched(model.id, !(e && e.w), model.title, model.uploader || "")
                     }
                 }
                 MenuItem {
-                    text: "Video details"
+                    text: qsTr("Video details")
                     onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                         { videoId: model.id, title: model.title, infoOnly: true,
                           infoThumbnail: model.thumbnail || "" })
                 }
                 MenuItem {
-                    text: "Add to playlist"
+                    text: qsTr("Add to playlist")
                     onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
                         { video: { id: model.id, title: model.title, uploader: model.uploader || "",
                                    duration: model.duration || 0, thumbnail: model.thumbnail || "" } })
                 }
                 MenuItem {
-                    text: "Download audio"
+                    text: qsTr("Download audio")
                     onClicked: {
                         var vid = model.id, t = model.title
-                        Remorse.popupAction(page, "Downloading audio",
+                        Remorse.popupAction(page, qsTr("Downloading audio"),
                             function() { app.backend.download(vid, t, "audio") })
                     }
                 }
                 MenuItem {
-                    text: "Download video"
+                    text: qsTr("Download video")
                     onClicked: {
                         var vid = model.id, t = model.title
-                        Remorse.popupAction(page, "Downloading video",
+                        Remorse.popupAction(page, qsTr("Downloading video"),
                             function() { app.backend.download(vid, t, "video") })
                     }
                 }
@@ -318,7 +318,7 @@ Page {
                     visible: text.length > 0
                     text: {
                         var parts = []
-                        if (model.views > 0) parts.push(page.fmtCount(model.views) + " views")
+                        if (model.views > 0) parts.push(qsTr("%1 views").arg(page.fmtCount(model.views)))
                         if (model.posted) parts.push(model.posted)
                         return parts.join("  ·  ")
                     }
@@ -334,9 +334,9 @@ Page {
 
         ViewPlaceholder {
             enabled: !page.loading && feedModel.count === 0
-            text: app.backend.subscriptions.length === 0 ? "No subscriptions yet" : "No recent uploads"
+            text: app.backend.subscriptions.length === 0 ? qsTr("No subscriptions yet") : qsTr("No recent uploads")
             hintText: app.backend.subscriptions.length === 0
-                      ? "Pull down → Search to find channels to subscribe to" : ""
+                      ? qsTr("Pull down → Search to find channels to subscribe to") : ""
         }
 
         VerticalScrollDecorator { }

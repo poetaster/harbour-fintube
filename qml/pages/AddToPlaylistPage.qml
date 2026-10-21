@@ -33,7 +33,7 @@ Page {
 
         header: Column {
             width: listView.width
-            PageHeader { title: "Add to playlist" }
+            PageHeader { title: qsTr("Add to playlist") }
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
@@ -58,7 +58,7 @@ Page {
                 Label {
                     anchors { left: plusIcon.right; leftMargin: Theme.paddingMedium
                               verticalCenter: parent.verticalCenter }
-                    text: "New playlist…"
+                    text: qsTr("New playlist…")
                     color: newItem.highlighted ? Theme.highlightColor : Theme.primaryColor
                 }
                 onClicked: pageStack.push(newDialog)
@@ -90,8 +90,8 @@ Page {
 
         ViewPlaceholder {
             enabled: page.localPlaylists.length === 0
-            text: "No local playlists"
-            hintText: "Tap New playlist… above to make one"
+            text: qsTr("No local playlists")
+            hintText: qsTr("Tap New playlist… above to make one")
         }
         VerticalScrollDecorator { }
     }
@@ -104,12 +104,12 @@ Page {
             canAccept: nameField.text.trim().length > 0
             Column {
                 width: parent.width
-                DialogHeader { title: "New playlist" }
+                DialogHeader { title: qsTr("New playlist") }
                 TextField {
                     id: nameField
                     width: parent.width
-                    label: "Name"
-                    placeholderText: "Playlist name"
+                    label: qsTr("Name")
+                    placeholderText: qsTr("Playlist name")
                     EnterKey.iconSource: "image://theme/icon-m-enter-accept"
                     EnterKey.onClicked: if (dlg.canAccept) dlg.accept()
                 }

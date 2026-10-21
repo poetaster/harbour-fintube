@@ -13,8 +13,8 @@ Page {
     readonly property var freqLabels: ["29 Hz", "59 Hz", "119 Hz", "237 Hz", "474 Hz",
                                        "947 Hz", "1.9 kHz", "3.8 kHz", "7.5 kHz", "15 kHz"]
     // Preset curves (dB per band). "Flat" (all zero) is index 0.
-    readonly property var presetNames: ["Flat", "Bass boost", "Treble boost", "Rock",
-                                        "Pop", "Vocal", "Electronic"]
+    readonly property var presetNames: [qsTr("Flat"), qsTr("Bass boost"), qsTr("Treble boost"), qsTr("Rock"),
+                                        qsTr("Pop"), qsTr("Vocal"), qsTr("Electronic")]
     readonly property var presets: [
         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
@@ -46,11 +46,11 @@ Page {
             width: parent.width
             spacing: Theme.paddingMedium
 
-            PageHeader { title: "Equalizer" }
+            PageHeader { title: qsTr("Equalizer") }
 
             TextSwitch {
-                text: "Equalizer"
-                description: "Apply the band gains below to playback."
+                text: qsTr("Equalizer")
+                description: qsTr("Apply the band gains below to playback.")
                 automaticCheck: false
                 checked: app.backend.eqEnabled
                 onClicked: app.backend.setEqEnabled(!app.backend.eqEnabled)
@@ -58,7 +58,7 @@ Page {
 
             ComboBox {
                 width: parent.width
-                label: "Preset"
+                label: qsTr("Preset")
                 // Apply on the item's own click (not currentIndex, which fires on load and would
                 // reset the saved bands to Flat every time the page opens).
                 menu: ContextMenu {

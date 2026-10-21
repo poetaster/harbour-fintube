@@ -86,8 +86,8 @@ Page {
         return t
     }
 
-    // Comments: fetched once on demand — auto-loaded as the info area scrolls near them (or by
-    // tapping the header) — then revealed a few at a time as the info area scrolls further.
+    // Comments: fetched once, a few seconds into playback (commentsAutoTimer); scrolling near them
+    // or tapping the header loads them sooner. Then revealed a few at a time as the info area scrolls.
     property var comments: []
     property bool commentsLoading: false
     property bool commentsLoaded: false
@@ -310,8 +310,8 @@ Page {
         onDownloadFinished: {
             if (videoId === page.videoId) {
                 page.downloading = false
-                page.downloadHint = ok ? "Downloaded"
-                                       : ("Download failed" + (message ? ": " + message : ""))
+                page.downloadHint = ok ? qsTr("Downloaded")
+                                       : (message ? qsTr("Download failed: %1").arg(message) : qsTr("Download failed"))
                 downloadHintTimer.restart()
             }
         }
@@ -393,6 +393,12 @@ Page {
         retryTimer.restart()
     }
     Timer {
+        id: commentsAutoTimer
+        interval: 3000
+        // Only for the page that is playing: a back-stack page's late timer must not start a walk.
+        onTriggered: if (page.holdsPlayer && page.commentsError.length === 0) page.loadComments()
+    }
+    Timer {
         id: retryTimer
         interval: 1500                    // brief backoff; a throttle 403 needs a beat to clear
         onTriggered: {
@@ -437,7 +443,7 @@ Page {
                 page.commentsTotal = res.total || (res.comments ? res.comments.length : 0)
                 page.commentsLoaded = true
             } else {
-                page.commentsError = (res && res.error) ? res.error : "couldn't load comments"
+                page.commentsError = (res && res.error) ? res.error : qsTr("couldn't load comments")
             }
         })
     }
@@ -458,7 +464,7 @@ Page {
             Qt.openUrlExternally(page.shareUrl)
         else if (act === "copy") {
             Clipboard.text = page.shareUrl
-            if (typeof app !== "undefined" && app.showToast) app.showToast("Link copied")
+            if (typeof app !== "undefined" && app.showToast) app.showToast(qsTr("Link copied"))
         } else if (act === "share") {
             shareLink.resources = [{ "type": "text/x-url",
                                      "linkTitle": page.title, "status": page.shareUrl }]
@@ -491,14 +497,14 @@ Page {
     // Human label for a category, used in the skip button and the "Skipped …" pill.
     function sbLabel(cat) {
         switch (cat) {
-        case "selfpromo":      return "self-promo"
-        case "interaction":    return "reminder"
-        case "intro":          return "intro"
-        case "outro":          return "endcards"
-        case "preview":        return "recap"
-        case "filler":         return "filler"
-        case "music_offtopic": return "non-music"
-        default:               return "sponsor"
+        case "selfpromo":      return qsTr("self-promo")
+        case "interaction":    return qsTr("reminder")
+        case "intro":          return qsTr("intro")
+        case "outro":          return qsTr("endcards")
+        case "preview":        return qsTr("recap")
+        case "filler":         return qsTr("filler")
+        case "music_offtopic": return qsTr("non-music")
+        default:               return qsTr("sponsor")
         }
     }
 
@@ -525,7 +531,7 @@ Page {
                 if (page.isPlaying) {
                     page.manualSeg = null
                     page.seekTo(Math.round(s.end * 1000))
-                    page.showSkipHint("Skipped " + page.sbLabel(s.category))
+                    page.showSkipHint(qsTr("Skipped %1").arg(page.sbLabel(s.category)))
                     return
                 }
             } else if (act === "manual" && pending === null) {
@@ -540,7 +546,7 @@ Page {
         if (!s) return
         page.manualSeg = null
         page.seekTo(Math.round(s.end * 1000))
-        page.showSkipHint("Skipped " + page.sbLabel(s.category))
+        page.showSkipHint(qsTr("Skipped %1").arg(page.sbLabel(s.category)))
     }
     function showSkipHint(t) {
         page.skipHint = t
@@ -615,7 +621,7 @@ Page {
             if (!page) return
             page.resolving = false
             if (!res || !res.ok) {
-                page.errorText = (res && res.error) ? res.error : "couldn't load details"
+                page.errorText = (res && res.error) ? res.error : qsTr("couldn't load details")
                 return
             }
             var info = res.info || {}
@@ -651,10 +657,10 @@ Page {
         app.nowPlaying.active = true
         nowPlayingConn.target = app.nowPlaying   // listen only after we've claimed
         app.applyAudioFx()                       // route EQ / boost to the (shared) player
-        // Comments are NOT prefetched at video-start any more: a one-shot watch (start it, never
-        // touch the info panel) would pay a wasted ~8s comment walk it never reads. They now warm
-        // on approach instead — the first time the user scrolls the info panel down toward the
-        // comments section (see infoFlick.onContentYChanged) — so the cost lands only on real intent.
+        // Comments load by themselves a few seconds after the video starts (commentsAutoTimer).
+        // The InnerTube walk takes ~1.5s on the background lane (pyBg), never the resolve lane, and
+        // the delay keeps its JSON parsing out of the first seconds of buffering.
+        commentsAutoTimer.restart()
         // NB: the remembered speed is primed on gplayer before play() (in onResolved) and engaged
         // by the C++ player during preroll — nothing rate-related happens here.
     }
@@ -775,7 +781,7 @@ Page {
                         gplayer.seekWhenReady(page.resumeMs)
                 }
             } else {
-                page.errorText = "no playable stream"
+                page.errorText = qsTr("no playable stream")
             }
             if (page.errorText.length === 0) {
                 page.claimNowPlaying()
@@ -952,7 +958,7 @@ Page {
     ShareAction {
         id: shareLink
         mimeType: "text/x-url"
-        title: "Share link"
+        title: qsTr("Share link")
     }
 
     // A lone tap toggles the controls, but only after we're sure it wasn't the first half of
@@ -1083,7 +1089,7 @@ Page {
                 Label { text: "▶"; color: Theme.highlightColor
                         font.pixelSize: Theme.fontSizeLarge
                         anchors.verticalCenter: parent.verticalCenter }
-                Label { text: "Watch"; color: Theme.highlightColor
+                Label { text: qsTr("Watch"); color: Theme.highlightColor
                         font.pixelSize: Theme.fontSizeMedium
                         anchors.verticalCenter: parent.verticalCenter }
             }
@@ -1163,7 +1169,7 @@ Page {
             Label {
                 id: manualSkipLabel
                 anchors.centerIn: parent
-                text: page.manualSeg ? ("Skip " + page.sbLabel(page.manualSeg.category) + "  »") : ""
+                text: page.manualSeg ? qsTr("Skip %1  »").arg(page.sbLabel(page.manualSeg.category)) : ""
                 color: Theme.highlightColor
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -1185,7 +1191,9 @@ Page {
                 id: dlLabel
                 anchors.centerIn: parent
                 text: page.downloading
-                      ? ("Downloading " + page.downloadKind + " " + Math.round(page.downloadPct) + "%")
+                      ? (page.downloadKind === "audio"
+                         ? qsTr("Downloading audio %1%").arg(Math.round(page.downloadPct))
+                         : qsTr("Downloading video %1%").arg(Math.round(page.downloadPct)))
                       : page.downloadHint
                 color: "white"
                 font.pixelSize: Theme.fontSizeExtraSmall
@@ -1317,11 +1325,9 @@ Page {
         // the end, normalises on scroll-up" report. Growing monotonically removes that feedback loop.
         onContentYChanged: {
             if (!page.commentsLoaded) {
-                // Load-on-approach: warm comments the first time the user actually scrolls the info
-                // panel down toward them. The comments section is the LAST thing in the column, so
-                // nearing the bottom (belowFold < one screen) = nearing comments. A one-shot watch
-                // that never scrolls here never fires the walk (a few seconds even post-2026-09
-                // lean profile) — the waste that made a video-start prefetch a bad trade.
+                // Load-on-approach: if the user scrolls toward the comments before the autoload
+                // timer fires, start now. The comments section is the LAST thing in the column, so
+                // nearing the bottom (belowFold < one screen) = nearing comments.
                 // contentY > 0 gates out the at-open case where a
                 // short panel already shows the header with nothing to scroll (tap it to load);
                 // loadComments() is idempotent, so a repeated trigger while it's in flight is a no-op.
@@ -1339,17 +1345,17 @@ Page {
 
         PullDownMenu {
             MenuItem {
-                text: "Related videos"
+                text: qsTr("Related videos")
                 onClicked: pageStack.push(Qt.resolvedUrl("RelatedPage.qml"),
                     { videoId: page.videoId, seedTitle: page.title })
             }
             MenuItem {
-                text: "Download audio"
+                text: qsTr("Download audio")
                 enabled: !page.downloading
                 onClicked: page.startDownload("audio")
             }
             MenuItem {
-                text: "Download video"
+                text: qsTr("Download video")
                 enabled: !page.downloading
                 onClicked: page.startDownload("video")
             }
@@ -1372,7 +1378,8 @@ Page {
                 Label {
                     id: liveLabel
                     anchors.centerIn: parent
-                    text: "● LIVE"
+                    //: Badge shown on a currently live stream
+        text: qsTr("● LIVE")
                     color: "white"
                     font.bold: true
                     font.pixelSize: Theme.fontSizeExtraSmall
@@ -1396,7 +1403,7 @@ Page {
                 visible: page.infoOnly && text.length > 0
                 text: {
                     var parts = []
-                    if (page.viewCount > 0) parts.push(page.fmtCount(page.viewCount) + " views")
+                    if (page.viewCount > 0) parts.push(qsTr("%1 views").arg(page.fmtCount(page.viewCount)))
                     if (page.likeCount > 0) parts.push("▲ " + page.fmtCount(page.likeCount))
                     if (page.uploadDate.length === 8)
                         parts.push(page.uploadDate.substr(0, 4) + "-"
@@ -1429,7 +1436,7 @@ Page {
                     id: subscribeButton
                     anchors { right: parent.right; verticalCenter: parent.verticalCenter }
                     visible: page.channelId.length > 0
-                    text: page.subscribed ? "Subscribed" : "Subscribe"
+                    text: page.subscribed ? qsTr("Subscribed") : qsTr("Subscribe")
                     onClicked: app.backend.toggleSubscription(
                         page.channelId, page.channel, page.channelUrl, page.channelAvatar)
                 }
@@ -1485,7 +1492,7 @@ Page {
                 visible: page.description.length > 0 && (descLabel.truncated || page.descExpanded)
                 Label {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: page.descExpanded ? "Show less" : "Show more"
+                    text: page.descExpanded ? qsTr("Show less") : qsTr("Show more")
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.highlightColor
                 }
@@ -1510,7 +1517,7 @@ Page {
                     }
                     Label {
                         anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Open"
+                        text: qsTr("Open")
                         font.pixelSize: Theme.fontSizeTiny
                         color: Theme.secondaryColor
                     }
@@ -1526,7 +1533,7 @@ Page {
                     }
                     Label {
                         anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Copy"
+                        text: qsTr("Copy")
                         font.pixelSize: Theme.fontSizeTiny
                         color: Theme.secondaryColor
                     }
@@ -1542,15 +1549,15 @@ Page {
                     }
                     Label {
                         anchors.horizontalCenter: parent.horizontalCenter
-                        text: "Share"
+                        text: qsTr("Share")
                         font.pixelSize: Theme.fontSizeTiny
                         color: Theme.secondaryColor
                     }
                 }
             }
 
-            // ---- Comments: auto-load as the info area scrolls near them (or tap the header),
-            //      then reveal a few at a time on further scroll ----
+            // ---- Comments: auto-load shortly after playback starts (sooner on scroll or a tap
+            //      on the header), then reveal a few at a time on further scroll ----
             Column {
                 id: commentsCol
                 width: parent.width
@@ -1565,9 +1572,9 @@ Page {
                         anchors { left: parent.left; verticalCenter: parent.verticalCenter }
                         text: page.commentsLoaded
                                 ? (page.commentsTotal > 0
-                                    ? "Comments  ·  " + page.fmtCount(page.commentsTotal)
-                                    : "Comments")
-                                : (page.commentsLoading ? "Loading comments…" : "Load comments")
+                                    ? qsTr("Comments  ·  %1").arg(page.fmtCount(page.commentsTotal))
+                                    : qsTr("Comments"))
+                                : (page.commentsLoading ? qsTr("Loading comments…") : qsTr("Load comments"))
                         font.pixelSize: Theme.fontSizeMedium
                         color: (page.commentsLoaded || page.commentsLoading)
                                  ? Theme.highlightColor : Theme.primaryColor
@@ -1593,7 +1600,7 @@ Page {
                     x: Theme.horizontalPageMargin
                     width: parent.width - 2 * Theme.horizontalPageMargin
                     visible: page.commentsLoaded && page.comments.length === 0
-                    text: "No comments"
+                    text: qsTr("No comments")
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.secondaryColor
                 }
@@ -1663,8 +1670,9 @@ Page {
                                     text: {
                                         if (!c) return ""
                                         var n = c.reply_count || (c.replies ? c.replies.length : 0)
-                                        return repExpanded ? "▴  Hide replies"
-                                            : ("▾  " + page.fmtCount(n) + (n === 1 ? " reply" : " replies"))
+                                        return repExpanded ? qsTr("▴  Hide replies")
+                                            : (n === 1 ? qsTr("▾  %1 reply").arg(page.fmtCount(n))
+                                                       : qsTr("▾  %1 replies").arg(page.fmtCount(n)))
                                     }
                                     font.pixelSize: Theme.fontSizeExtraSmall
                                     color: Theme.highlightColor
@@ -1740,7 +1748,7 @@ Page {
                     visible: page.commentsLoaded && page.commentsShown < page.comments.length
                     Label {
                         anchors.verticalCenter: parent.verticalCenter
-                        text: "Show more comments"
+                        text: qsTr("Show more comments")
                         font.pixelSize: Theme.fontSizeSmall
                         color: Theme.highlightColor
                     }
@@ -1757,8 +1765,7 @@ Page {
                     visible: page.commentsLoaded && page.comments.length > 0
                              && page.commentsShown >= page.comments.length
                              && page.commentsTotal > page.comments.length
-                    text: "Showing the top " + page.comments.length + " of "
-                          + page.fmtCount(page.commentsTotal) + " comments"
+                    text: qsTr("Showing the top %1 of %2 comments").arg(page.comments.length).arg(page.fmtCount(page.commentsTotal))
                     font.pixelSize: Theme.fontSizeExtraSmall
                     color: Theme.secondaryColor
                 }

@@ -14,7 +14,7 @@ Page {
         anchors.fill: parent
         model: app.backend.subscriptions
 
-        header: PageHeader { title: "Subscriptions" }
+        header: PageHeader { title: qsTr("Subscriptions") }
 
         delegate: ListItem {
             id: delegateItem
@@ -22,7 +22,7 @@ Page {
 
             menu: ContextMenu {
                 MenuItem {
-                    text: "Unsubscribe"
+                    text: qsTr("Unsubscribe")
                     onClicked: app.backend.toggleSubscription(
                         modelData.id, modelData.name, modelData.url, modelData.thumbnail || "")
                 }
@@ -49,8 +49,8 @@ Page {
 
         ViewPlaceholder {
             enabled: app.backend.subscriptions.length === 0
-            text: "No subscriptions"
-            hintText: "Open a video and tap Subscribe"
+            text: qsTr("No subscriptions")
+            hintText: qsTr("Open a video and tap Subscribe")
         }
 
         VerticalScrollDecorator { }

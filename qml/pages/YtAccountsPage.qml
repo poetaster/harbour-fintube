@@ -20,7 +20,7 @@ Page {
             if (!page) return              // page popped before the account list came back
             page.loading = false
             if (res && !res.ok)
-                page.errorText = res.error || "Couldn't load the account list."
+                page.errorText = res.error || qsTr("Couldn't load the account list.")
         })
     }
 
@@ -31,19 +31,19 @@ Page {
         model: app.backend.ytAccounts
 
         PullDownMenu {
-            MenuItem { text: "Reload"; onClicked: page.reload() }
+            MenuItem { text: qsTr("Reload"); onClicked: page.reload() }
         }
 
         header: Column {
             width: parent.width
-            PageHeader { title: "Account" }
+            PageHeader { title: qsTr("Account") }
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 bottomPadding: Theme.paddingMedium
                 wrapMode: Text.Wrap
-                text: "Which account/channel to import subscriptions and playlists from. Re-run "
-                      + "More → Import from YouTube after switching."
+                text: qsTr("Which account/channel to import subscriptions and playlists from. Re-run "
+                      + "More → Import from YouTube after switching.")
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
@@ -114,16 +114,16 @@ Page {
                         if (page.status === PageStatus.Active)
                             pageStack.pop()
                     } else
-                        page.errorText = (res && res.error) ? res.error : "Couldn't switch account."
+                        page.errorText = (res && res.error) ? res.error : qsTr("Couldn't switch account.")
                 })
             }
         }
 
         ViewPlaceholder {
             enabled: !page.loading && app.backend.ytAccounts.length === 0
-            text: page.errorText.length > 0 ? page.errorText : "No accounts found"
+            text: page.errorText.length > 0 ? page.errorText : qsTr("No accounts found")
             hintText: app.backend.youtubeLoggedIn
-                      ? "Pull down to reload" : "Import your YouTube login first"
+                      ? qsTr("Pull down to reload") : qsTr("Import your YouTube login first")
         }
 
         VerticalScrollDecorator { }

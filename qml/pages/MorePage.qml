@@ -19,7 +19,7 @@ Page {
 
     property bool hideDock: true   // hide the now-playing dock / resume bar over the More hub
     property var entries: []
-    property string heading: "More"
+    property string heading: qsTr("More")
 
     SilicaListView {
         anchors.fill: parent

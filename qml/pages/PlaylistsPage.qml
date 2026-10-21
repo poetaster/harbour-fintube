@@ -8,7 +8,7 @@ Page {
 
     Component.onCompleted: app.backend.loadPlaylists()
 
-    function fmtCount(n) { return (n === 1) ? "1 video" : ((n || 0) + " videos") }
+    function fmtCount(n) { return qsTr("%n video(s)", "", n || 0) }
 
     SilicaListView {
         id: listView
@@ -17,16 +17,16 @@ Page {
 
         PullDownMenu {
             MenuItem {
-                text: "Add YouTube playlist"
+                text: qsTr("Add YouTube playlist")
                 onClicked: pageStack.push(ytDialog)
             }
             MenuItem {
-                text: "New playlist"
+                text: qsTr("New playlist")
                 onClicked: pageStack.push(newDialog)
             }
         }
 
-        header: PageHeader { title: "Playlists" }
+        header: PageHeader { title: qsTr("Playlists") }
 
         delegate: ListItem {
             id: item
@@ -36,16 +36,16 @@ Page {
             menu: ContextMenu {
                 MenuItem {
                     visible: modelData.kind === "youtube"
-                    text: "Refresh from YouTube"
+                    text: qsTr("Refresh from YouTube")
                     onClicked: app.backend.refreshPlaylist(modelData.id, function(pl) {
-                        if (!pl) app.showToast("Couldn't refresh playlist")
+                        if (!pl) app.showToast(qsTr("Couldn't refresh playlist"))
                     })
                 }
                 MenuItem {
-                    text: "Delete"
+                    text: qsTr("Delete")
                     onClicked: {
                         var pid = modelData.id, t = modelData.title
-                        Remorse.popupAction(page, "Deleting " + t,
+                        Remorse.popupAction(page, qsTr("Deleting %1").arg(t),
                             function() { app.backend.deletePlaylist(pid) })
                     }
                 }
@@ -103,8 +103,8 @@ Page {
 
         ViewPlaceholder {
             enabled: app.backend.playlists.length === 0
-            text: "No playlists"
-            hintText: "Pull down to create one or add a YouTube playlist"
+            text: qsTr("No playlists")
+            hintText: qsTr("Pull down to create one or add a YouTube playlist")
         }
         VerticalScrollDecorator { }
     }
@@ -117,12 +117,12 @@ Page {
             canAccept: nameField.text.trim().length > 0
             Column {
                 width: parent.width
-                DialogHeader { title: "New playlist" }
+                DialogHeader { title: qsTr("New playlist") }
                 TextField {
                     id: nameField
                     width: parent.width
-                    label: "Name"
-                    placeholderText: "Playlist name"
+                    label: qsTr("Name")
+                    placeholderText: qsTr("Playlist name")
                     EnterKey.iconSource: "image://theme/icon-m-enter-accept"
                     EnterKey.onClicked: if (dlg.canAccept) dlg.accept()
                 }
@@ -139,11 +139,11 @@ Page {
             canAccept: urlField.text.trim().length > 0
             Column {
                 width: parent.width
-                DialogHeader { title: "Add YouTube playlist" }
+                DialogHeader { title: qsTr("Add YouTube playlist") }
                 TextField {
                     id: urlField
                     width: parent.width
-                    label: "Playlist URL or ID"
+                    label: qsTr("Playlist URL or ID")
                     placeholderText: "youtube.com/playlist?list=…"
                     EnterKey.iconSource: "image://theme/icon-m-enter-accept"
                     EnterKey.onClicked: if (yd.canAccept) yd.accept()
@@ -152,14 +152,14 @@ Page {
                     x: Theme.horizontalPageMargin
                     width: parent.width - 2 * Theme.horizontalPageMargin
                     wrapMode: Text.Wrap
-                    text: "Fetches the playlist's videos and saves it to your library."
+                    text: qsTr("Fetches the playlist's videos and saves it to your library.")
                     color: Theme.secondaryColor
                     font.pixelSize: Theme.fontSizeExtraSmall
                 }
             }
             onAccepted: app.backend.saveYoutubePlaylist(urlField.text.trim(), function(res) {
                 if (!res || !res.ok)
-                    app.showToast((res && res.error) ? res.error : "Couldn't save playlist")
+                    app.showToast((res && res.error) ? res.error : qsTr("Couldn't save playlist"))
             })
         }
     }

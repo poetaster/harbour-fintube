@@ -29,7 +29,7 @@ Page {
         anchors.fill: parent
         model: plModel
 
-        header: PageHeader { title: page.channelName || "Playlists" }
+        header: PageHeader { title: page.channelName || qsTr("Playlists") }
 
         delegate: ListItem {
             id: item
@@ -68,7 +68,7 @@ Page {
                 Label {
                     width: parent.width
                     visible: model.count > 0
-                    text: (model.count === 1) ? "1 video" : (model.count + " videos")
+                    text: qsTr("%n video(s)", "", model.count)
                     font.pixelSize: Theme.fontSizeExtraSmall
                     color: Theme.secondaryColor
                 }
@@ -80,7 +80,7 @@ Page {
 
         ViewPlaceholder {
             enabled: !page.loading && plModel.count === 0
-            text: "No playlists"
+            text: qsTr("No playlists")
         }
         VerticalScrollDecorator { }
     }

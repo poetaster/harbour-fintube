@@ -69,7 +69,7 @@ Page {
             page.loadingMore = false
             if (!res || !res.ok) {
                 if (start <= 1) {
-                    page.statusText = (res && res.error) ? res.error : "search failed"
+                    page.statusText = (res && res.error) ? res.error : qsTr("search failed")
                     page.statusError = true
                 }
                 return
@@ -138,7 +138,7 @@ Page {
         anchors { top: parent.top; left: parent.left; right: parent.right }
         z: 2
 
-        PageHeader { title: "Search" }
+        PageHeader { title: qsTr("Search") }
 
         Row {
             width: parent.width
@@ -148,7 +148,7 @@ Page {
                 // magnifying glass's gap on the left (the cog is the Row's last item → the freed
                 // width becomes a right-edge gap).
                 width: parent.width - (filterCog.visible ? filterCog.width + Theme.horizontalPageMargin : 0)
-                placeholderText: page.searchKind === "channel" ? "Search channels" : "Search YouTube"
+                placeholderText: page.searchKind === "channel" ? qsTr("Search channels") : qsTr("Search YouTube")
                 EnterKey.iconSource: "image://theme/icon-m-enter-accept"
                 EnterKey.onClicked: page.runSearch(text)
                 onTextChanged: {
@@ -176,11 +176,11 @@ Page {
         ComboBox {
             id: kindCombo
             width: parent.width
-            label: "Search for"
+            label: qsTr("Search for")
             currentIndex: 0
             menu: ContextMenu {
-                MenuItem { text: "Videos" }
-                MenuItem { text: "Channels" }
+                MenuItem { text: qsTr("Videos") }
+                MenuItem { text: qsTr("Channels") }
             }
             onCurrentIndexChanged: {
                 page.searchKind = currentIndex === 1 ? "channel" : "video"
@@ -201,38 +201,38 @@ Page {
 
             ComboBox {
                 width: parent.width
-                label: "Sort by"
+                label: qsTr("Sort by")
                 currentIndex: 0
                 menu: ContextMenu {
-                    MenuItem { text: "Relevance" }
-                    MenuItem { text: "Upload date" }
-                    MenuItem { text: "View count" }
-                    MenuItem { text: "Rating" }
+                    MenuItem { text: qsTr("Relevance") }
+                    MenuItem { text: qsTr("Upload date") }
+                    MenuItem { text: qsTr("View count") }
+                    MenuItem { text: qsTr("Rating") }
                 }
                 onCurrentIndexChanged: { page.fSort = [0, 2, 3, 1][currentIndex]; page.applyFilters() }
             }
             ComboBox {
                 width: parent.width
-                label: "Uploaded"
+                label: qsTr("Uploaded")
                 currentIndex: 0
                 menu: ContextMenu {
-                    MenuItem { text: "Any time" }
-                    MenuItem { text: "Today" }
-                    MenuItem { text: "This week" }
-                    MenuItem { text: "This month" }
-                    MenuItem { text: "This year" }
+                    MenuItem { text: qsTr("Any time") }
+                    MenuItem { text: qsTr("Today") }
+                    MenuItem { text: qsTr("This week") }
+                    MenuItem { text: qsTr("This month") }
+                    MenuItem { text: qsTr("This year") }
                 }
                 onCurrentIndexChanged: { page.fDate = [0, 2, 3, 4, 5][currentIndex]; page.applyFilters() }
             }
             ComboBox {
                 width: parent.width
-                label: "Length"
+                label: qsTr("Length")
                 currentIndex: 0
                 menu: ContextMenu {
-                    MenuItem { text: "Any" }
-                    MenuItem { text: "Under 4 minutes" }
-                    MenuItem { text: "4 – 20 minutes" }
-                    MenuItem { text: "Over 20 minutes" }
+                    MenuItem { text: qsTr("Any") }
+                    MenuItem { text: qsTr("Under 4 minutes") }
+                    MenuItem { text: qsTr("4 – 20 minutes") }
+                    MenuItem { text: qsTr("Over 20 minutes") }
                 }
                 onCurrentIndexChanged: { page.fDur = [0, 1, 3, 2][currentIndex]; page.applyFilters() }
             }
@@ -348,32 +348,32 @@ Page {
                 ContextMenu {
                     MenuItem {
                         text: (app.backend.watchMap && app.backend.watchMap[item.vidId]
-                               && app.backend.watchMap[item.vidId].w) ? "Mark as unwatched" : "Mark as watched"
+                               && app.backend.watchMap[item.vidId].w) ? qsTr("Mark as unwatched") : qsTr("Mark as watched")
                         onClicked: {
                             var e = app.backend.watchMap ? app.backend.watchMap[item.vidId] : undefined
                             app.backend.setWatched(item.vidId, !(e && e.w), item.vidTitle, item.vidUploader)
                         }
                     }
                     MenuItem {
-                        text: "Video details"
+                        text: qsTr("Video details")
                         onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                             { videoId: item.vidId, title: item.vidTitle, infoOnly: true,
                               infoThumbnail: item.vidThumb })
                     }
                     MenuItem {
-                        text: "Add to playlist"
+                        text: qsTr("Add to playlist")
                         onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
                             { video: { id: item.vidId, title: item.vidTitle, uploader: item.vidUploader,
                                        duration: item.vidDuration, thumbnail: item.vidThumb } })
                     }
                     MenuItem {
-                        text: "Download audio"
-                        onClicked: Remorse.popupAction(page, "Downloading audio",
+                        text: qsTr("Download audio")
+                        onClicked: Remorse.popupAction(page, qsTr("Downloading audio"),
                             function() { app.backend.download(item.vidId, item.vidTitle, "audio") })
                     }
                     MenuItem {
-                        text: "Download video"
-                        onClicked: Remorse.popupAction(page, "Downloading video",
+                        text: qsTr("Download video")
+                        onClicked: Remorse.popupAction(page, qsTr("Downloading video"),
                             function() { app.backend.download(item.vidId, item.vidTitle, "video") })
                     }
                 }
@@ -455,7 +455,7 @@ Page {
                         // views · age on their own line (channel name is above)
                         text: {
                             var parts = []
-                            if (model.views > 0) parts.push(page.fmtCount(model.views) + " views")
+                            if (model.views > 0) parts.push(qsTr("%1 views").arg(page.fmtCount(model.views)))
                             if (model.posted) parts.push(model.posted)
                             return parts.join("  ·  ")
                         }
@@ -499,7 +499,7 @@ Page {
                     Label {
                         width: parent.width
                         visible: model.subscribers > 0
-                        text: page.fmtCount(model.subscribers) + " subscribers"
+                        text: qsTr("%1 subscribers").arg(page.fmtCount(model.subscribers))
                         color: Theme.secondaryColor
                         font.pixelSize: Theme.fontSizeExtraSmall
                     }
@@ -521,10 +521,10 @@ Page {
 
         ViewPlaceholder {
             enabled: resultsModel.count === 0 && !page.loading
-            text: !app.backend.ready ? "yt-dlp not found"
-                  : (page.searchKind === "channel" ? "Search for a channel" : "Search for a video")
+            text: !app.backend.ready ? qsTr("yt-dlp not found")
+                  : (page.searchKind === "channel" ? qsTr("Search for a channel") : qsTr("Search for a video"))
             hintText: app.backend.ready
-                      ? "" : "Install yt-dlp on the device, then pull down to recheck"
+                      ? "" : qsTr("Install yt-dlp on the device, then pull down to recheck")
         }
 
         VerticalScrollDecorator { }

@@ -93,17 +93,17 @@ ApplicationWindow {
     // a toast reports the combined result. Guarded so a signed-out tap explains itself.
     function importYoutubeAccount() {
         if (!app.backend.youtubeLoggedIn) {
-            app.showToast("Sign in first: More → Providers → YouTube account")
+            app.showToast(qsTr("Sign in first: More → Providers → YouTube account"))
             return
         }
         var win = app
-        win.showToast("Importing from YouTube…")
+        win.showToast(qsTr("Importing from YouTube…"))
         win.backend.importYoutubeAccount(function(res) {
             if (!res || !res.ok) {
-                win.showToast((res && res.error) ? res.error : "Import failed")
+                win.showToast((res && res.error) ? res.error : qsTr("Import failed"))
                 return
             }
-            win.showToast(res.summary || "Imported from YouTube")
+            win.showToast(res.summary || qsTr("Imported from YouTube"))
         })
     }
 
@@ -116,21 +116,20 @@ ApplicationWindow {
     Component {
         id: newpipePicker
         FilePickerPage {
-            title: "Choose a NewPipe / PipePipe backup"
+            title: qsTr("Choose a NewPipe / PipePipe backup")
             nameFilters: [ "*.zip", "*.db" ]
             onSelectedContentPropertiesChanged: {
                 // Capture the ApplicationWindow as a plain JS reference: the pyotherside callback
                 // below is invoked from Backend's QML context (QJSValue.call), where the `app` ID
                 // won't resolve — but a captured object reference the closure holds still works.
                 var win = app
-                win.showToast("Importing…")
+                win.showToast(qsTr("Importing…"))
                 win.backend.importNewpipe(selectedContentProperties.filePath, function(res) {
                     if (!res || !res.ok) {
-                        win.showToast((res && res.error) ? res.error : "Import failed")
+                        win.showToast((res && res.error) ? res.error : qsTr("Import failed"))
                         return
                     }
-                    var msg = res.summary || ("Imported " + res.added + " channel"
-                                              + (res.added === 1 ? "" : "s"))
+                    var msg = res.summary || qsTr("Imported %n channel(s)", "", res.added)
                     win.showToast(msg)
                 })
             }
@@ -255,7 +254,7 @@ ApplicationWindow {
                 // Save the playlist into the library (async), then show the library — it fills in
                 // once the fetch completes since the page binds to backend.playlists.
                 backend.saveYoutubePlaylist(res.id || res.url, function(r) {
-                    if (!r || !r.ok) app.showToast((r && r.error) ? r.error : "Couldn't save playlist")
+                    if (!r || !r.ok) app.showToast((r && r.error) ? r.error : qsTr("Couldn't save playlist"))
                 })
                 pageStack.push(Qt.resolvedUrl("pages/PlaylistsPage.qml"))
             }
@@ -340,7 +339,7 @@ ApplicationWindow {
             }
             Label {
                 width: parent.width
-                text: "Continue watching"
+                text: qsTr("Continue watching")
                 font.pixelSize: Theme.fontSizeExtraSmall
                 color: Theme.secondaryColor
             }

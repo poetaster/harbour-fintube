@@ -238,6 +238,12 @@ render thread, everything else under the lock.
 - **A just-ended livestream (`live_status == "post_live"`) is refused** with a "still processing"
   message. Until YouTube finishes the recording, its formats are DASH segment lists that the proxy
   can't serve as one file.
+- **Every user-visible QML string goes through `qsTr()`** (`CONFIG += sailfishapp_i18n`; the build's
+  lupdate refreshes `translations/*.ts`). Use `.arg()` for values, never `+` concatenation; `%n` for
+  counts (`qsTr("%n video(s)", "", n)`) — `translations/harbour-fintube-en.ts` supplies the English
+  plural forms and `main()` installs it as the fallback under the device language. Never wrap
+  setting keys/values, `py.call` names, or anything compared with `===`: use a flag instead of
+  testing translated text (`ProvidersPage.diagRunning`). Python-sourced messages stay English.
 - **Qt sets the process locale from the device**, so `strptime("%b")` fails on non-English phones.
   Month names are parsed by hand (`innertube._upload_date`).
 - **Debug lines worth grepping** (`YOUFISH_DEBUG=1`, `[youfish/t …]`): `fast player`, `fast live`,

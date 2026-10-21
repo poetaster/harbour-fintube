@@ -71,12 +71,12 @@ Page {
             }
         }
 
-        header: PageHeader { title: "History" }
+        header: PageHeader { title: qsTr("History") }
 
         PullDownMenu {
             MenuItem {
-                text: "Clear history"
-                onClicked: Remorse.popupAction(page, "Clearing history", function() {
+                text: qsTr("Clear history")
+                onClicked: Remorse.popupAction(page, qsTr("Clearing history"), function() {
                     app.backend.clearWatchHistory(function() { page.reload() })
                 })
             }
@@ -95,14 +95,14 @@ Page {
             menu: ContextMenu {
                 MenuItem {
                     text: (app.backend.watchMap && app.backend.watchMap[model.id]
-                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                           && app.backend.watchMap[model.id].w) ? qsTr("Mark as unwatched") : qsTr("Mark as watched")
                     onClicked: {
                         var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
                         app.backend.setWatched(model.id, !(e && e.w), model.title, model.channel || "")
                     }
                 }
                 MenuItem {
-                    text: "Video details"
+                    text: qsTr("Video details")
                     onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                         { videoId: model.id, title: model.title, infoOnly: true,
                           infoThumbnail: model.thumbnail || "" })
@@ -156,8 +156,8 @@ Page {
 
         ViewPlaceholder {
             enabled: !page.loading && histModel.count === 0
-            text: "No history yet"
-            hintText: "Videos you watch show up here."
+            text: qsTr("No history yet")
+            hintText: qsTr("Videos you watch show up here.")
         }
 
         VerticalScrollDecorator { }

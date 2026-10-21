@@ -8,5 +8,6 @@ rm -rf .build RPMS .sfdk installroot
 rm -f  Makefile Makefile.* .qmake.stash documentation.list
 rm -f  *.o moc_*.cpp moc_*.h qrc_*.cpp ui_*.h
 rm -f  harbour-fintube          # the compiled binary at the project root
+rm -f  translations/*.qm        # lrelease output (in-source builds)
 
 echo "Cleaned build artifacts from $(pwd)"

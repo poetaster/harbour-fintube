@@ -396,14 +396,14 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                   verticalCenter: parent.verticalCenter }
-                        text: "Subtitles"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("Subtitles"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     Label {
                         anchors { right: cChev.left; rightMargin: Theme.paddingSmall
                                   verticalCenter: parent.verticalCenter }
                         // "Off", or the active base-language code (EN, PT…).
                         text: root.currentCaptionLang.length > 0
-                              ? root.currentCaptionLang.split("-")[0].toUpperCase() : "Off"
+                              ? root.currentCaptionLang.split("-")[0].toUpperCase() : qsTr("Off")
                         font.pixelSize: Theme.fontSizeSmall
                         color: root.currentCaptionLang.length > 0 ? Theme.highlightColor : "#99FFFFFF"
                     }
@@ -421,7 +421,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                   verticalCenter: parent.verticalCenter }
-                        text: "Audio"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("Audio"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     Label {
                         anchors { right: aChev.left; rightMargin: Theme.paddingSmall
@@ -445,12 +445,12 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                   verticalCenter: parent.verticalCenter }
-                        text: "Quality"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("Quality"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     Label {
                         anchors { right: qChev.left; rightMargin: Theme.paddingSmall
                                   verticalCenter: parent.verticalCenter }
-                        text: root.currentQuality.length > 0 ? root.currentQuality : "Auto"
+                        text: root.currentQuality.length > 0 ? root.currentQuality : qsTr("Auto")
                         font.pixelSize: Theme.fontSizeSmall; color: Theme.highlightColor
                     }
                     Label { id: qChev
@@ -467,7 +467,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                   verticalCenter: parent.verticalCenter }
-                        text: "Speed"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("Speed"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     Label {
                         anchors { right: sChev.left; rightMargin: Theme.paddingSmall
@@ -498,7 +498,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.paddingMedium
                                   verticalCenter: parent.verticalCenter }
-                        text: "‹  Quality"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("‹  Quality"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     MouseArea { id: qBackArea; anchors.fill: parent
                         onClicked: { root.playbackSection = ""; root.interacted() } }
@@ -547,7 +547,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.paddingMedium
                                   verticalCenter: parent.verticalCenter }
-                        text: "‹  Audio"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("‹  Audio"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     MouseArea { id: aBackArea; anchors.fill: parent
                         onClicked: { root.playbackSection = ""; root.interacted() } }
@@ -569,7 +569,7 @@ Item {
                                     anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                               right: parent.right; rightMargin: Theme.horizontalPageMargin
                                               verticalCenter: parent.verticalCenter }
-                                    text: modelData.name + (modelData.is_original ? "  (original)" : "")
+                                    text: modelData.name + (modelData.is_original ? qsTr("  (original)") : "")
                                     truncationMode: TruncationMode.Fade
                                     font.pixelSize: Theme.fontSizeSmall
                                     font.bold: modelData.itag === root.currentAudioItag
@@ -598,7 +598,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.paddingMedium
                                   verticalCenter: parent.verticalCenter }
-                        text: "‹  Speed"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("‹  Speed"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     MouseArea { id: sBackArea; anchors.fill: parent
                         onClicked: { root.playbackSection = ""; root.interacted() } }
@@ -619,7 +619,7 @@ Item {
                                 Label {
                                     anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                               verticalCenter: parent.verticalCenter }
-                                    text: root.fmtRate(modelData) + (modelData === 1.0 ? "  (Normal)" : "")
+                                    text: root.fmtRate(modelData) + (modelData === 1.0 ? qsTr("  (Normal)") : "")
                                     font.pixelSize: Theme.fontSizeSmall
                                     font.bold: modelData === root.playbackRate
                                     color: modelData === root.playbackRate
@@ -647,7 +647,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.paddingMedium
                                   verticalCenter: parent.verticalCenter }
-                        text: "‹  Subtitles"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("‹  Subtitles"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     MouseArea { id: capBackArea; anchors.fill: parent
                         onClicked: { root.playbackSection = ""; root.interacted() } }
@@ -666,7 +666,7 @@ Item {
                             Label {
                                 anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                           verticalCenter: parent.verticalCenter }
-                                text: "Off"; font.pixelSize: Theme.fontSizeSmall
+                                text: qsTr("Off"); font.pixelSize: Theme.fontSizeSmall
                                 font.bold: root.currentCaptionLang === ""
                                 color: root.currentCaptionLang === "" ? Theme.highlightColor : "white"
                             }
@@ -686,7 +686,7 @@ Item {
                                     truncationMode: TruncationMode.Fade
                                     text: modelData.name + (modelData.kind === "asr"
                                           && modelData.name.toLowerCase().indexOf("auto") < 0
-                                          ? "  ·  auto" : "")
+                                          ? qsTr("  ·  auto") : "")
                                     font.pixelSize: Theme.fontSizeSmall
                                     font.bold: modelData.lang === root.currentCaptionLang
                                     color: modelData.lang === root.currentCaptionLang
@@ -706,7 +706,7 @@ Item {
                             Label {
                                 anchors { left: parent.left; leftMargin: Theme.horizontalPageMargin
                                           verticalCenter: parent.verticalCenter }
-                                text: "Translate…"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                                text: qsTr("Translate…"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                             }
                             Label {
                                 anchors { right: parent.right; rightMargin: Theme.horizontalPageMargin
@@ -732,7 +732,7 @@ Item {
                     Label {
                         anchors { left: parent.left; leftMargin: Theme.paddingMedium
                                   verticalCenter: parent.verticalCenter }
-                        text: "‹  Translate to"; font.pixelSize: Theme.fontSizeSmall; color: "white"
+                        text: qsTr("‹  Translate to"); font.pixelSize: Theme.fontSizeSmall; color: "white"
                     }
                     MouseArea { id: trBackArea; anchors.fill: parent
                         onClicked: { root.playbackSection = "captions"; root.interacted() } }
@@ -740,7 +740,7 @@ Item {
                 SearchField {
                     id: captionSearch
                     anchors { left: parent.left; right: parent.right; top: trBack.bottom }
-                    placeholderText: "Language"
+                    placeholderText: qsTr("Language")
                     onTextChanged: root.captionFilter = text
                 }
                 SilicaFlickable {

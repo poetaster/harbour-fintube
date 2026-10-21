@@ -35,7 +35,7 @@ Page {
                 page.loading = false
                 itemsModel.clear()
                 if (!res || !res.ok) {
-                    app.showToast((res && res.error) ? res.error : "Couldn't load playlist")
+                    app.showToast((res && res.error) ? res.error : qsTr("Couldn't load playlist"))
                     return
                 }
                 page.playlistTitle = res.title || page.playlistTitle
@@ -88,27 +88,27 @@ Page {
         PullDownMenu {
             MenuItem {
                 visible: page.ytView
-                text: page.saved ? "Saved to library ✓" : "Save to library"
+                text: page.saved ? qsTr("Saved to library ✓") : qsTr("Save to library")
                 enabled: !page.saved
                 onClicked: {
                     page.saved = true
                     app.backend.saveYoutubePlaylist(page.ytRef, function(res) {
                         if (res && res.ok) return
                         if (page) page.saved = false     // let the user retry
-                        app.showToast((res && res.error) ? res.error : "Couldn't save playlist")
+                        app.showToast((res && res.error) ? res.error : qsTr("Couldn't save playlist"))
                     })
                 }
             }
             MenuItem {
                 visible: page.playlistKind === "youtube" && !page.ytView
-                text: "Refresh from YouTube"
+                text: qsTr("Refresh from YouTube")
                 onClicked: app.backend.refreshPlaylist(page.playlistId, function(pl) {
-                    if (!pl) app.showToast("Couldn't refresh playlist")
+                    if (!pl) app.showToast(qsTr("Couldn't refresh playlist"))
                     if (page) page.load()
                 })
             }
             MenuItem {
-                text: "Play all"
+                text: qsTr("Play all")
                 enabled: itemsModel.count > 0
                 onClicked: page.playAt(0)
             }
@@ -126,40 +126,40 @@ Page {
             menu: ContextMenu {
                 MenuItem {
                     text: (app.backend.watchMap && app.backend.watchMap[model.id]
-                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                           && app.backend.watchMap[model.id].w) ? qsTr("Mark as unwatched") : qsTr("Mark as watched")
                     onClicked: {
                         var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
                         app.backend.setWatched(model.id, !(e && e.w), model.title, model.uploader || "")
                     }
                 }
                 MenuItem {
-                    text: "Video details"
+                    text: qsTr("Video details")
                     onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                         { videoId: model.id, title: model.title, infoOnly: true,
                           infoThumbnail: model.thumbnail || "" })
                 }
                 MenuItem {
-                    text: "Download audio"
+                    text: qsTr("Download audio")
                     onClicked: {
                         var vid = model.id, t = model.title
-                        Remorse.popupAction(page, "Downloading audio",
+                        Remorse.popupAction(page, qsTr("Downloading audio"),
                             function() { app.backend.download(vid, t, "audio") })
                     }
                 }
                 MenuItem {
-                    text: "Download video"
+                    text: qsTr("Download video")
                     onClicked: {
                         var vid = model.id, t = model.title
-                        Remorse.popupAction(page, "Downloading video",
+                        Remorse.popupAction(page, qsTr("Downloading video"),
                             function() { app.backend.download(vid, t, "video") })
                     }
                 }
                 MenuItem {
                     visible: page.playlistKind === "local"
-                    text: "Remove from playlist"
+                    text: qsTr("Remove from playlist")
                     onClicked: {
                         var vid = model.id
-                        Remorse.popupAction(page, "Removing", function() {
+                        Remorse.popupAction(page, qsTr("Removing"), function() {
                             app.backend.removeFromPlaylist(page.playlistId, vid,
                                 function() { page.load() })
                         })
@@ -222,9 +222,9 @@ Page {
 
         ViewPlaceholder {
             enabled: !page.loading && itemsModel.count === 0
-            text: "Empty playlist"
+            text: qsTr("Empty playlist")
             hintText: page.playlistKind === "local"
-                      ? "Long-press a video anywhere → Add to playlist" : ""
+                      ? qsTr("Long-press a video anywhere → Add to playlist") : ""
         }
         VerticalScrollDecorator { }
     }

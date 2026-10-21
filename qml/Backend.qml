@@ -134,7 +134,7 @@ Item {
             // matches its own video — a slow/abandoned resolve for another video (or an info-only
             // page still mid-fetch) must never grab the shared pipeline or poison the reattach cache. (M8)
             if (res && res.ok) backend.resolved(videoId, res.info)
-            else backend.resolveError(videoId, res ? res.error : "resolve failed")
+            else backend.resolveError(videoId, res ? res.error : qsTr("resolve failed"))
         })
     }
 
@@ -686,7 +686,7 @@ Item {
                 backend.ready = res.version.length > 0
             }
             backend.updateFinished(!!(res && res.ok),
-                res ? (res.output || res.error || "") : "update failed")
+                res ? (res.output || res.error || "") : qsTr("update failed"))
         })
     }
 
@@ -731,7 +731,7 @@ Item {
         if (backend.fastResolveInstalling) return
         backend.fastResolveInstalling = true
         backend.fastResolvePct = 0
-        backend.fastResolveStatusMsg = "Downloading the importable yt-dlp…"
+        backend.fastResolveStatusMsg = qsTr("Downloading the importable yt-dlp…")
         py.call("youfish.install_ytdlp_zipapp", [], function() {})
     }
 
@@ -768,7 +768,7 @@ Item {
     function installPotProvider() {
         if (backend.potInstalling) return
         backend.potInstalling = true
-        backend.potStatusMsg = "Starting…"
+        backend.potStatusMsg = qsTr("Starting…")
         py.call("youfish.install_pot_provider", [], function() {})
     }
     // Resolve the latest provider release from GitHub + (re)install it. User-initiated, so the
@@ -776,7 +776,7 @@ Item {
     function updatePotProvider() {
         if (backend.potInstalling) return
         backend.potInstalling = true
-        backend.potStatusMsg = "Checking for the latest provider…"
+        backend.potStatusMsg = qsTr("Checking for the latest provider…")
         py.call("youfish.update_pot_provider", [], function() {})
     }
     function setPotEnabled(on) {

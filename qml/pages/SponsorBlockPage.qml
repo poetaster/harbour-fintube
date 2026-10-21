@@ -18,22 +18,22 @@ Page {
     // The skippable categories SponsorBlock exposes (matches _SB_CATEGORIES in youfish.py), in the
     // order shown. name = the row label, desc = what the segment type covers.
     property var categories: [
-        { key: "sponsor",        name: "Sponsor",
-          desc: "Paid promotions, paid referrals, and direct advertisements." },
-        { key: "selfpromo",      name: "Self-promotion",
-          desc: "Unpaid/self promotion: merch, donations, or plugging other creators." },
-        { key: "interaction",    name: "Interaction reminder",
-          desc: "Reminders to like, subscribe, or follow." },
-        { key: "intro",          name: "Intro / intermission",
-          desc: "Intro animations or pauses with no real content." },
-        { key: "outro",          name: "Endcards / credits",
-          desc: "Endcards and credits at the end of the video." },
-        { key: "preview",        name: "Preview / recap",
-          desc: "A recap of earlier episodes or a preview of upcoming content." },
-        { key: "filler",         name: "Filler tangent",
-          desc: "Tangential scenes not needed to follow the video." },
-        { key: "music_offtopic", name: "Non-music section",
-          desc: "Non-music portions of a music video." }
+        { key: "sponsor",        name: qsTr("Sponsor"),
+          desc: qsTr("Paid promotions, paid referrals, and direct advertisements.") },
+        { key: "selfpromo",      name: qsTr("Self-promotion"),
+          desc: qsTr("Unpaid/self promotion: merch, donations, or plugging other creators.") },
+        { key: "interaction",    name: qsTr("Interaction reminder"),
+          desc: qsTr("Reminders to like, subscribe, or follow.") },
+        { key: "intro",          name: qsTr("Intro / intermission"),
+          desc: qsTr("Intro animations or pauses with no real content.") },
+        { key: "outro",          name: qsTr("Endcards / credits"),
+          desc: qsTr("Endcards and credits at the end of the video.") },
+        { key: "preview",        name: qsTr("Preview / recap"),
+          desc: qsTr("A recap of earlier episodes or a preview of upcoming content.") },
+        { key: "filler",         name: qsTr("Filler tangent"),
+          desc: qsTr("Tangential scenes not needed to follow the video.") },
+        { key: "music_offtopic", name: qsTr("Non-music section"),
+          desc: qsTr("Non-music portions of a music video.") }
     ]
 
     SilicaFlickable {
@@ -45,12 +45,12 @@ Page {
             width: parent.width
             spacing: Theme.paddingMedium
 
-            PageHeader { title: "SponsorBlock" }
+            PageHeader { title: qsTr("SponsorBlock") }
 
             TextSwitch {
-                text: "Enable SponsorBlock"
-                description: "Skip community-marked segments. Fetching them sends the video ID to "
-                             + "sponsor.ajay.app; nothing else is shared."
+                text: qsTr("Enable SponsorBlock")
+                description: qsTr("Skip community-marked segments. Fetching them sends the video ID to "
+                             + "sponsor.ajay.app; nothing else is shared.")
                 automaticCheck: false
                 checked: app.backend.sponsorBlock
                 onClicked: app.backend.setSponsorBlock(!app.backend.sponsorBlock)
@@ -69,11 +69,11 @@ Page {
                     wrapMode: Text.Wrap
                     color: Theme.secondaryColor
                     font.pixelSize: Theme.fontSizeExtraSmall
-                    text: "Auto-skip jumps past a segment silently. Show skip button leaves a "
-                          + "tap-to-skip button over the video while the segment plays, so you decide."
+                    text: qsTr("Auto-skip jumps past a segment silently. Show skip button leaves a "
+                          + "tap-to-skip button over the video while the segment plays, so you decide.")
                 }
 
-                SectionHeader { text: "Categories" }
+                SectionHeader { text: qsTr("Categories") }
 
                 Repeater {
                     model: page.categories
@@ -87,9 +87,9 @@ Page {
                         currentIndex: page.actionToIndex(
                             app.backend.sbActions ? app.backend.sbActions[cat] : "off")
                         menu: ContextMenu {
-                            MenuItem { text: "Off" }
-                            MenuItem { text: "Auto-skip" }
-                            MenuItem { text: "Show skip button" }
+                            MenuItem { text: qsTr("Off") }
+                            MenuItem { text: qsTr("Auto-skip") }
+                            MenuItem { text: qsTr("Show skip button") }
                         }
                         onCurrentIndexChanged: {
                             if (!catCombo.ready) return

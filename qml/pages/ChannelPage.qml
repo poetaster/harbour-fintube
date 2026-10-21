@@ -85,7 +85,7 @@ Page {
             page.loading = false
             if (!res || !res.ok) {
                 if (!hadRss) {
-                    var err = (res && res.error) ? res.error : "channel failed"
+                    var err = (res && res.error) ? res.error : qsTr("channel failed")
                     if (/videos tab/i.test(err)) {
                         pageStack.replace(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
                             { channelRef: page.channelRef, channelName: page.channelName })
@@ -169,7 +169,7 @@ Page {
 
         PullDownMenu {
             MenuItem {
-                text: "Playlists"
+                text: qsTr("Playlists")
                 onClicked: pageStack.push(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
                     { channelRef: page.channelRef, channelName: page.channelName })
             }
@@ -197,7 +197,7 @@ Page {
             width: listView.width
             spacing: Theme.paddingLarge
 
-            PageHeader { title: "Channel" }
+            PageHeader { title: qsTr("Channel") }
 
             // Row 1: profile picture + channel name together.
             Item {
@@ -249,11 +249,11 @@ Page {
                     text: {
                         var parts = []
                         if (page.channelSubs > 0)
-                            parts.push(page.fmtCount(page.channelSubs) + " subscribers")
+                            parts.push(qsTr("%1 subscribers").arg(page.fmtCount(page.channelSubs)))
                         // Only trust a count above the fetch window (a real metadata total,
                         // not the sliced page size).
                         if (page.videoCount > page.pageSize)
-                            parts.push(page.fmtCount(page.videoCount) + " videos")
+                            parts.push(qsTr("%1 videos").arg(page.fmtCount(page.videoCount)))
                         return parts.join("  ·  ")
                     }
                     wrapMode: Text.Wrap
@@ -264,7 +264,7 @@ Page {
                 Button {
                     anchors.horizontalCenter: parent.horizontalCenter
                     visible: page.channelId.length > 0
-                    text: page.subscribed ? "Subscribed" : "Subscribe"
+                    text: page.subscribed ? qsTr("Subscribed") : qsTr("Subscribe")
                     onClicked: app.backend.toggleSubscription(
                         page.channelId, page.channelName, page.channelUrl, page.channelThumb)
                 }
@@ -295,37 +295,37 @@ Page {
             menu: ContextMenu {
                 MenuItem {
                     text: (app.backend.watchMap && app.backend.watchMap[model.id]
-                           && app.backend.watchMap[model.id].w) ? "Mark as unwatched" : "Mark as watched"
+                           && app.backend.watchMap[model.id].w) ? qsTr("Mark as unwatched") : qsTr("Mark as watched")
                     onClicked: {
                         var e = app.backend.watchMap ? app.backend.watchMap[model.id] : undefined
                         app.backend.setWatched(model.id, !(e && e.w), model.title, model.uploader || "")
                     }
                 }
                 MenuItem {
-                    text: "Video details"
+                    text: qsTr("Video details")
                     onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                         { videoId: model.id, title: model.title, infoOnly: true,
                           infoThumbnail: model.thumbnail || "" })
                 }
                 MenuItem {
-                    text: "Add to playlist"
+                    text: qsTr("Add to playlist")
                     onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
                         { video: { id: model.id, title: model.title, uploader: model.uploader || "",
                                    duration: model.duration || 0, thumbnail: model.thumbnail || "" } })
                 }
                 MenuItem {
-                    text: "Download audio"
+                    text: qsTr("Download audio")
                     onClicked: {
                         var vid = model.id, t = model.title
-                        Remorse.popupAction(page, "Downloading audio",
+                        Remorse.popupAction(page, qsTr("Downloading audio"),
                             function() { app.backend.download(vid, t, "audio") })
                     }
                 }
                 MenuItem {
-                    text: "Download video"
+                    text: qsTr("Download video")
                     onClicked: {
                         var vid = model.id, t = model.title
-                        Remorse.popupAction(page, "Downloading video",
+                        Remorse.popupAction(page, qsTr("Downloading video"),
                             function() { app.backend.download(vid, t, "video") })
                     }
                 }
@@ -389,7 +389,7 @@ Page {
                     visible: text.length > 0
                     text: {
                         var parts = []
-                        if (model.views > 0) parts.push(page.fmtCount(model.views) + " views")
+                        if (model.views > 0) parts.push(qsTr("%1 views").arg(page.fmtCount(model.views)))
                         if (model.posted) parts.push(model.posted)
                         return parts.join("  ·  ")
                     }
@@ -405,7 +405,7 @@ Page {
 
         ViewPlaceholder {
             enabled: !page.loading && videosModel.count === 0 && page.errorText.length === 0
-            text: "No videos"
+            text: qsTr("No videos")
         }
 
         VerticalScrollDecorator { }

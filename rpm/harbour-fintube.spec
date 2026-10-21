@@ -26,6 +26,8 @@ BuildRequires:  pkgconfig(gstreamer-video-1.0)
 BuildRequires:  pkgconfig(egl)
 BuildRequires:  pkgconfig(nemo-gstreamer-interfaces-1.0)
 BuildRequires:  desktop-file-utils
+# lupdate/lrelease for the translations (CONFIG += sailfishapp_i18n).
+BuildRequires:  qt5-qttools-linguist
 
 %description
 FinTube is a native Sailfish OS client for YouTube. It uses an external yt-dlp

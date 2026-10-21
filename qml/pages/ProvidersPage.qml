@@ -33,6 +33,7 @@ Page {
     }
 
     property string ytdlpStatus: ""
+    property bool diagRunning: false
 
     Connections {
         target: app.backend
@@ -43,16 +44,17 @@ Page {
     // backend properties directly, so QML re-binds them whenever the status refreshes.
     function potStateText() {
         var b = app.backend
-        if (b.potInstalling) return b.potStatusMsg || "Setting up…"
-        if (!b.potDeno) return "Deno runtime not found. Tap Download Deno below."
-        if (!b.potInstalled) return "Provider not installed."
-        if (!b.potEnabled) return "Installed · off"
+        if (b.potInstalling) return b.potStatusMsg || qsTr("Setting up…")
+        if (!b.potDeno) return qsTr("Deno runtime not found. Tap Download Deno below.")
+        if (!b.potInstalled) return qsTr("Provider not installed.")
+        if (!b.potEnabled) return qsTr("Installed · off")
         if (b.potResponding)
-            return "Installed · working" + (b.potServerVersion ? " (v" + b.potServerVersion + ")" : "")
+            return b.potServerVersion ? qsTr("Installed · working (v%1)").arg(b.potServerVersion)
+                                      : qsTr("Installed · working")
         // A real failure sets potLastError (shown in full just below) → say so and colour it red.
         // Otherwise the server is simply still coming up: a calm "starting…", not an alarming error.
-        if (b.potLastError) return "Installed · on — not working (see below)"
-        return "Installed · on — starting…"
+        if (b.potLastError) return qsTr("Installed · on — not working (see below)")
+        return qsTr("Installed · on — starting…")
     }
     function potStateColor() {
         var b = app.backend
@@ -72,7 +74,7 @@ Page {
             width: parent.width
             spacing: Theme.paddingMedium
 
-            PageHeader { title: "Providers" }
+            PageHeader { title: qsTr("Providers") }
 
             // Setup first: without yt-dlp nothing plays, so it leads the panel.
             SectionHeader { text: "yt-dlp" }
@@ -82,11 +84,11 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
                 text: app.backend.installing
-                      ? ("Downloading yt-dlp… " + Math.round(app.backend.installPct) + "%")
+                      ? qsTr("Downloading yt-dlp… %1%").arg(Math.round(app.backend.installPct))
                       : (app.backend.ready
-                         ? ("Installed — version " + app.backend.ytdlpVersion)
-                         : "Not found. Tap Download to fetch a self-contained copy into the "
-                           + "app's own folder (kept independent of any system yt-dlp).")
+                         ? qsTr("Installed — version %1").arg(app.backend.ytdlpVersion)
+                         : qsTr("Not found. Tap Download to fetch a self-contained copy into the "
+                              + "app's own folder (kept independent of any system yt-dlp)."))
                 color: app.backend.ready ? Theme.secondaryHighlightColor : Theme.errorColor
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -111,12 +113,12 @@ Page {
                 Button {
                     text: app.backend.installing
                           ? (Math.round(app.backend.installPct) + "%")
-                          : (!app.backend.ready ? "Download"
-                             : (app.backend.updating ? "Updating…" : "Update"))
+                          : (!app.backend.ready ? qsTr("Download")
+                             : (app.backend.updating ? qsTr("Updating…") : qsTr("Update")))
                     enabled: !app.backend.installing && !app.backend.updating
                     onClicked: {
                         if (!app.backend.ready) {
-                            page.ytdlpStatus = "Downloading yt-dlp…"
+                            page.ytdlpStatus = qsTr("Downloading yt-dlp…")
                             app.backend.installYtdlp()
                         } else {
                             // Keep the in-process zipapp in lockstep with the binary so a YouTube
@@ -124,7 +126,7 @@ Page {
                             // On a capable device this also (re)fetches a missing copy — Update is
                             // the self-heal lever, since fast resolve has no row of its own.
                             page.ytdlpStatus = app.backend.fastResolvePythonOk
-                                ? "Updating yt-dlp + fast-resolve copy…" : "Updating yt-dlp…"
+                                ? qsTr("Updating yt-dlp + fast-resolve copy…") : qsTr("Updating yt-dlp…")
                             app.backend.updateYtdlp()
                             if (app.backend.fastResolvePythonOk)
                                 app.backend.installFastResolve()
@@ -132,7 +134,7 @@ Page {
                     }
                 }
                 Button {
-                    text: "Recheck"
+                    text: qsTr("Recheck")
                     enabled: !app.backend.updating && !app.backend.installing
                     onClicked: app.backend.recheck()
                 }
@@ -143,18 +145,18 @@ Page {
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: app.backend.ready && !app.backend.installing
                 enabled: !app.backend.updating
-                text: "Reinstall"
+                text: qsTr("Reinstall")
                 onClicked: {
-                    page.ytdlpStatus = "Reinstalling yt-dlp…"
+                    page.ytdlpStatus = qsTr("Reinstalling yt-dlp…")
                     app.backend.installYtdlp()
                 }
             }
 
             TextSwitch {
                 visible: app.backend.ready
-                text: "Use nightly builds"
-                description: "Nightly yt-dlp ships fixes for YouTube breakages days sooner, at the "
-                             + "cost of less testing. Applies on the next Update."
+                text: qsTr("Use nightly builds")
+                description: qsTr("Nightly yt-dlp ships fixes for YouTube breakages days sooner, at the "
+                                  + "cost of less testing. Applies on the next Update.")
                 automaticCheck: false
                 checked: app.backend.ytdlpChannel === "nightly"
                 onClicked: app.backend.setSetting("ytdlp_channel",
@@ -164,19 +166,19 @@ Page {
             ComboBox {
                 id: clientCombo
                 width: parent.width
-                label: "Player client"
-                description: "How yt-dlp identifies to YouTube. If a video won't play, try "
-                             + "TV or iOS — several clients stream without a PO token."
+                label: qsTr("Player client")
+                description: qsTr("How yt-dlp identifies to YouTube. If a video won't play, try "
+                                  + "TV or iOS — several clients stream without a PO token.")
                 // Index ↔ value map; kept in sync with the menu below.
                 property var vals: ["", "tv", "ios", "android_vr", "mweb", "web"]
                 currentIndex: Math.max(0, vals.indexOf(app.backend.playerClient))
                 menu: ContextMenu {
-                    MenuItem { text: "Auto (yt-dlp default)" }
+                    MenuItem { text: qsTr("Auto (yt-dlp default)") }
                     MenuItem { text: "TV" }
                     MenuItem { text: "iOS" }
                     MenuItem { text: "Android VR" }
-                    MenuItem { text: "Mobile web" }
-                    MenuItem { text: "Web" }
+                    MenuItem { text: qsTr("Mobile web") }
+                    MenuItem { text: qsTr("Web") }
                 }
                 onCurrentIndexChanged: {
                     var v = vals[currentIndex]
@@ -196,19 +198,19 @@ Page {
                 wrapMode: Text.Wrap
                 textFormat: Text.PlainText
                 text: !app.backend.fastResolvePythonOk
-                    ? ("Fast resolve unavailable: needs OS Python 3.10 or newer to run yt-dlp "
-                       + "in-process — this device has "
-                       + (app.backend.fastResolvePythonVersion || "an older one")
-                       + ". The self-contained binary (with its own bundled Python) is used instead.")
+                    ? qsTr("Fast resolve unavailable: needs OS Python 3.10 or newer to run yt-dlp "
+                           + "in-process — this device has %1. The self-contained binary "
+                           + "(with its own bundled Python) is used instead.")
+                        .arg(app.backend.fastResolvePythonVersion || qsTr("an older one"))
                     : app.backend.fastResolveInstalling
-                    ? ("Fast resolve: downloading the importable yt-dlp… "
-                       + Math.round(app.backend.fastResolvePct) + "%")
+                    ? qsTr("Fast resolve: downloading the importable yt-dlp… %1%")
+                        .arg(Math.round(app.backend.fastResolvePct))
                     : (app.backend.fastResolveInstalled
-                       ? ("Fast resolve active — yt-dlp " + app.backend.fastResolveVersion
-                          + " runs in-process (no per-resolve respawn). Any error falls back to "
-                          + "the binary above.")
-                       : "Fast resolve: the importable copy isn't here yet — it downloads "
-                         + "automatically, or rides along with the next Update.")
+                       ? qsTr("Fast resolve active — yt-dlp %1 runs in-process (no per-resolve respawn). "
+                              + "Any error falls back to the binary above.")
+                            .arg(app.backend.fastResolveVersion)
+                       : qsTr("Fast resolve: the importable copy isn't here yet — it downloads "
+                              + "automatically, or rides along with the next Update."))
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
@@ -236,9 +238,9 @@ Page {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "Fast-resolve copy (" + app.backend.fastResolveVersion
-                      + ") is out of step with the yt-dlp binary (" + app.backend.ytdlpVersion
-                      + ") — tap Update above to refresh both."
+                text: qsTr("Fast-resolve copy (%1) is out of step with the yt-dlp binary (%2) "
+                           + "— tap Update above to refresh both.")
+                      .arg(app.backend.fastResolveVersion).arg(app.backend.ytdlpVersion)
                 color: Theme.secondaryHighlightColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
@@ -250,13 +252,13 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
                 text: app.backend.ffmpegInstalling
-                      ? ("Downloading ffmpeg… " + Math.round(app.backend.ffmpegPct) + "%")
+                      ? qsTr("Downloading ffmpeg… %1%").arg(Math.round(app.backend.ffmpegPct))
                       : (app.backend.ffmpegReady
-                         ? ("Installed — " + app.backend.ffmpegVersion)
-                         : "Needed for video downloads — YouTube removed the combined formats, "
-                           + "so video is always fetched as separate tracks and merged by "
-                           + "ffmpeg. Audio downloads work without it. Tap Download to fetch a "
-                           + "static build into the app's folder.")
+                         ? qsTr("Installed — %1").arg(app.backend.ffmpegVersion)
+                         : qsTr("Needed for video downloads — YouTube removed the combined formats, "
+                              + "so video is always fetched as separate tracks and merged by "
+                              + "ffmpeg. Audio downloads work without it. Tap Download to fetch a "
+                              + "static build into the app's folder."))
                 color: app.backend.ffmpegReady ? Theme.secondaryHighlightColor : Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeSmall
             }
@@ -278,12 +280,12 @@ Page {
                 Button {
                     text: app.backend.ffmpegInstalling
                           ? (Math.round(app.backend.ffmpegPct) + "%")
-                          : (app.backend.ffmpegReady ? "Update" : "Download")
+                          : (app.backend.ffmpegReady ? qsTr("Update") : qsTr("Download"))
                     enabled: !app.backend.ffmpegInstalling
                     onClicked: app.backend.installFfmpeg()
                 }
                 Button {
-                    text: "Recheck"
+                    text: qsTr("Recheck")
                     enabled: !app.backend.ffmpegInstalling
                     onClicked: app.backend.recheckFfmpeg()
                 }
@@ -294,23 +296,23 @@ Page {
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible: app.backend.ffmpegNeedsConfirm && !app.backend.ffmpegInstalling
-                text: "Install unverified build"
+                text: qsTr("Install unverified build")
                 onClicked: app.backend.installFfmpeg(true)
             }
 
-            SectionHeader { text: "PO token provider" }
+            SectionHeader { text: qsTr("PO token provider") }
 
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "YouTube now demands a fresh proof-of-origin token per video. This sets up "
-                      + "the bgutil provider (v" + (app.backend.potTag || "…") + "): a small "
-                      + "Deno helper that mints one automatically for each video, so you get full "
-                      + "quality instead of 403s.\n\n"
-                      + "It runs sandboxed by Deno: network only, no file writes, no subprocesses, "
-                      + "no native code, and it can't read anything outside its own folder. Opt-in — "
-                      + "nothing is downloaded unless you tap Set up."
+                text: qsTr("YouTube now demands a fresh proof-of-origin token per video. This sets up "
+                           + "the bgutil provider (v%1): a small "
+                           + "Deno helper that mints one automatically for each video, so you get full "
+                           + "quality instead of 403s.\n\n"
+                           + "It runs sandboxed by Deno: network only, no file writes, no subprocesses, "
+                           + "no native code, and it can't read anything outside its own folder. Opt-in — "
+                           + "nothing is downloaded unless you tap Set up.").arg(app.backend.potTag || "…")
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
@@ -357,8 +359,8 @@ Page {
                          || app.backend.potDenoManaged
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.backend.denoInstalling
-                      ? ("Downloading Deno… " + Math.round(app.backend.denoPct) + "%")
-                      : (app.backend.potDeno ? "Update Deno" : "Download Deno")
+                      ? qsTr("Downloading Deno… %1%").arg(Math.round(app.backend.denoPct))
+                      : (app.backend.potDeno ? qsTr("Update Deno") : qsTr("Download Deno"))
                 enabled: !app.backend.denoInstalling
                 onClicked: app.backend.installDeno()
             }
@@ -381,15 +383,15 @@ Page {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "Deno found: " + app.backend.potDenoPath
+                text: qsTr("Deno found: %1").arg(app.backend.potDenoPath)
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
             TextSwitch {
                 visible: app.backend.potInstalled
-                text: "Use PO token provider"
-                description: "Fetch a per-video token so age/robot-gated videos return full quality."
+                text: qsTr("Use PO token provider")
+                description: qsTr("Fetch a per-video token so age/robot-gated videos return full quality.")
                 automaticCheck: false
                 checked: app.backend.potEnabled
                 onClicked: app.backend.setPotEnabled(!app.backend.potEnabled)
@@ -398,8 +400,8 @@ Page {
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.backend.potInstalling
-                      ? "Setting up…"
-                      : (app.backend.potInstalled ? "Reinstall provider" : "Set up provider")
+                      ? qsTr("Setting up…")
+                      : (app.backend.potInstalled ? qsTr("Reinstall provider") : qsTr("Set up provider"))
                 enabled: !app.backend.potInstalling && app.backend.potDeno
                 onClicked: app.backend.installPotProvider()
             }
@@ -407,22 +409,22 @@ Page {
             Button {
                 visible: app.backend.potInstalled
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Update to latest"
+                text: qsTr("Update to latest")
                 enabled: !app.backend.potInstalling && app.backend.potDeno
                 onClicked: app.backend.updatePotProvider()
             }
 
-            SectionHeader { text: "YouTube account" }
+            SectionHeader { text: qsTr("YouTube account") }
 
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "Sign in to YouTube in the Sailfish Browser, then import the session here. It "
+                text: qsTr("Sign in to YouTube in the Sailfish Browser, then import the session here. It "
                       + "unlocks age-restricted, members-only and premium content, eases the robot "
                       + "check, and lets you import your subscriptions.\n\n"
                       + "Cookies stay on this device (owner-only) and are never uploaded. The session "
-                      + "eventually expires — just Re-import when it does."
+                      + "eventually expires — just Re-import when it does.")
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
@@ -432,21 +434,21 @@ Page {
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
                 text: app.backend.youtubeLoggedIn
-                      ? ("Signed in — " + app.backend.youtubeCookieCount + " cookies imported.")
-                      : "Not signed in."
+                      ? qsTr("Signed in — %1 cookies imported.").arg(app.backend.youtubeCookieCount)
+                      : qsTr("Not signed in.")
                 color: app.backend.youtubeLoggedIn ? Theme.highlightColor : Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeSmall
             }
 
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: app.backend.youtubeLoggedIn ? "Re-import from browser"
-                                                  : "Import login from browser"
+                text: app.backend.youtubeLoggedIn ? qsTr("Re-import from browser")
+                                                  : qsTr("Import login from browser")
                 onClicked: app.backend.importBrowserLogin(function(res) {
                     if (res && res.ok)
-                        app.showToast("Signed in (" + (res.count || 0) + " cookies)")
+                        app.showToast(qsTr("Signed in (%1 cookies)").arg(res.count || 0))
                     else
-                        app.showToast((res && res.error) ? res.error : "Import failed")
+                        app.showToast((res && res.error) ? res.error : qsTr("Import failed"))
                 })
             }
 
@@ -455,7 +457,7 @@ Page {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "Import your subscriptions and playlists from More → Import from YouTube."
+                text: qsTr("Import your subscriptions and playlists from More → Import from YouTube.")
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
@@ -466,40 +468,42 @@ Page {
             // here (a yt-dlp limitation). Only worth touching with more than one account signed in.
             ValueButton {
                 visible: app.backend.youtubeLoggedIn
-                label: "Account"
-                value: app.backend.ytSelectedName || "Default account"
-                description: "Which account/channel (incl. brand accounts) to import from. Re-run "
-                            + "the import after changing it."
+                label: qsTr("Account")
+                value: app.backend.ytSelectedName || qsTr("Default account")
+                description: qsTr("Which account/channel (incl. brand accounts) to import from. Re-run "
+                                 + "the import after changing it.")
                 onClicked: pageStack.push(Qt.resolvedUrl("YtAccountsPage.qml"))
             }
 
             Button {
                 visible: app.backend.youtubeLoggedIn
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Log out"
-                onClicked: app.backend.youtubeLogout(function() { app.showToast("Logged out") })
+                text: qsTr("Log out")
+                onClicked: app.backend.youtubeLogout(function() { app.showToast(qsTr("Logged out")) })
             }
 
-            SectionHeader { text: "Diagnostics" }
+            SectionHeader { text: qsTr("Diagnostics") }
 
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: "A full report of what the app can see: which binaries were found, whether the "
-                      + "token server is alive and answering, and the tail of its log. Copy it if you "
-                      + "need help getting the provider working."
+                text: qsTr("A full report of what the app can see: which binaries were found, whether the "
+                           + "token server is alive and answering, and the tail of its log. Copy it if you "
+                           + "need help getting the provider working.")
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeExtraSmall
             }
 
             Button {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Run diagnostics"
+                text: qsTr("Run diagnostics")
                 onClicked: {
-                    diagArea.text = "Running…"
+                    page.diagRunning = true
+                    diagArea.text = qsTr("Running…")
                     app.backend.potDiagnostics(function(res) {
-                        diagArea.text = (res && res.report) ? res.report : "No report."
+                        page.diagRunning = false
+                        diagArea.text = (res && res.report) ? res.report : qsTr("No report.")
                     })
                 }
             }
@@ -509,16 +513,16 @@ Page {
                 visible: text.length > 0
                 width: parent.width
                 readOnly: true
-                label: "Provider report"
+                label: qsTr("Provider report")
                 font.pixelSize: Theme.fontSizeExtraSmall
                 font.family: "monospace"
                 text: ""
             }
 
             Button {
-                visible: diagArea.text.length > 0 && diagArea.text !== "Running…"
+                visible: diagArea.text.length > 0 && !page.diagRunning
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "Copy report"
+                text: qsTr("Copy report")
                 onClicked: Clipboard.text = diagArea.text
             }
         }

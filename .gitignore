@@ -10,6 +10,7 @@ qrc_*.cpp
 ui_*.h
 documentation.list
 installroot/
+translations/*.qm
 
 # qmake / Qt Creator local state
 *.pro.user*

@@ -13,7 +13,7 @@ Page {
         anchors.fill: parent
         model: app.backend.downloads
 
-        header: PageHeader { title: "Downloads" }
+        header: PageHeader { title: qsTr("Downloads") }
 
         delegate: ListItem {
             id: item
@@ -21,7 +21,7 @@ Page {
 
             menu: ContextMenu {
                 MenuItem {
-                    text: "Delete"
+                    text: qsTr("Delete")
                     onClicked: app.backend.deleteDownload(modelData.id, modelData.kind)
                 }
             }
@@ -49,7 +49,7 @@ Page {
                 }
                 Label {
                     width: parent.width
-                    text: modelData.kind === "audio" ? "Audio" : "Video"
+                    text: modelData.kind === "audio" ? qsTr("Audio") : qsTr("Video")
                     font.pixelSize: Theme.fontSizeExtraSmall
                     color: Theme.secondaryColor
                 }
@@ -61,8 +61,8 @@ Page {
 
         ViewPlaceholder {
             enabled: app.backend.downloads.length === 0
-            text: "No downloads"
-            hintText: "Open a video, pull down, and pick Download"
+            text: qsTr("No downloads")
+            hintText: qsTr("Open a video, pull down, and pick Download")
         }
         VerticalScrollDecorator { }
     }

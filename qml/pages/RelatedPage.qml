@@ -40,7 +40,7 @@ Page {
             page.loading = false
             relModel.clear()
             if (!res || !res.ok) {
-                page.errorText = (res && res.error) ? res.error : "no recommendations"
+                page.errorText = (res && res.error) ? res.error : qsTr("no recommendations")
                 return
             }
             var items = res.items || []
@@ -56,13 +56,13 @@ Page {
         model: relModel
 
         header: PageHeader {
-            title: "Related"
+            title: qsTr("Related")
             description: page.seedTitle
         }
 
         PullDownMenu {
             MenuItem {
-                text: "Reload"
+                text: qsTr("Reload")
                 onClicked: page.load()
             }
         }
@@ -82,32 +82,32 @@ Page {
             menu: ContextMenu {
                 MenuItem {
                     text: (app.backend.watchMap && app.backend.watchMap[item.vidId]
-                           && app.backend.watchMap[item.vidId].w) ? "Mark as unwatched" : "Mark as watched"
+                           && app.backend.watchMap[item.vidId].w) ? qsTr("Mark as unwatched") : qsTr("Mark as watched")
                     onClicked: {
                         var e = app.backend.watchMap ? app.backend.watchMap[item.vidId] : undefined
                         app.backend.setWatched(item.vidId, !(e && e.w), item.vidTitle, item.vidUploader)
                     }
                 }
                 MenuItem {
-                    text: "Video details"
+                    text: qsTr("Video details")
                     onClicked: pageStack.push(Qt.resolvedUrl("VideoPage.qml"),
                         { videoId: item.vidId, title: item.vidTitle, infoOnly: true,
                           infoThumbnail: item.vidThumb })
                 }
                 MenuItem {
-                    text: "Add to playlist"
+                    text: qsTr("Add to playlist")
                     onClicked: pageStack.push(Qt.resolvedUrl("AddToPlaylistPage.qml"),
                         { video: { id: item.vidId, title: item.vidTitle, uploader: item.vidUploader,
                                    duration: item.vidDuration, thumbnail: item.vidThumb } })
                 }
                 MenuItem {
-                    text: "Download audio"
-                    onClicked: Remorse.popupAction(page, "Downloading audio",
+                    text: qsTr("Download audio")
+                    onClicked: Remorse.popupAction(page, qsTr("Downloading audio"),
                         function() { app.backend.download(item.vidId, item.vidTitle, "audio") })
                 }
                 MenuItem {
-                    text: "Download video"
-                    onClicked: Remorse.popupAction(page, "Downloading video",
+                    text: qsTr("Download video")
+                    onClicked: Remorse.popupAction(page, qsTr("Downloading video"),
                         function() { app.backend.download(item.vidId, item.vidTitle, "video") })
                 }
             }
@@ -170,7 +170,7 @@ Page {
                     // views · age (age is often absent on mix rows — then just views)
                     text: {
                         var parts = []
-                        if (model.views > 0) parts.push(page.fmtCount(model.views) + " views")
+                        if (model.views > 0) parts.push(qsTr("%1 views").arg(page.fmtCount(model.views)))
                         if (model.posted) parts.push(model.posted)
                         return parts.join("  ·  ")
                     }
@@ -186,7 +186,7 @@ Page {
 
         ViewPlaceholder {
             enabled: !page.loading && relModel.count === 0
-            text: "Nothing related"
+            text: qsTr("Nothing related")
             hintText: page.errorText
         }
 

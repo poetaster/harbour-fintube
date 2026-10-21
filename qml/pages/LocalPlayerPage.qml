@@ -49,7 +49,7 @@ Page {
     function claimNowPlaying() {
         app.nowPlaying.stopRequested()
         app.nowPlaying.title = page.title
-        app.nowPlaying.channel = "Downloaded"
+        app.nowPlaying.channel = qsTr("Downloaded")
         app.nowPlaying.playing = page.isPlaying
         app.nowPlaying.active = true
         nowPlayingConn.target = app.nowPlaying
@@ -172,7 +172,7 @@ Page {
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
-                text: page.kind === "audio" ? "Downloaded audio" : "Downloaded video"
+                text: page.kind === "audio" ? qsTr("Downloaded audio") : qsTr("Downloaded video")
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.secondaryColor
             }

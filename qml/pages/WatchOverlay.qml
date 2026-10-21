@@ -38,7 +38,8 @@ Item {
         Label {
             id: liveLabel
             anchors.centerIn: parent
-            text: "LIVE"
+            //: Badge on a video thumbnail for a running livestream
+            text: qsTr("LIVE")
             font.pixelSize: Theme.fontSizeExtraSmall
             font.bold: true
             color: "white"
@@ -56,7 +57,8 @@ Item {
         Label {
             id: watchedLabel
             anchors.centerIn: parent
-            text: "WATCHED"
+            //: Badge on a video thumbnail for an already watched video
+            text: qsTr("WATCHED")
             font.pixelSize: Theme.fontSizeExtraSmall
             font.bold: true
             color: "white"
