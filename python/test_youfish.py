@@ -4242,5 +4242,98 @@ class RssPooled(unittest.TestCase):
         self.assertEqual(youfish._rss_get("UC_X"), self.XML)
 
 
+class Arm32Userland(unittest.TestCase):
+    """32-bit ARM: yt-dlp is the stable one-directory armv7l zip, unpacked behind a bin/yt-dlp
+    symlink and updated by downloading again; Deno and the PO-token provider are refused."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.saved = dict((n, getattr(youfish, n)) for n in (
+            "_data_dir", "_ARM32", "_YTDLP_ASSET", "ytdlp_version", "_ytdlp_latest_tag",
+            "_install_ytdlp_sync", "get_settings"))
+        youfish._data_dir = lambda: self._tmp
+        youfish._ARM32 = True
+        youfish._YTDLP_ASSET = "yt-dlp_linux_armv7l.zip"
+        os.makedirs(os.path.join(self._tmp, "bin"))
+        self.sent = []
+        self.prev_po = sys.modules.get("pyotherside")
+        sys.modules["pyotherside"] = types.SimpleNamespace(send=lambda *a: self.sent.append(a))
+
+    def tearDown(self):
+        for n, v in self.saved.items():
+            setattr(youfish, n, v)
+        if self.prev_po is not None:
+            sys.modules["pyotherside"] = self.prev_po
+        else:
+            sys.modules.pop("pyotherside", None)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _zip(self, version, extra=None):
+        import zipfile
+        path = os.path.join(self._tmp, "y.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("yt-dlp_linux_armv7l", "#!/bin/sh\necho %s\n" % version)
+            z.writestr("_internal/base_library.zip", version)
+            for name in (extra or []):
+                z.writestr(name, "x")
+        return path
+
+    def test_unpack_points_bin_ytdlp_at_the_tree(self):
+        youfish._unpack_ytdlp_dir(self._zip("2026.01.01"))
+        exe = youfish._managed_ytdlp()
+        self.assertTrue(os.path.islink(exe))
+        self.assertTrue(os.access(exe, os.X_OK))
+        self.assertEqual(os.readlink(exe), os.path.join("yt-dlp-armv7l", "yt-dlp_linux_armv7l"))
+        out = youfish.subprocess.run([exe], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(out, "2026.01.01")
+
+    def test_reinstall_swaps_and_parks_the_old_tree(self):
+        youfish._unpack_ytdlp_dir(self._zip("old"))
+        youfish._unpack_ytdlp_dir(self._zip("new"))
+        bindir = os.path.join(self._tmp, "bin")
+        with open(os.path.join(bindir, "yt-dlp-armv7l", "_internal", "base_library.zip")) as f:
+            self.assertEqual(f.read(), "new")
+        with open(os.path.join(bindir, "yt-dlp-armv7l.old", "_internal", "base_library.zip")) as f:
+            self.assertEqual(f.read(), "old")
+        self.assertFalse(os.path.exists(os.path.join(bindir, "yt-dlp-armv7l.new")))
+
+    def test_unsafe_archive_is_refused_and_leaves_the_install(self):
+        youfish._unpack_ytdlp_dir(self._zip("good"))
+        with self.assertRaises(ValueError):
+            youfish._unpack_ytdlp_dir(self._zip("evil", extra=["../../escape"]))
+        self.assertFalse(os.path.exists(os.path.join(self._tmp, "escape")))
+        out = youfish.subprocess.run([youfish._managed_ytdlp()], capture_output=True,
+                                     text=True).stdout.strip()
+        self.assertEqual(out, "good")
+
+    def test_channel_is_pinned_to_stable(self):
+        youfish.get_settings = lambda: {"ytdlp_channel": "nightly"}
+        self.assertEqual(youfish._ytdlp_channel(), "stable")
+        youfish._ARM32 = False
+        self.assertEqual(youfish._ytdlp_channel(), "nightly")
+
+    def test_update_downloads_only_when_behind(self):
+        calls = []
+        youfish._install_ytdlp_sync = lambda progress=None: (calls.append(1) or
+                                                             (True, "Installed yt-dlp 2", "2"))
+        youfish.ytdlp_version = lambda fresh=False: "1"
+        youfish._ytdlp_latest_tag = lambda: "1"
+        self.assertTrue(youfish._ytdlp_update_by_download()["ok"])
+        self.assertEqual(calls, [])                       # up to date: nothing fetched
+        youfish._ytdlp_latest_tag = lambda: ""
+        res = youfish._ytdlp_update_by_download()
+        self.assertFalse(res["ok"])                       # can't tell: don't pull 40 MB blind
+        self.assertEqual(calls, [])
+        youfish._ytdlp_latest_tag = lambda: "2"
+        res = youfish._ytdlp_update_by_download()
+        self.assertEqual((res["ok"], res["version"], calls), (True, "2", [1]))
+
+    def test_deno_and_provider_are_refused(self):
+        self.assertFalse(youfish.install_deno()["ok"])
+        self.assertFalse(youfish.install_pot_provider()["ok"])
+        self.assertEqual([e[0] for e in self.sent], ["deno_install_done", "pot_install_done"])
+        self.assertTrue(all(e[1] is False for e in self.sent))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

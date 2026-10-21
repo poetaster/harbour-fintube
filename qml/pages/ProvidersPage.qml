@@ -152,8 +152,10 @@ Page {
                 }
             }
 
+            // 32-bit ARM stays on stable: the nightly repo publishes no armv7l build (the engine
+            // pins the channel there too).
             TextSwitch {
-                visible: app.backend.ready
+                visible: app.backend.ready && !app.backend.arm32
                 text: qsTr("Use nightly builds")
                 description: qsTr("Nightly yt-dlp ships fixes for YouTube breakages days sooner, at the "
                                   + "cost of less testing. Applies on the next Update.")
@@ -306,7 +308,11 @@ Page {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
-                text: qsTr("YouTube now demands a fresh proof-of-origin token per video. This sets up "
+                text: app.backend.arm32
+                      ? qsTr("Not available on this phone: the provider runs on Deno, and Deno has no "
+                             + "32-bit ARM build. Videos play through the clients that need no token, "
+                             + "which covers most of them.")
+                      : qsTr("YouTube now demands a fresh proof-of-origin token per video. This sets up "
                            + "the bgutil provider (v%1): a small "
                            + "Deno helper that mints one automatically for each video, so you get full "
                            + "quality instead of 403s.\n\n"
@@ -320,6 +326,7 @@ Page {
             // Status line. "running" means the port is open; "working" is the stronger signal that
             // the server actually answered an HTTP probe — that's the state that unlocks full quality.
             Label {
+                visible: !app.backend.arm32
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
                 wrapMode: Text.Wrap
@@ -331,7 +338,7 @@ Page {
             // The reason it isn't working, when the app knows one (Deno missing, server crashed,
             // clone/deps failed…). Hidden when the provider is healthy.
             Label {
-                visible: app.backend.potLastError.length > 0 && !app.backend.potInstalling
+                visible: !app.backend.arm32 && app.backend.potLastError.length > 0 && !app.backend.potInstalling
                          && !(app.backend.potEnabled && app.backend.potResponding)
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2 * Theme.horizontalPageMargin
@@ -355,8 +362,8 @@ Page {
             // has no other updater (the button hid forever once any Deno existed, so a managed
             // Deno stayed at its install-day version for life). A system/user Deno stays theirs.
             Button {
-                visible: !app.backend.potDeno || app.backend.denoInstalling
-                         || app.backend.potDenoManaged
+                visible: !app.backend.arm32 && (!app.backend.potDeno || app.backend.denoInstalling
+                                                 || app.backend.potDenoManaged)
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.backend.denoInstalling
                       ? qsTr("Downloading Deno… %1%").arg(Math.round(app.backend.denoPct))
@@ -398,6 +405,7 @@ Page {
             }
 
             Button {
+                visible: !app.backend.arm32
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: app.backend.potInstalling
                       ? qsTr("Setting up…")

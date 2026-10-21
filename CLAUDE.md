@@ -239,6 +239,16 @@ render thread, everything else under the lock.
 - **A just-ended livestream (`live_status == "post_live"`) is refused** with a "still processing"
   message. Until YouTube finishes the recording, its formats are DASH segment lists that the proxy
   can't serve as one file.
+- **32-bit ARM userland (`_ARM32`)** is detected from the interpreter's pointer size, never
+  uname: armv7hl images often run on a 64-bit kernel that reports `aarch64`. There yt-dlp is
+  the stable-only `yt-dlp_linux_armv7l.zip` one-directory build, unpacked to
+  `bin/yt-dlp-armv7l/` behind a `bin/yt-dlp` symlink (`_unpack_ytdlp_dir`); it can't self-update,
+  so `ytdlp_update` re-downloads when the latest tag differs (`_ytdlp_update_by_download`).
+  `_ytdlp_channel()` pins stable (keeps the zipapp in lockstep). Deno/PO token are refused
+  (`_ARM32_NO_DENO`; `pot_status().arm32` hides the setup in the UI); ffmpeg is the pinned armhf
+  JVS build. Verified only under the SDK armv7hl target (`sfdk engine exec sb2 -t
+  SailfishOS-5.1.0.11-armv7hl.default python3 …`), never on hardware. CI builds aarch64 + armv7hl;
+  qreal is float on armv7hl, so write `qreal(1.0)` in qFuzzyCompare.
 - **Every user-visible QML string goes through `qsTr()`** (`CONFIG += sailfishapp_i18n`; the build's
   lupdate refreshes `translations/*.ts`). Use `.arg()` for values, never `+` concatenation; `%n` for
   counts (`qsTr("%n video(s)", "", n)`) — `translations/harbour-fintube-en.ts` supplies the English

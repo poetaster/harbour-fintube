@@ -27,6 +27,15 @@ jobs:
         release: ${{ env.RELEASE }}
         arch: aarch64
 
+    # 32-bit ARM phones (armv7hl images). The engine picks the matching yt-dlp/ffmpeg builds at
+    # runtime and switches off the PO-token provider there (no 32-bit Deno).
+    - name: Build armv7hl
+      id: build_armv7hl
+      uses: coderus/github-sfos-build@sfos5
+      with:
+        release: ${{ env.RELEASE }}
+        arch: armv7hl
+
     - name: Extract Version Name
       id: extract_name
       uses: actions/github-script@v4

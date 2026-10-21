@@ -992,7 +992,7 @@ gboolean VideoPlayer::onBusMessage(GstBus *, GstMessage *msg, gpointer self)
                     player->m_seekRetryMs = landed;
                     player->m_seekRetryTimer->start();
                 }
-            } else if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, 1.0)) {
+            } else if (!player->m_rateEngaged && !qFuzzyCompare(player->m_rate, qreal(1.0))) {
                 player->m_rateEngaged = true;
                 gint64 pos = 0;
                 if (!gst_element_query_position(player->m_pipeline, GST_FORMAT_TIME, &pos) || pos < 0)

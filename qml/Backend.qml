@@ -78,6 +78,7 @@ Item {
     property string potLastError: ""     // why the provider last failed to start / respond (diagnostics)
     property string potDenoPath: ""      // where Deno was found ("" = not found)
     property bool potDenoManaged: false  // the found Deno is the app-managed copy (we update it)
+    property bool arm32: false           // 32-bit ARM userland: no Deno/PO-token provider, stable yt-dlp only
 
     // Download folder — where completed downloads are written. downloadDir is the configured value
     // ("" = the app's own folder); downloadDirEffective is the absolute path actually in use.
@@ -744,6 +745,7 @@ Item {
             backend.potDeno = !!s.deno
             backend.potDenoPath = s.deno_path || ""
             backend.potDenoManaged = !!s.deno_managed
+            backend.arm32 = !!s.arm32
             backend.potRunning = !!s.running
             backend.potResponding = !!s.responding
             backend.potServerVersion = s.server_version || ""

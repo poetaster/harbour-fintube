@@ -58,6 +58,12 @@ the Providers page, not the app:
   updated with one tap.
 - **ffmpeg** *(optional)* — video downloads only; audio downloads never need it.
 
+**32-bit phones (armv7hl):** releases include an armv7hl RPM. The app fetches the 32-bit
+yt-dlp and ffmpeg builds there. yt-dlp stays on the stable channel (no nightly build exists for
+32-bit ARM), and the PO-token provider is unavailable because Deno has no 32-bit build;
+videos play through the clients that need no token. This build is tested in the SDK's
+armv7hl emulator, not on a real 32-bit phone — reports welcome.
+
 ## Build
 
 With the Sailfish SDK (`sfdk`) configured. Shadow build (recommended — RPM lands in

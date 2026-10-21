@@ -35,6 +35,7 @@ import signal
 import socket
 import socketserver
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1979,6 +1980,8 @@ def ytdlp_update():
     path = _ytdlp_path()
     if not path:
         return {"ok": False, "error": "yt-dlp not found", "version": ""}
+    if _ARM32 and path == _managed_ytdlp():
+        return _ytdlp_update_by_download()
     channel = _ytdlp_channel()
     try:
         # --update-to <channel>@latest is unambiguous whichever channel the binary is on now;
@@ -1995,10 +1998,19 @@ def ytdlp_update():
         return {"ok": False, "error": str(ex), "version": ytdlp_version()}
 
 
-# Standalone aarch64 build (self-contained — bundles its own Python, so it doesn't depend on
-# the device's Python version). "latest" redirects to the current release asset; each release
-# also publishes SHA2-256SUMS, which we verify the download against.
-_YTDLP_ASSET = "yt-dlp_linux_aarch64"
+# A 32-bit ARM userland: the armv7hl images, which some phones run on a 64-bit kernel. Asked of
+# the interpreter, not uname, which reports the kernel ("aarch64") there; every binary we fetch
+# has to match the userland. What changes on it: yt-dlp comes as the stable one-directory armv7l
+# zip (no nightly build, no self-update), Deno has no 32-bit build at all (so no PO-token
+# provider; playback relies on the token-free clients), and ffmpeg is the armhf static build.
+_ARM32 = struct.calcsize("P") == 4
+
+# Standalone build (self-contained — bundles its own Python, so it doesn't depend on the device's
+# Python version). "latest" redirects to the current release asset; each release also publishes
+# SHA2-256SUMS, which we verify the download against. On 32-bit ARM it's a zip of a directory
+# (executable + _internal/), unpacked by _unpack_ytdlp_dir.
+_YTDLP_ASSET = "yt-dlp_linux_armv7l.zip" if _ARM32 else "yt-dlp_linux_aarch64"
+_YTDLP_DIR_NAME = "yt-dlp-armv7l"   # bin/ subdir holding the unpacked 32-bit build
 # Release bases PER UPDATE CHANNEL. The binary hops channels via its own --update-to, but every
 # direct download here (first binary install and — crucially — the importable ZIPAPP, which has
 # no self-updater) must come from the repo matching the user's channel: a nightly binary next to
@@ -2013,7 +2025,10 @@ _YTDLP_RELEASE_BASES = {
 
 
 def _ytdlp_channel():
-    """The user's yt-dlp update channel: "stable" unless explicitly "nightly"."""
+    """The user's yt-dlp update channel: "stable" unless explicitly "nightly". Always stable on
+    32-bit ARM: the nightly repo publishes no armv7l build, and the zipapp must match the binary."""
+    if _ARM32:
+        return "stable"
     return "nightly" if (get_settings().get("ytdlp_channel") == "nightly") else "stable"
 
 
@@ -2035,9 +2050,10 @@ def _https_open(url, ctx, timeout=60):
     return resp
 
 
-def _expected_sha256(ctx, asset=_YTDLP_ASSET):
-    """The published SHA-256 for `asset` (the aarch64 binary by default; the arch-independent
-    zipapp for fast resolve), from the CHANNEL repo's SHA2-256SUMS file (or None)."""
+def _expected_sha256(ctx, asset=None):
+    """The published SHA-256 for `asset` (this device's yt-dlp build by default; the
+    arch-independent zipapp for fast resolve), from the CHANNEL repo's SHA2-256SUMS file (or None)."""
+    asset = asset or _YTDLP_ASSET
     with _https_open(_ytdlp_release_base() + "SHA2-256SUMS", ctx, timeout=30) as resp:
         text = resp.read().decode("utf-8", "replace")
     for line in text.splitlines():
@@ -2047,6 +2063,98 @@ def _expected_sha256(ctx, asset=_YTDLP_ASSET):
     return None
 
 
+def _unpack_ytdlp_dir(zpath):
+    """Install the 32-bit one-directory build from its zip: unpack it into bin/yt-dlp-armv7l and
+    point bin/yt-dlp at its executable with a relative symlink, so every caller keeps running
+    bin/yt-dlp (the bootloader finds _internal/ through the link's real path). The tree is unpacked
+    beside the live one and swapped in by rename, so a failed unpack leaves a working install
+    alone. The replaced tree is parked as .old until the next install rather than deleted, in case
+    a yt-dlp process is still running from it."""
+    import zipfile
+    bindir = os.path.dirname(_managed_ytdlp())
+    final = os.path.join(bindir, _YTDLP_DIR_NAME)
+    new, old = final + ".new", final + ".old"
+    for d in (new, old):
+        shutil.rmtree(d, ignore_errors=True)
+    exe = _YTDLP_ASSET[:-len(".zip")]
+    root = os.path.realpath(new) + os.sep
+    with zipfile.ZipFile(zpath) as z:
+        for name in z.namelist():                 # no member may land outside the new tree
+            if not os.path.realpath(os.path.join(new, name)).startswith(root):
+                raise ValueError("unsafe path in the yt-dlp archive: " + name)
+        z.extractall(new)
+    exe_path = os.path.join(new, exe)
+    if not os.path.isfile(exe_path):
+        raise ValueError("the yt-dlp archive has no " + exe)
+    os.chmod(exe_path, 0o755)                     # zipfile doesn't restore permissions
+    if os.path.isdir(final):
+        os.rename(final, old)
+    os.rename(new, final)
+    link = _managed_ytdlp() + ".link"
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(os.path.join(_YTDLP_DIR_NAME, exe), link)
+    os.replace(link, _managed_ytdlp())
+
+
+def _install_ytdlp_sync(progress=None):
+    """Download, verify and install this device's yt-dlp build into our bin/. Returns
+    (ok, message, version); progress(pct) is called as the download advances."""
+    tmp = None
+    try:
+        _force_ipv4()  # pin IPv4 — avoid a stalled connect on unroutable-IPv6 networks
+        ctx = ssl.create_default_context()  # verifies the server certificate
+        expected = _expected_sha256(ctx)    # None if the sums file can't be parsed
+        dest_dir = os.path.join(_data_dir(), "bin")
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = _managed_ytdlp()
+        tmp = dest + ".part"
+        h = hashlib.sha256()
+        with _https_open(_ytdlp_release_base() + _YTDLP_ASSET, ctx) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            last = -1
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if total > 0 and progress:
+                        pct = done * 100.0 / total
+                        if int(pct) != last:
+                            last = int(pct)
+                            progress(pct)
+        if expected and h.hexdigest().lower() != expected:
+            os.remove(tmp)
+            tmp = None
+            return False, "Checksum mismatch — download discarded, nothing installed", ""
+        if _YTDLP_ASSET.endswith(".zip"):
+            _unpack_ytdlp_dir(tmp)
+            os.remove(tmp)
+        else:
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)
+        tmp = None
+        ver = ytdlp_version(fresh=True)  # exercises the binary — confirms it actually runs
+        if ver:
+            note = "Installed yt-dlp " + ver
+            if not expected:
+                note += " (checksum unavailable, not verified)"
+            return True, note, ver
+        return False, ("Downloaded + checksum OK, but the binary won't run here — "
+                       "the sandbox is likely blocking exec from the data dir"), ""
+    except Exception as ex:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False, str(ex), ""
+
+
 def install_ytdlp():
     """Download yt-dlp into our data dir (the one place that's writable AND visible inside the
     Sailjail sandbox). HTTPS-only, checksum-verified against the release's SHA2-256SUMS. Runs
@@ -2054,60 +2162,46 @@ def install_ytdlp():
     import pyotherside
 
     def run():
-        tmp = None
-        try:
-            _force_ipv4()  # pin IPv4 — avoid a stalled connect on unroutable-IPv6 networks
-            ctx = ssl.create_default_context()  # verifies the server certificate
-            expected = _expected_sha256(ctx)    # None if the sums file can't be parsed
-            dest_dir = os.path.join(_data_dir(), "bin")
-            os.makedirs(dest_dir, exist_ok=True)
-            dest = _managed_ytdlp()
-            tmp = dest + ".part"
-            h = hashlib.sha256()
-            with _https_open(_ytdlp_release_base() + _YTDLP_ASSET, ctx) as resp:
-                total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
-                last = -1
-                with open(tmp, "wb") as f:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        h.update(chunk)
-                        done += len(chunk)
-                        if total > 0:
-                            pct = done * 100.0 / total
-                            if int(pct) != last:
-                                last = int(pct)
-                                pyotherside.send("ytdlp_install_progress", pct)
-            if expected and h.hexdigest().lower() != expected:
-                os.remove(tmp)
-                pyotherside.send("ytdlp_install_done", False,
-                                 "Checksum mismatch — download discarded, nothing installed", "")
-                return
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, dest)
-            ver = ytdlp_version(fresh=True)  # exercises the binary — confirms it actually runs
-            if ver:
-                note = "Installed yt-dlp " + ver
-                if not expected:
-                    note += " (checksum unavailable, not verified)"
-                pyotherside.send("ytdlp_install_done", True, note, ver)
-            else:
-                pyotherside.send("ytdlp_install_done", False,
-                                 "Downloaded + checksum OK, but the binary won't run here — "
-                                 "the sandbox is likely blocking exec from the data dir", "")
-        except Exception as ex:
-            try:
-                if tmp and os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            pyotherside.send("ytdlp_install_done", False, str(ex), "")
+        ok, msg, ver = _install_ytdlp_sync(
+            lambda pct: pyotherside.send("ytdlp_install_progress", pct))
+        pyotherside.send("ytdlp_install_done", ok, msg, ver)
 
     threading.Thread(target=run, daemon=True).start()
     return {"ok": True}
+
+
+def _ytdlp_latest_tag():
+    """The latest stable yt-dlp release tag ('' on any failure). yt-dlp's version string is the
+    tag, so the two compare directly."""
+    try:
+        _force_ipv4()
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+            headers={"User-Agent": _BROWSER_UA, "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+            return (json.loads(resp.read().decode()).get("tag_name") or "").strip()
+    except Exception:
+        return ""
+
+
+def _ytdlp_update_by_download():
+    """ytdlp_update for the 32-bit build, which can't update itself (yt-dlp: "Auto-update is not
+    supported for unpackaged Linux executable"): download the latest stable release again,
+    unless that is already the installed version."""
+    cur = ytdlp_version()
+    latest = _ytdlp_latest_tag()
+    if not latest:     # don't pull ~40 MB blind when we can't tell whether it's needed
+        return {"ok": False, "error": "Couldn't reach GitHub to check for a newer yt-dlp",
+                "version": cur, "channel": "stable"}
+    if cur and latest == cur:
+        return {"ok": True, "output": "yt-dlp is up to date (stable@%s)" % cur,
+                "version": cur, "channel": "stable"}
+    ok, msg, ver = _install_ytdlp_sync()
+    res = {"ok": ok, "output": msg, "version": ver or ytdlp_version(), "channel": "stable"}
+    if not ok:
+        res["error"] = msg
+    return res
 
 
 # --------------------------------------------------------------------------- #
@@ -2616,7 +2710,8 @@ def ffmpeg_version():
         return ""
 
 
-# Static aarch64 build (self-contained; John Van Sickle's release is the de-facto arm64 source).
+# Static aarch64 build, armhf on 32-bit ARM (self-contained; John Van Sickle's release is the de-facto
+# arm64 source). The armhf binary is pinned the same way (verified to run on the armv7hl SDK target).
 # It's a .tar.xz carrying ffmpeg + ffprobe under a versioned dir; a companion .md5 lets us verify
 # the archive before unpacking. (MD5 is weak, but the transfer is HTTPS + cert-verified.)
 # NOTE (2026-09): the JVS arm64 build has been FROZEN since Aug 2024 (Last-Modified checked
@@ -2624,7 +2719,8 @@ def ffmpeg_version():
 # a single point of failure. If the site ever dies, BtbN/FFmpeg-Builds on GitHub publishes
 # linuxarm64 static builds with per-asset sums (the same trust model as the yt-dlp and Deno
 # installers): switching means re-pointing these URLs and re-pinning _FFMPEG_SHA256.
-_FFMPEG_URL = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz"
+_FFMPEG_URL = ("https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-%s-static.tar.xz"
+               % ("armhf" if _ARM32 else "arm64"))
 _FFMPEG_MD5_URL = _FFMPEG_URL + ".md5"
 
 # A trusted SHA-256 of the extracted ffmpeg BINARY, pinned out-of-band. The .md5 companion above is
@@ -2636,7 +2732,8 @@ _FFMPEG_MD5_URL = _FFMPEG_URL + ".md5"
 # known-good build; a mismatching download is REFUSED while staged (never promoted over a
 # working install) unless the user explicitly accepts it via allow_unpinned — see the M12
 # integrity gate in install_ffmpeg.
-_FFMPEG_SHA256 = "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce"
+_FFMPEG_SHA256 = ("0afba4a11110e6e402053e0fc14c33a7eb207d7a588688ae87dba471a0f06c71" if _ARM32 else
+                  "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce")
 
 
 def _sha256_file(path):
@@ -2805,6 +2902,8 @@ _DENO_CANDIDATES = (
 # Deno ships as a single self-contained binary (aarch64/glibc) from its GitHub releases, so — like
 # yt-dlp — the app can fetch it into its own bin/ instead of needing a manual system install.
 _DENO_ASSET = "deno-aarch64-unknown-linux-gnu.zip"
+_ARM32_NO_DENO = ("Deno has no 32-bit ARM build, so the PO-token provider can't run on this phone. "
+                  "Playback uses the clients that need no token.")
 _DENO_DOWNLOAD_URL = "https://github.com/denoland/deno/releases/latest/download/" + _DENO_ASSET
 _DENO_SUMS_URL = _DENO_DOWNLOAD_URL + ".sha256sum"
 
@@ -2884,6 +2983,9 @@ def install_deno():
     Background thread; progress + result via pyotherside (deno_install_progress / deno_install_done)."""
     import pyotherside
     import zipfile
+    if _ARM32:
+        pyotherside.send("deno_install_done", False, _ARM32_NO_DENO, "")
+        return {"ok": False}
 
     def run():
         tmp = None
@@ -3414,6 +3516,8 @@ def pot_status():
         # True when the Deno in use is the APP-MANAGED copy — the one that has no other
         # updater, so the UI offers "Update Deno" for it (a system/user Deno is theirs).
         "deno_managed": bool(deno) and deno == _managed_deno(),
+        # 32-bit ARM: no Deno build exists, so the UI explains instead of offering the setup.
+        "arm32": _ARM32,
     }
 
 
@@ -3453,6 +3557,8 @@ def pot_diagnostics():
     L = []
     L.append("FinTube / FinTune — PO-token provider diagnostics")
     L.append("app data dir: " + _data_dir())
+    L.append("userland    : " + ("32-bit ARM (no Deno build: provider unavailable, yt-dlp stable only)"
+                                 if _ARM32 else "64-bit"))
     L.append("")
     L.append("Deno   : " + ((deno + "  (v" + (deno_version() or "?") + ")") if deno else "NOT FOUND"))
     L.append("git    : " + (git or "NOT FOUND"))
@@ -3566,6 +3672,10 @@ def install_pot_provider(tag=None, persist_tag=False):
     setup (node-canvas's native binary is skipped — jsdom degrades gracefully without it,
     which is what lets the server run with ffi fully denied)."""
     import pyotherside
+
+    if _ARM32:
+        pyotherside.send("pot_install_done", False, _ARM32_NO_DENO)
+        return {"ok": False}
 
     def run():
         global _pot_last_error
