@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // Recommendations for a video — its YouTube autoplay Mix, pulled flat by the engine (no InnerTube).
 // Reached from a video's pulldown ("Related videos"). Tap a row to watch it; long-press for the
@@ -15,21 +16,8 @@ Page {
 
     ListModel { id: relModel }
 
-    function fmtDur(sec) {
-        if (!sec || sec <= 0) return ""
-        sec = Math.floor(sec)
-        var h = Math.floor(sec / 3600)
-        var m = Math.floor((sec % 3600) / 60)
-        var s = sec % 60
-        function p(nn) { return (nn < 10 ? "0" : "") + nn }
-        return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(s)
-    }
-    function fmtCount(n) {
-        if (!n || n < 0) return "0"
-        if (n >= 1000000) return (n / 1000000).toFixed(1).replace(".0", "") + "M"
-        if (n >= 1000) return (n / 1000).toFixed(1).replace(".0", "") + "K"
-        return "" + n
-    }
+    function fmtDur(sec) { return Logic.fmtDur(sec) }
+    function fmtCount(n) { return Logic.fmtCount(n) }
 
     function load() {
         page.loading = true

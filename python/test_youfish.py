@@ -11,16 +11,28 @@ covered so it can't come back. youfish.py imports `pyotherside` only inside func
 """
 
 import base64
+import contextlib
+import gzip
+import hashlib
+import http.client
+import http.server
+import io
 import json
+import re
 import os
 import shutil
+import socket
 import sqlite3
+import tarfile
 import time
 import sys
 import tempfile
+import threading as _threading
 import types
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import youfish  # noqa: E402
@@ -1712,6 +1724,28 @@ class SearchFiltersRouting(unittest.TestCase):
         self.assertIn("&sp=", self._target())
 
 
+class SearchChannelsFallback(unittest.TestCase):
+    """Channel search on the yt-dlp path (InnerTube unavailable) builds channel rows, keeping
+    URL-only entries and dropping ones with neither id nor URL."""
+    setUp = SearchFiltersRouting.setUp
+    tearDown = SearchFiltersRouting.tearDown
+
+    def test_channel_rows(self):
+        entries = [{"id": "UC" + "a" * 22, "channel": "Alpha", "channel_follower_count": 12,
+                    "channel_url": "https://www.youtube.com/channel/UC" + "a" * 22},
+                   {"url": "https://www.youtube.com/@beta", "title": "Beta"},
+                   {"title": "nothing to open"}]
+        youfish.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stderr="", stdout=json.dumps({"entries": entries}))
+        res = youfish.search("x", n=5, kind="channel")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["kind"], "channel")
+        self.assertEqual([(i["type"], i["title"]) for i in res["items"]],
+                         [("channel", "Alpha"), ("channel", "Beta")])
+        self.assertEqual(res["items"][0]["subscribers"], 12)
+        self.assertEqual(res["items"][1]["url"], "https://www.youtube.com/@beta")
+
+
 class Related(unittest.TestCase):
     """related() pulls the RD mix flat and drops the seed video."""
     def setUp(self):
@@ -2293,6 +2327,71 @@ class DirectFetchStreamer(unittest.TestCase):
         f = youfish._DirectFetch("https://r.googlevideo.com/vp", "UA", 0, 100)
         self.assertEqual(f.read(7), b"")                              # like the child dying at byte 0
         self.assertEqual(f.poll(), 1)                                 # error, not clean EOF
+
+    def _refuse_first(self, n, data=None):
+        """Fake googlevideo that answers 403 to the first n requests, then serves (a fresh PO-token
+        URL's warm-up), or 403s everything once data has been served (data=bytes: mid-stream)."""
+        calls = {"n": 0}
+
+        def fake(req, timeout=None):
+            calls["n"] += 1
+            a, b = map(int, req.headers["Range"][6:].split("-"))
+            self.ranges.append((a, b))
+            if calls["n"] <= n or (data is not None and a > 0):
+                raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, None)
+            body = (data or self.DATA)[a:b + 1]
+            return _FakeHttpResp(206, body, {"Content-Range": "bytes %d-%d/%d"
+                                             % (a, a + len(body) - 1, len(data or self.DATA))})
+        youfish.urllib.request.urlopen = fake
+        self._step, self._warm = youfish._POT_WARMUP_STEP, youfish._POT_WARMUP
+        youfish._POT_WARMUP_STEP = 0
+        self.addCleanup(setattr, youfish, "_POT_WARMUP_STEP", self._step)
+        self.addCleanup(setattr, youfish, "_POT_WARMUP", self._warm)
+        return calls
+
+    @staticmethod
+    def _gv(expire_in, pot=True):
+        return ("https://r.googlevideo.com/vp?expire=%d&itag=251%s"
+                % (time.time() + expire_in, "&pot=Mlx" if pot else ""))
+
+    def test_young_token_url_rides_out_its_warmup(self):
+        calls = self._refuse_first(3)                 # refused for ~1.5 s on a phone, then served
+        f = youfish._DirectFetch(self._gv(21599), "UA", 0, len(self.DATA))
+        self.assertEqual(self._drain(f), self.DATA)
+        self.assertEqual(calls["n"], 6)               # 3 refusals + the 3 real chunks
+        self.assertEqual(self.ranges[:4], [(0, 9)] * 4)   # the same first request, retried
+
+    def test_token_url_refused_past_the_warmup_dies(self):
+        self._refuse_first(10 ** 6)
+        youfish._POT_WARMUP = 0.05
+        f = youfish._DirectFetch(self._gv(21599), "UA", 0, len(self.DATA))
+        self.assertEqual(f.read(7), b"")
+        self.assertEqual((f.poll(), f.err), (1, "HTTP 403"))   # into the re-resolve as before
+
+    def test_only_young_token_urls_wait(self):
+        for url in (self._gv(21599, pot=False),       # token-free: a 403 is a real refusal
+                    self._gv(3600)):                  # issued hours ago: expired or gated, not warming
+            calls = self._refuse_first(1)
+            f = youfish._DirectFetch(url, "UA", 0, len(self.DATA))
+            self.assertEqual(f.read(7), b"", url)
+            self.assertEqual(calls["n"], 1, url)
+
+    def test_refusal_after_the_first_bytes_never_waits(self):
+        calls = self._refuse_first(0, data=self.DATA)  # chunk 1 served, chunk 2 refused
+        f = youfish._DirectFetch(self._gv(21599), "UA", 0, len(self.DATA))
+        self.assertEqual(self._drain(f), self.DATA[:10])
+        self.assertEqual((f.poll(), calls["n"]), (1, 2))
+
+    def test_kill_during_warmup_stops_it(self):
+        calls = self._refuse_first(10 ** 6)
+        f = youfish._DirectFetch(self._gv(21599), "UA", 0, len(self.DATA))
+        youfish._POT_WARMUP_STEP = 0.01
+        t = _threading.Timer(0.05, f.kill)
+        t.start()
+        self.assertEqual(f.read(7), b"")
+        t.join()
+        self.assertEqual(f.poll(), 0)                  # killed, not an error
+        self.assertLess(calls["n"], 100)
 
     def test_midchunk_truncation_self_heals(self):
         self._serve(self.DATA, truncate_first=4)                      # server closes after 4 bytes
@@ -4333,6 +4432,2118 @@ class Arm32Userland(unittest.TestCase):
         self.assertFalse(youfish.install_pot_provider()["ok"])
         self.assertEqual([e[0] for e in self.sent], ["deno_install_done", "pot_install_done"])
         self.assertTrue(all(e[1] is False for e in self.sent))
+
+
+
+# --- Release-safety net: features that had no offline test (see TESTING.md) ------------------ #
+
+class _TmpDataDir(unittest.TestCase):
+    """Base: every store lands in a throwaway data dir."""
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="stores-")
+        self._dd = youfish._data_dir
+        youfish._data_dir = lambda: self._tmp
+
+    def tearDown(self):
+        youfish._data_dir = self._dd
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+class AudioTrackMemory(_TmpDataDir):
+    """The Audio picker's choice, as the next video sees it (the 1.5.x "original audio" bug)."""
+
+    def test_original_track_remembers_original_not_its_language(self):
+        self.assertEqual(youfish.set_audio_track("pl", True)["audio_lang"], "")
+
+    def test_dub_is_remembered_by_language(self):
+        self.assertEqual(youfish.set_audio_track("es-419", False)["audio_lang"], "es-419")
+
+    def test_next_video_after_picking_a_polish_original_plays_its_own_original(self):
+        youfish.set_audio_track("pl", True)
+        english_video = [af("251-en", 160, "opus", lang_pref=10, lang="en"),   # original
+                         af("251-pl", 158, "opus", lang_pref=-1, lang="pl")]   # Polish dub
+        want = youfish.get_settings().get("audio_lang") or ""
+        self.assertEqual(youfish._pick_audio(english_video, want)["format_id"], "251-en")
+
+    def test_after_picking_a_dub_the_next_video_starts_on_that_dub(self):
+        youfish.set_audio_track("pl", False)
+        english_video = [af("251-en", 160, "opus", lang_pref=10, lang="en"),
+                         af("251-pl", 158, "opus", lang_pref=-1, lang="pl")]
+        want = youfish.get_settings().get("audio_lang") or ""
+        self.assertEqual(youfish._pick_audio(english_video, want)["format_id"], "251-pl")
+
+
+class SettingsStore(_TmpDataDir):
+    def test_defaults_then_persist(self):
+        self.assertEqual(youfish.get_settings()["default_quality"], "720")
+        youfish.set_setting("hide_shorts", False)
+        self.assertIs(youfish.get_settings()["hide_shorts"], False)
+        self.assertEqual(oct(os.stat(youfish._settings_path()).st_mode & 0o777), "0o600")
+
+    def test_output_settings_drop_cached_resolves_others_dont(self):
+        calls = []
+        saved = youfish.invalidate_resolve_cache
+        youfish.invalidate_resolve_cache = lambda: calls.append(1)
+        try:
+            for key in youfish._RESOLVE_OUTPUT_KEYS:
+                youfish.set_setting(key, "x")
+            self.assertEqual(len(calls), len(youfish._RESOLVE_OUTPUT_KEYS))
+            youfish.set_setting("caption_lang", "de")
+            youfish.set_setting("sponsorblock", False)
+            self.assertEqual(len(calls), len(youfish._RESOLVE_OUTPUT_KEYS))
+        finally:
+            youfish.invalidate_resolve_cache = saved
+
+    def test_corrupt_settings_file_falls_back_to_defaults(self):
+        with open(youfish._settings_path(), "w") as f:
+            f.write("{not json")
+        self.assertEqual(youfish.get_settings()["history_limit"], 500)
+
+    def test_qml_fallbacks_match_engine_defaults(self):
+        # Backend.qml repeats some defaults as `s.key || <literal>`; a drift between the two means
+        # the UI shows one value while the engine uses another.
+        qml = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "qml",
+                                "Backend.qml")).read()
+        found = re.findall(r"=\s*s\.(\w+)\s*\|\|\s*(\"[^\"]*\"|[\d.]+)", qml)
+        found += re.findall(r"\(s\.(\w+)\s*===\s*undefined\)\s*\?\s*(\"[^\"]*\"|[\d.]+|true|false)",
+                            qml)
+        self.assertTrue(found)
+        for key, lit in found:
+            if key not in youfish._SETTINGS_DEFAULTS:
+                continue
+            want = youfish._SETTINGS_DEFAULTS[key]
+            got = json.loads(lit)
+            if want in ("", 0, None) and want is not False:   # `|| ""` just guards a missing key
+                continue
+            self.assertEqual(got, want, "Backend.qml fallback for %s" % key)
+
+
+class ResolveKeyInputs(_TmpDataDir):
+    """Invariant 6: every setting that changes resolve's answer is part of the cache key."""
+    def test_each_output_input_changes_the_key(self):
+        base = youfish._resolve_key("vid")
+        for key, val in (("default_quality", "1080"), ("audio_lang", "de"), ("hw_decode", True)):
+            youfish.set_setting(key, val)
+            changed = youfish._resolve_key("vid")
+            self.assertNotEqual(changed, base, key)
+            base = changed
+        saved = youfish._signed_in
+        youfish._signed_in = lambda: True
+        try:
+            self.assertNotEqual(youfish._resolve_key("vid"), base)
+        finally:
+            youfish._signed_in = saved
+
+    def test_display_only_settings_keep_the_key(self):
+        base = youfish._resolve_key("vid")
+        youfish.set_setting("caption_lang", "de")
+        youfish.set_setting("hide_shorts", False)
+        self.assertEqual(youfish._resolve_key("vid"), base)
+
+
+class LocalPlaylists(_TmpDataDir):
+    def test_create_rename_add_remove_delete(self):
+        pid = youfish.create_playlist("  Mix  ")["id"]
+        self.assertEqual(youfish.list_playlists()[0]["title"], "Mix")
+        youfish.rename_playlist(pid, "Chill")
+        youfish.add_to_playlist(pid, "a", title="A")
+        youfish.add_to_playlist(pid, "a", title="A again")     # no duplicates
+        youfish.add_to_playlist(pid, "b")
+        items = youfish.get_playlist(pid)["playlist"]["items"]
+        self.assertEqual([i["id"] for i in items], ["a", "b"])
+        self.assertEqual(youfish.list_playlists()[0]["title"], "Chill")
+        self.assertEqual(youfish.list_playlists()[0]["count"], 2)
+        self.assertEqual([i["id"] for i in youfish.remove_from_playlist(pid, "a")["playlist"]["items"]],
+                         ["b"])
+        youfish.delete_playlist(pid)
+        self.assertEqual(youfish.list_playlists(), [])
+        self.assertFalse(youfish.get_playlist(pid)["ok"])
+
+    def test_blank_title_gets_a_name(self):
+        youfish.create_playlist("   ")
+        self.assertEqual(youfish.list_playlists()[0]["title"], "New playlist")
+
+
+class SubscriptionsStore(_TmpDataDir):
+    def test_toggle_on_and_off(self):
+        r = youfish.toggle_subscription("UC1", name="One")
+        self.assertTrue(r["subscribed"])
+        self.assertTrue(youfish.is_subscribed("UC1"))
+        self.assertEqual(youfish.list_subscriptions()[0]["name"], "One")
+        self.assertFalse(youfish.toggle_subscription("UC1")["subscribed"])
+        self.assertEqual(youfish.list_subscriptions(), [])
+
+    def test_empty_id_is_refused(self):
+        self.assertFalse(youfish.toggle_subscription("")["ok"])
+
+
+class WatchHistoryPages(_TmpDataDir):
+    def test_newest_first_paging_and_clear(self):
+        for i in range(5):
+            youfish.record_watch("v%d" % i, 10, 100, title="T%d" % i)
+        self.assertEqual([r["id"] for r in youfish.watch_history(1, 2)], ["v4", "v3"])
+        self.assertEqual([r["id"] for r in youfish.watch_history(3, 2)], ["v2", "v1"])
+        youfish.record_watch("v1", 20, 100)                     # a replay moves it to the top
+        self.assertEqual(youfish.watch_history(1, 1)[0]["id"], "v1")
+        youfish.clear_watch_history()
+        self.assertEqual(youfish.watch_history(), [])
+
+
+class DownloadFolder(_TmpDataDir):
+    def test_pick_reset_and_refuse(self):
+        target = os.path.join(self._tmp, "Videos")
+        r = youfish.set_download_dir("file://" + target)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["custom"])
+        self.assertEqual(r["effective"], target)
+        blocker = os.path.join(self._tmp, "file")
+        open(blocker, "w").close()
+        r = youfish.set_download_dir(os.path.join(blocker, "sub"))   # can't create under a file
+        self.assertFalse(r["ok"])
+        self.assertEqual(youfish.download_location()["configured"], target)   # previous kept
+        self.assertFalse(youfish.set_download_dir("")["custom"])
+
+    def test_delete_download_removes_file_and_entry(self):
+        f, g = os.path.join(self._tmp, "a.m4a"), os.path.join(self._tmp, "a.mp4")
+        open(f, "w").close()
+        open(g, "w").close()
+        youfish._save_downloads([{"id": "a", "kind": "audio", "path": f},
+                                 {"id": "a", "kind": "video", "path": g}])
+        left = youfish.delete_download("a", "audio")["downloads"]
+        self.assertFalse(os.path.exists(f))
+        self.assertTrue(os.path.exists(g))
+        self.assertEqual([(d["id"], d["kind"]) for d in left], [("a", "video")])
+
+
+class AtomicJsonWrite(_TmpDataDir):
+    def test_failed_write_keeps_the_old_file(self):
+        p = os.path.join(self._tmp, "x.json")
+        youfish._atomic_write_json(p, {"a": 1})
+        with self.assertRaises(Exception):
+            youfish._atomic_write_json(p, {"bad": object()})     # not serialisable
+        with open(p) as f:
+            self.assertEqual(json.load(f), {"a": 1})
+        self.assertEqual(sorted(os.listdir(self._tmp)), ["x.json"])   # no temp file left behind
+
+
+class ProxyAllowList(unittest.TestCase):
+    """Invariant 1's SSRF guard: the proxy only refetches https Google media hosts."""
+    def test_allowed(self):
+        for u in ("https://rr1---sn-x.googlevideo.com/videoplayback?a=1",
+                  "https://i.ytimg.com/vi/x/hq.jpg", "https://www.youtube.com/x"):
+            self.assertTrue(youfish._proxy_url_ok(u), u)
+
+    def test_refused(self):
+        for u in ("http://rr1.googlevideo.com/x", "https://127.0.0.1/x", "file:///etc/passwd",
+                  "https://evil.com/googlevideo.com", "https://googlevideo.com.evil.com/x",
+                  "https://evilgooglevideo.com/x", ""):
+            self.assertFalse(youfish._proxy_url_ok(u), u)
+
+
+class MediaProxyEndToEnd(_TmpDataDir):
+    """A real request through the localhost proxy: playback's own path minus the network. The
+    fake googlevideo serves known bytes; the proxy must hand back exactly the asked range."""
+    DATA = bytes(range(256)) * 40          # 10240 bytes
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {n: getattr(youfish, n) for n in ("_force_ipv4", "_ytdlp_path", "_DIRECT_CHUNK")}
+        self._urlopen = youfish.urllib.request.urlopen
+        youfish._force_ipv4 = lambda: None
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+        youfish._DIRECT_CHUNK = 4096
+        data = self.DATA
+
+        def fake(req, timeout=None):
+            a, b = map(int, re.match(r"bytes=(\d+)-(\d+)", req.headers["Range"]).groups())
+            if a >= len(data):
+                raise urllib.error.HTTPError(req.full_url, 416, "range", {}, None)
+            return _FakeHttpResp(206, data[a:b + 1], {"Content-Range": "bytes %d-%d/%d" % (
+                a, min(b, len(data) - 1), len(data))})
+        youfish.urllib.request.urlopen = fake
+        youfish._ensure_proxy()
+        self._sdir = youfish._STREAM_DIR
+        youfish._STREAM_DIR = self._tmp
+
+    def tearDown(self):
+        youfish.release_playback("pv", [])
+        youfish.urllib.request.urlopen = self._urlopen
+        youfish._STREAM_DIR = self._sdir
+        for n, v in self._saved.items():
+            setattr(youfish, n, v)
+        super().tearDown()
+
+    def _get(self, url, rng=None):
+        import http.client
+        u = urllib.parse.urlsplit(url)
+        c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+        c.request("GET", u.path + "?" + u.query, headers={"Range": rng} if rng else {})
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, dict(r.getheaders()), body
+
+    def test_range_requests_get_the_exact_bytes(self):
+        src = "https://rr1.googlevideo.com/videoplayback?clen=%d&itag=251" % len(self.DATA)
+        url = youfish._proxied(src, "pv", "251", "UA/1")
+        self.assertTrue(url.startswith("http://127.0.0.1:"))
+        st, h, body = self._get(url, "bytes=0-")
+        self.assertEqual(st, 206)
+        self.assertEqual(body, self.DATA)
+        st, h, body = self._get(url, "bytes=5000-")          # a seek
+        self.assertEqual((st, h["Content-Range"]), (206, "bytes 5000-10239/10240"))
+        self.assertEqual(body, self.DATA[5000:])
+
+    def test_seek_past_the_end_is_a_clean_416(self):
+        src = "https://rr1.googlevideo.com/videoplayback?clen=%d" % len(self.DATA)
+        st, h, _ = self._get(youfish._proxied(src, "pv", "251"), "bytes=10240-")
+        self.assertEqual((st, h["Content-Range"]), (416, "bytes */10240"))
+
+    def test_non_google_target_is_refused(self):
+        st, _, _ = self._get(youfish._proxied("https://example.com/x?clen=10", "pv", "251"))
+        self.assertEqual(st, 403)
+
+    def test_plays_without_yt_dlp_installed(self):
+        """A fast-path resolve needs no yt-dlp, and neither does the direct fetch. The proxy used
+        to refuse such a stream (503 "no stream capacity"), so nothing played on a phone where
+        yt-dlp wasn't installed or couldn't run (the first 32-bit report)."""
+        youfish._ytdlp_path = lambda: None
+        src = "https://rr1.googlevideo.com/videoplayback?clen=%d&itag=251" % len(self.DATA)
+        st, _, body = self._get(youfish._proxied(src, "pv", "251", "UA/1"), "bytes=0-")
+        self.assertEqual((st, body), (206, self.DATA))
+
+    def test_byte0_refusal_without_yt_dlp_retries_direct(self):
+        """A stream refused at byte 0 flips to the yt-dlp child, unless there's no yt-dlp: then
+        the direct fetch tries again (it used to crash the reader and fail the stream)."""
+        youfish._ytdlp_path = lambda: None
+        serve, calls = youfish.urllib.request.urlopen, []
+
+        def once_refused(req, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(req.full_url, 403, "forbidden", {}, None)
+            return serve(req, timeout)
+        youfish.urllib.request.urlopen = once_refused
+        src = "https://rr1.googlevideo.com/videoplayback?clen=%d&itag=251" % len(self.DATA)
+        st, _, body = self._get(youfish._proxied(src, "pv", "251", "UA/1"), "bytes=0-")
+        self.assertEqual((st, body), (206, self.DATA))
+        self.assertGreater(len(calls), 1)
+
+    def test_refusal_says_why(self):
+        free = youfish._free_bytes
+        youfish._free_bytes = lambda path: 120 << 20
+        try:
+            src = "https://rr1.googlevideo.com/videoplayback?clen=%d&itag=251" % len(self.DATA)
+            u = urllib.parse.urlsplit(youfish._proxied(src, "pv", "251"))
+            import http.client
+            c = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
+            c.request("GET", u.path + "?" + u.query)
+            r = c.getresponse()
+            r.read()
+            c.close()
+        finally:
+            youfish._free_bytes = free
+        self.assertEqual(r.status, 503)
+        self.assertIn("not enough free storage", r.reason)
+        self.assertIn("120 MB free", r.reason)
+
+
+
+class ChannelNoVideosTab(unittest.TestCase):
+    """A channel without uploads: the page opens its playlists from a machine field, not by
+    matching yt-dlp's wording."""
+    def setUp(self):
+        self._saved = {n: getattr(youfish, n) for n in
+                       ("_channel_videos_innertube", "_ytdlp_path", "_ytdlp_run")}
+        youfish._channel_videos_innertube = lambda *a, **k: None
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(youfish, n, v)
+
+    def _fail(self, stderr):
+        youfish._ytdlp_run = lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+        return youfish.channel_videos("UCx")
+
+    def test_no_videos_tab_is_flagged(self):
+        r = self._fail("ERROR: [youtube:tab] UCx: This channel does not have a videos tab")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "no_videos_tab")
+        self.assertIn("videos tab", r["error"])
+
+    def test_other_errors_carry_no_reason(self):
+        r = self._fail("ERROR: [youtube:tab] UCx: HTTP Error 404: Not Found")
+        self.assertFalse(r["ok"])
+        self.assertNotIn("reason", r)
+
+
+# --- Gap closers: functions no test ran before (python3 tests/coverage_report.py) ------------ #
+
+class _InlineThreading:
+    """Stands in for a module's `threading`: Thread/Timer are recorded and, when `run`, their target
+    runs inline at start(); `fail` makes start() raise like a thread/FD-exhausted process."""
+    def __init__(self, run=True, fail=False):
+        self.run, self.fail, self.made = run, fail, []
+
+    def __getattr__(self, name):
+        return getattr(_threading, name)
+
+    def Thread(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+        return self._make(name, target, args, kwargs, None)
+
+    def Timer(self, interval, function, args=None, kwargs=None):
+        return self._make(None, function, args or (), kwargs, interval)
+
+    def _make(self, name, target, args, kwargs, interval):
+        rec = types.SimpleNamespace(name=name, target=target, interval=interval, daemon=None)
+
+        def start():
+            if self.fail:
+                raise RuntimeError("can't start new thread")
+            if self.run:
+                target(*args, **(kwargs or {}))
+        rec.start = start
+        self.made.append(rec)
+        return rec
+
+
+class _Download(io.BytesIO):
+    """A download response for _https_open fakes: .headers, read(n), a context manager. `fail`
+    is raised by the read after the first one (a connection dropping mid-download)."""
+    def __init__(self, data, fail=None):
+        io.BytesIO.__init__(self, data)
+        self.headers = {"Content-Length": str(len(data))}
+        self._fail = fail
+
+    def read(self, n=-1):
+        if self._fail is not None and self.tell() > 0:
+            raise self._fail
+        return io.BytesIO.read(self, n)
+
+
+def _script(path, body):
+    """A fake binary: a small executable shell script."""
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\n" + body)
+    os.chmod(path, 0o755)
+    return path
+
+
+class _Restore(unittest.TestCase):
+    """Base: SAVE lists youfish attributes put back after each test; also restores pyotherside,
+    urllib's urlopen and subprocess.run, which several of these tests replace."""
+    SAVE = ()
+
+    def setUp(self):
+        self._saved = {n: getattr(youfish, n) for n in self.SAVE}
+        self._urlopen = urllib.request.urlopen
+        self._run = youfish.subprocess.run
+        self.sent = []
+        self._prev_po = sys.modules.get("pyotherside")
+        sys.modules["pyotherside"] = types.SimpleNamespace(send=lambda *a: self.sent.append(a))
+        self._tmp = tempfile.mkdtemp(prefix="gap-")
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(youfish, n, v)
+        urllib.request.urlopen = self._urlopen
+        youfish.subprocess.run = self._run
+        if self._prev_po is not None:
+            sys.modules["pyotherside"] = self._prev_po
+        else:
+            sys.modules.pop("pyotherside", None)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def tmp_data(self):
+        """Point every store at the throwaway dir."""
+        youfish._data_dir = lambda: self._tmp
+
+
+class FfmpegInstallIntegrity(_Restore):
+    """install_ffmpeg: the .md5 and pinned SHA-256 gates. A mismatch never replaces a working ffmpeg,
+    an archive path can't escape bin/, nothing staged is left behind, and every outcome reaches the
+    UI as one ffmpeg_install_done event."""
+    SAVE = ("_data_dir", "_force_ipv4", "_https_open", "_FFMPEG_SHA256", "threading")
+    GOOD = "echo 'ffmpeg version 6.0-static https://johnvansickle.com/ffmpeg/'\n"
+
+    def setUp(self):
+        super().setUp()
+        self.tmp_data()
+        youfish._force_ipv4 = lambda: None
+        youfish.threading = _InlineThreading()
+        self.bin = os.path.join(self._tmp, "bin")
+        self.served = {}
+
+        def https_open(url, ctx, timeout=60):
+            v = self.served[url]
+            if isinstance(v, Exception):
+                raise v
+            return v if isinstance(v, _Download) else _Download(v)
+        youfish._https_open = https_open
+
+    @staticmethod
+    def _sha(text):
+        return hashlib.sha256(("#!/bin/sh\n" + text).encode()).hexdigest()
+
+    def _serve(self, members, md5=None, fail=None):
+        """Serve a .tar.xz of {arcname: script body} (+ its .md5; md5=b"" serves an empty one)."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:xz") as tf:
+            for name, text in members.items():
+                data = ("#!/bin/sh\n" + text).encode()
+                ti = tarfile.TarInfo(name)
+                ti.size, ti.mode = len(data), 0o755
+                tf.addfile(ti, io.BytesIO(data))
+        blob = buf.getvalue()
+        self.served[youfish._FFMPEG_URL] = _Download(blob, fail) if fail else blob
+        self.served[youfish._FFMPEG_MD5_URL] = (
+            (hashlib.md5(blob).hexdigest().upper() + "  ffmpeg-release-arm64-static.tar.xz\n").encode()
+            if md5 is None else md5)
+
+    def _done(self):
+        done = [e for e in self.sent if e[0] == "ffmpeg_install_done"]
+        self.assertEqual(len(done), 1, self.sent)
+        return done[0]
+
+    def test_pinned_build_installs_verified(self):
+        self._serve({"ffmpeg-7.0-arm64-static/ffmpeg": self.GOOD,
+                     "ffmpeg-7.0-arm64-static/ffprobe": "exit 0\n"})
+        youfish._FFMPEG_SHA256 = self._sha(self.GOOD).upper()
+        self.assertEqual(youfish.install_ffmpeg(), {"ok": True})
+        self.assertEqual(self._done(), ("ffmpeg_install_done", True,
+                                        "Installed ffmpeg 6.0-static (SHA-256 verified — pinned build)",
+                                        "6.0-static"))
+        self.assertTrue(any(e[0] == "ffmpeg_install_progress" for e in self.sent))
+        self.assertEqual(sorted(os.listdir(self.bin)), ["ffmpeg", "ffprobe"])   # nothing staged left
+        self.assertEqual(youfish._sha256_file(os.path.join(self.bin, "ffmpeg")), self._sha(self.GOOD))
+        self.assertEqual(youfish.ffmpeg_version(), "6.0-static")
+
+    def test_md5_mismatch_installs_nothing(self):
+        self._serve({"x/ffmpeg": self.GOOD}, md5=b"0" * 32)
+        youfish._FFMPEG_SHA256 = self._sha(self.GOOD)
+        youfish.install_ffmpeg()
+        self.assertEqual(self._done(), ("ffmpeg_install_done", False,
+                                        "Checksum mismatch — download discarded, nothing installed", ""))
+        self.assertEqual(os.listdir(self.bin), [])
+
+    def test_pin_mismatch_keeps_the_working_ffmpeg(self):
+        os.makedirs(self.bin)
+        old = _script(os.path.join(self.bin, "ffmpeg"), "echo 'ffmpeg version 5.1'\n")
+        self._serve({"x/ffmpeg": self.GOOD, "x/ffprobe": "exit 0\n"})
+        youfish._FFMPEG_SHA256 = "0" * 64
+        youfish.install_ffmpeg()
+        ev = self._done()
+        self.assertEqual(ev[1:2] + ev[3:], (False, "", True))   # 5th arg: offer "install unverified"
+        self.assertIn("NOT installed", ev[2])
+        self.assertEqual(os.listdir(self.bin), ["ffmpeg"])      # staged .new files discarded
+        self.assertEqual(youfish._sha256_file(old), self._sha("echo 'ffmpeg version 5.1'\n"))
+
+    def test_user_accepts_unpinned_build(self):
+        self._serve({"x/ffmpeg": self.GOOD})
+        youfish._FFMPEG_SHA256 = "0" * 64
+        youfish.update_ffmpeg(allow_unpinned=True)
+        self.assertEqual(self._done()[1:3], (True, "Installed ffmpeg 6.0-static "
+                                                   "(unverified build — accepted by you)"))
+
+    def test_no_pin_and_no_md5_says_unverified(self):
+        youfish._FFMPEG_SHA256 = ""
+        self._serve({"x/ffmpeg": self.GOOD}, md5=b"")
+        youfish.install_ffmpeg()
+        self.assertEqual(self._done()[1:3], (True, "Installed ffmpeg 6.0-static "
+                                                   "(checksum unavailable, not verified)"))
+
+    def test_archive_without_ffmpeg(self):
+        self._serve({"x/ffprobe": "exit 0\n", "x/README": "hi\n"})
+        youfish.install_ffmpeg()
+        self.assertEqual(self._done()[1:3], (False, "Archive didn't contain an ffmpeg binary"))
+        self.assertEqual(os.listdir(self.bin), [])
+
+    def test_archive_paths_cannot_escape_bin(self):
+        self._serve({"../../../escape/ffmpeg": self.GOOD, "../../etc/README": "x\n"})
+        youfish._FFMPEG_SHA256 = self._sha(self.GOOD)
+        youfish.install_ffmpeg()
+        self.assertTrue(self._done()[1])
+        self.assertEqual(os.listdir(self.bin), ["ffmpeg"])     # basename only, README ignored
+        self.assertEqual(sorted(os.listdir(self._tmp)), ["bin"])
+
+    def test_binary_that_wont_run(self):
+        self._serve({"x/ffmpeg": "exit 1\n"})
+        youfish._FFMPEG_SHA256 = self._sha("exit 1\n")
+        youfish.install_ffmpeg()
+        self.assertEqual(self._done()[1:3], (False, "Unpacked, but the binary won't run here"))
+
+    def test_dropped_download_leaves_no_part_file(self):
+        self._serve({"x/ffmpeg": self.GOOD}, fail=ConnectionResetError("connection reset"))
+        youfish.install_ffmpeg()
+        self.assertEqual(self._done(), ("ffmpeg_install_done", False, "connection reset", ""))
+        self.assertEqual(os.listdir(self.bin), [])
+
+    def test_ffmpeg_version_edges(self):
+        saved = youfish._ffmpeg_path
+        try:
+            youfish._ffmpeg_path = lambda: None
+            self.assertEqual(youfish.ffmpeg_version(), "")
+            youfish._ffmpeg_path = lambda: _script(os.path.join(self._tmp, "ff"), "echo odd build\n")
+            self.assertEqual(youfish.ffmpeg_version(), "odd build")
+        finally:
+            youfish._ffmpeg_path = saved
+
+
+class YtdlpInstallIntegrity(_Restore):
+    """_install_ytdlp_sync / install_ytdlp: the release's SHA2-256SUMS gate, a binary that won't run
+    isn't reported installed, a failure keeps the old binary and leaves no .part, and every
+    download refuses plain HTTP, also after a redirect."""
+    SAVE = ("_data_dir", "_force_ipv4", "_https_open", "_YTDLP_ASSET", "_ARM32", "threading",
+            "_ytdlp_path")
+    GOOD = "echo 2026.10.01\n"
+
+    def setUp(self):
+        super().setUp()
+        self.tmp_data()
+        youfish._force_ipv4 = lambda: None
+        youfish._ARM32 = False
+        youfish._YTDLP_ASSET = "yt-dlp_linux_aarch64"
+        youfish._ytdlp_path = youfish._managed_ytdlp
+        youfish.threading = _InlineThreading()
+        self.served = {}
+
+        def https_open(url, ctx, timeout=60):
+            v = self.served[url]
+            return v if isinstance(v, _Download) else _Download(v)
+        youfish._https_open = https_open
+        self.dest = youfish._managed_ytdlp()
+
+    def _serve(self, body, listed_sha=None, fail=None):
+        base = youfish._ytdlp_release_base()
+        blob = ("#!/bin/sh\n" + body).encode()
+        sha = hashlib.sha256(blob).hexdigest() if listed_sha is None else listed_sha
+        sums = "%s  yt-dlp\n" % ("1" * 64)
+        if sha:
+            sums += "%s  yt-dlp_linux_aarch64\n" % sha.upper()
+        self.served[base + "SHA2-256SUMS"] = sums.encode()
+        self.served[base + "yt-dlp_linux_aarch64"] = _Download(blob, fail) if fail else blob
+
+    def _keep_old(self):
+        os.makedirs(os.path.dirname(self.dest), exist_ok=True)
+        _script(self.dest, "echo 2025.01.01\n")
+
+    def _assert_old_kept(self):
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.dest))), ["yt-dlp"])   # no .part
+        self.assertEqual(youfish.ytdlp_version(fresh=True), "2025.01.01")
+
+    def test_verified_install(self):
+        self._serve(self.GOOD)
+        pct = []
+        self.assertEqual(youfish._install_ytdlp_sync(pct.append),
+                         (True, "Installed yt-dlp 2026.10.01", "2026.10.01"))
+        self.assertEqual(pct[-1], 100.0)
+        self.assertTrue(os.access(self.dest, os.X_OK))
+        self.assertFalse(os.path.exists(self.dest + ".part"))
+
+    def test_checksum_mismatch_keeps_the_old_binary(self):
+        self._keep_old()
+        self._serve(self.GOOD, listed_sha="2" * 64)
+        self.assertEqual(youfish._install_ytdlp_sync(),
+                         (False, "Checksum mismatch — download discarded, nothing installed", ""))
+        self._assert_old_kept()
+
+    def test_unlisted_asset_says_unverified(self):
+        self._serve(self.GOOD, listed_sha="")
+        ok, msg, _ = youfish._install_ytdlp_sync()
+        self.assertTrue(ok)
+        self.assertEqual(msg, "Installed yt-dlp 2026.10.01 (checksum unavailable, not verified)")
+
+    def test_binary_that_wont_run_is_not_installed_ok(self):
+        self._serve("exit 1\n")
+        ok, msg, ver = youfish._install_ytdlp_sync()
+        self.assertEqual((ok, ver), (False, ""))
+        self.assertTrue(msg.startswith("Downloaded + checksum OK, but the binary won't run here"))
+
+    def test_dropped_download_keeps_the_old_binary(self):
+        self._keep_old()
+        self._serve(self.GOOD, fail=ConnectionResetError("connection reset"))
+        self.assertEqual(youfish._install_ytdlp_sync(), (False, "connection reset", ""))
+        self._assert_old_kept()
+
+    def test_install_ytdlp_reports_to_the_ui(self):
+        self._serve(self.GOOD)
+        self.assertEqual(youfish.install_ytdlp(), {"ok": True})
+        self.assertEqual(self.sent[0][0], "ytdlp_install_progress")
+        self.assertEqual(self.sent[-1], ("ytdlp_install_done", True, "Installed yt-dlp 2026.10.01",
+                                         "2026.10.01"))
+
+    def test_https_open_refuses_plain_http(self):
+        https_open = self._saved["_https_open"]
+        opened = []
+        urllib.request.urlopen = lambda req, timeout=0, context=None: opened.append(req)
+        with self.assertRaises(ValueError):
+            https_open("http://github.com/x", None)
+        self.assertEqual(opened, [])
+        closed = []
+        resp = types.SimpleNamespace(geturl=lambda: "http://evil.example/x",
+                                     close=lambda: closed.append(1))
+        urllib.request.urlopen = lambda req, timeout=0, context=None: resp
+        with self.assertRaises(ValueError):
+            https_open("https://github.com/x", None)
+        self.assertEqual(closed, [1])
+        resp.geturl = lambda: "https://objects.githubusercontent.com/x"
+        self.assertIs(https_open("https://github.com/x", None), resp)
+
+    def test_latest_tag(self):
+        urllib.request.urlopen = lambda req, timeout=0, context=None: _Download(
+            b'{"tag_name": " 2026.10.01 "}')
+        self.assertEqual(youfish._ytdlp_latest_tag(), "2026.10.01")
+
+        def down(req, timeout=0, context=None):
+            raise urllib.error.URLError("offline")
+        urllib.request.urlopen = down
+        self.assertEqual(youfish._ytdlp_latest_tag(), "")
+
+    def test_zipapp_lives_in_bin(self):
+        self.assertEqual(youfish._ytdlp_zipapp_path(), os.path.join(self._tmp, "bin", "yt-dlp.zip"))
+
+
+class YtdlpUpdate(_Restore):
+    """ytdlp_update: the self-updater runs on the chosen channel; its output, a timeout and a missing
+    binary all come back as a result the Providers page can show; 32-bit ARM downloads instead."""
+    SAVE = ("_ytdlp_path", "_ARM32", "_managed_ytdlp", "ytdlp_version", "get_settings",
+            "_ytdlp_update_by_download")
+
+    def setUp(self):
+        super().setUp()
+        youfish._ytdlp_path = lambda: "/b/yt-dlp"
+        youfish._managed_ytdlp = lambda: "/b/yt-dlp"
+        youfish._ARM32 = False
+        youfish.ytdlp_version = lambda fresh=False: "2026.10.01"
+        youfish.get_settings = lambda: {"ytdlp_channel": "nightly"}
+        self.argv = []
+
+    def _proc(self, rc, out="", err=""):
+        def run(cmd, **kw):
+            self.argv.append(cmd)
+            return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+        youfish.subprocess.run = run
+
+    def test_no_binary(self):
+        youfish._ytdlp_path = lambda: None
+        self.assertEqual(youfish.ytdlp_update(), {"ok": False, "error": "yt-dlp not found",
+                                                  "version": ""})
+
+    def test_updates_on_the_chosen_channel(self):
+        self._proc(0, "Updated yt-dlp to nightly@2026.10.01\n")
+        r = youfish.ytdlp_update()
+        self.assertEqual(r, {"ok": True, "output": "Updated yt-dlp to nightly@2026.10.01",
+                             "version": "2026.10.01", "channel": "nightly"})
+        self.assertEqual(self.argv[0][0], "/b/yt-dlp")
+        self.assertEqual(self.argv[0][-2:], ["--update-to", "nightly@latest"])
+
+    def test_failure_output_is_kept_short(self):
+        self._proc(1, "", "x" * 1000 + "ERROR: can't update a pip install")
+        r = youfish.ytdlp_update()
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(r["output"]), 400)
+        self.assertTrue(r["output"].endswith("can't update a pip install"))
+        self._proc(1)
+        self.assertEqual(youfish.ytdlp_update()["output"], "yt-dlp reported nothing")
+
+    def test_timeout_and_errors(self):
+        def slow(cmd, **kw):
+            raise youfish.subprocess.TimeoutExpired(cmd, 300)
+        youfish.subprocess.run = slow
+        self.assertEqual(youfish.ytdlp_update(), {"ok": False, "error": "update timed out",
+                                                  "version": "2026.10.01"})
+
+        def gone(cmd, **kw):
+            raise OSError("exec format error")
+        youfish.subprocess.run = gone
+        self.assertEqual(youfish.ytdlp_update()["error"], "exec format error")
+
+    def test_arm32_downloads_instead_of_self_updating(self):
+        youfish._ARM32 = True
+        youfish._ytdlp_update_by_download = lambda: {"ok": True, "by": "download"}
+        self._proc(0)
+        self.assertEqual(youfish.ytdlp_update(), {"ok": True, "by": "download"})
+        self.assertEqual(self.argv, [])
+        youfish._ytdlp_path = lambda: "/usr/bin/yt-dlp"      # a system yt-dlp updates itself
+        self.assertTrue(youfish.ytdlp_update()["ok"])
+        self.assertEqual(len(self.argv), 1)
+
+
+class PotSandboxFlags(_Restore):
+    """_pot_server_flags: the Deno sidecar runs default-deny. No write, no subprocess, reads jailed
+    to its own tree, and FFI granted only to node-canvas's one addon, and only when asked for."""
+    SAVE = ("_data_dir", "_deno_path", "get_settings")
+
+    def setUp(self):
+        super().setUp()
+        self.tmp_data()
+        youfish._deno_path = lambda: "/d/deno"
+        self.settings = {}
+        youfish.get_settings = lambda: self.settings
+        self.srv = youfish._pot_server_dir()
+
+    def _addon(self):
+        """Deno's npm layout: the package under node_modules/.deno/, linked as node_modules/canvas."""
+        nm = os.path.join(self.srv, "node_modules")
+        pkg = os.path.join(nm, ".deno", "canvas@2.11.2", "node_modules", "canvas")
+        os.makedirs(os.path.join(pkg, "build", "Release"))
+        open(os.path.join(pkg, "build", "Release", "canvas.node"), "w").close()
+        os.symlink(os.path.join(".deno", "canvas@2.11.2", "node_modules", "canvas"),
+                   os.path.join(nm, "canvas"))
+        return os.path.join(nm, "canvas", "build", "Release", "canvas.node")
+
+    def _assert_no_broad_grant(self, flags):
+        for bad in ("--allow-write", "--allow-run", "--allow-all", "-A", "--allow-ffi",
+                    "--allow-read", "--allow-sys"):
+            self.assertNotIn(bad, flags)          # bare = unrestricted
+
+    def test_default_deny(self):
+        flags = youfish._pot_server_flags()
+        self.assertEqual(flags, [
+            "/d/deno", "run", "--allow-net", "--allow-env", "--allow-read=" + self.srv,
+            "--deny-write", "--deny-run", "--v8-flags=--max-old-space-size=8192", "--deny-ffi",
+            os.path.join(self.srv, "src", "main.ts")])
+        self.assertTrue(self.srv.startswith(self._tmp))
+        self._assert_no_broad_grant(flags)
+
+    def test_ffi_wanted_but_no_addon_stays_denied(self):
+        self.settings["pot_needs_ffi"] = True
+        self.assertEqual(youfish._canvas_node_path(), "")
+        self.assertIn("--deny-ffi", youfish._pot_server_flags())
+
+    def test_addon_is_ignored_unless_asked_for(self):
+        self._addon()
+        self.assertIn("--deny-ffi", youfish._pot_server_flags())
+
+    def test_ffi_only_to_the_canvas_addon(self):
+        addon = self._addon()
+        self.settings["pot_needs_ffi"] = True
+        self.assertEqual(youfish._canvas_node_path(), addon)
+        flags = youfish._pot_server_flags()
+        self.assertIn("--allow-ffi=" + addon, flags)
+        self.assertNotIn("--deny-ffi", flags)
+        self._assert_no_broad_grant(flags)
+
+
+class PotServerHelpers(_Restore):
+    """The PO-token sidecar's small helpers: the WebGPU crash shim, the server log tail and its
+    once-per-launch rotation, the token label in debug logs, stop/enable, deno/git lookup and the
+    explicit provider update."""
+    SAVE = ("_data_dir", "_pot_log_rotated", "_pot_proc", "_ensure_pot_server", "stop_pot_server",
+            "pot_status", "_force_ipv4", "install_pot_provider", "_deno_path")
+
+    def setUp(self):
+        super().setUp()
+        self.tmp_data()
+        youfish._force_ipv4 = lambda: None
+        self.pot = youfish._pot_dir()
+        self._which = youfish.shutil.which
+
+    def tearDown(self):
+        youfish.shutil.which = self._which
+        super().tearDown()
+
+    def test_webgpu_shim_is_prepended_once(self):
+        main = os.path.join(youfish._pot_server_dir(), "src", "main.ts")
+        youfish._pot_disable_webgpu()                      # no clone yet: a no-op, not a crash
+        self.assertFalse(os.path.exists(main))
+        os.makedirs(os.path.dirname(main))
+        with open(main, "w") as f:
+            f.write("serve();\n")
+        youfish._pot_disable_webgpu()
+        youfish._pot_disable_webgpu()
+        with open(main) as f:
+            src = f.read()
+        self.assertTrue(src.startswith("/* youfish:no-webgpu */"))
+        self.assertEqual(src.count("/* youfish:no-webgpu */"), 1)
+        self.assertIn("requestAdapter", src)
+        self.assertTrue(src.endswith("serve();\n"))
+
+    def test_log_tail(self):
+        self.assertEqual(youfish._pot_server_log_tail(), "")
+        os.makedirs(self.pot)
+        with open(os.path.join(self.pot, "server.log"), "w") as f:
+            f.write("a\n\n  \nb\nc\n")
+        self.assertEqual(youfish._pot_server_log_tail(2), "b\nc")
+        self.assertEqual(youfish._pot_server_log_tail(0), "c")
+        self.assertEqual(youfish._pot_server_log_tail(), "a\nb\nc")
+
+    def test_log_rotates_once_per_launch(self):
+        youfish._pot_log_rotated = False
+        os.makedirs(self.pot)
+        log = os.path.join(self.pot, "server.log")
+        with open(log, "w") as f:
+            f.write("last session\n")
+        youfish._pot_rotate_log()
+        with open(log + ".prev") as f:
+            self.assertEqual(f.read(), "last session\n")
+        self.assertFalse(os.path.exists(log))
+        with open(log, "w") as f:
+            f.write("this session\n")
+        youfish._pot_rotate_log()                          # second call in the same process: no-op
+        self.assertTrue(os.path.exists(log))
+
+    def test_pot_label_never_leaks_the_token(self):
+        self.assertEqual(youfish._pot_of(""), "no-url")
+        self.assertEqual(youfish._pot_of("https://r1.googlevideo.com/videoplayback?c=WEB"), "no-pot")
+        self.assertEqual(youfish._pot_of("https://r1.googlevideo.com/videoplayback?pot=SECRETTOKEN123"),
+                         "len=14 pfx=SECRETTO")
+
+    def test_stop_pot_server(self):
+        calls = []
+
+        def proc(alive=True, wait_hangs=False):
+            def wait(timeout=None):
+                calls.append("wait")
+                if wait_hangs:
+                    raise youfish.subprocess.TimeoutExpired("deno", timeout)
+            return types.SimpleNamespace(poll=lambda: None if alive else 0, wait=wait,
+                                         terminate=lambda: calls.append("term"),
+                                         kill=lambda: calls.append("kill"))
+        youfish._pot_proc = None
+        youfish.stop_pot_server()                          # nothing running: fine
+        youfish._pot_proc = proc()
+        youfish.stop_pot_server()
+        self.assertEqual((calls, youfish._pot_proc), (["term", "wait"], None))
+        del calls[:]
+        youfish._pot_proc = proc(wait_hangs=True)
+        youfish.stop_pot_server()
+        self.assertEqual(calls, ["term", "wait", "kill"])
+        del calls[:]
+        youfish._pot_proc = proc(alive=False)
+        youfish.stop_pot_server()
+        self.assertEqual(calls, [])
+
+    def test_set_pot_enabled(self):
+        calls = []
+        youfish._ensure_pot_server = lambda wait=25.0: calls.append("start")
+        youfish.stop_pot_server = lambda: calls.append("stop")
+        youfish.pot_status = lambda: {"status": 1}
+        self.assertEqual(youfish.set_pot_enabled(True), {"status": 1})
+        self.assertIs(youfish.get_settings()["pot_provider"], True)
+        youfish.set_pot_enabled(False)
+        self.assertIs(youfish.get_settings()["pot_provider"], False)
+        self.assertEqual(calls, ["start", "stop"])
+
+    def test_update_pot_provider(self):
+        installs = []
+        youfish.install_pot_provider = lambda tag=None, persist_tag=False: (
+            installs.append((tag, persist_tag)) or {"ok": True})
+
+        def down(req, timeout=0, context=None):
+            raise urllib.error.URLError("offline")
+        urllib.request.urlopen = down
+        self.assertEqual(youfish._pot_latest_tag(), "")
+        self.assertEqual(youfish.update_pot_provider(), {"ok": False})
+        self.assertEqual(self.sent[-1][:2], ("pot_install_done", False))
+        self.assertEqual(installs, [])
+        urllib.request.urlopen = lambda req, timeout=0, context=None: _Download(b'{"tag_name":"1.4.0"}')
+        self.assertEqual(youfish.update_pot_provider(), {"ok": True})
+        self.assertEqual(installs, [("1.4.0", True)])     # the tag is persisted only by the install
+
+    def test_deno_version(self):
+        youfish._deno_path = lambda: None
+        self.assertEqual(youfish.deno_version(), "")
+        deno = _script(os.path.join(self._tmp, "deno"),
+                       "echo 'deno 2.1.4 (stable, release, aarch64-unknown-linux-gnu)'\necho 'v8 13'\n")
+        youfish._deno_path = lambda: deno
+        self.assertEqual(youfish.deno_version(), "2.1.4")
+
+    def test_git_path(self):
+        youfish.shutil.which = lambda name: "/opt/bin/git" if name == "git" else None
+        self.assertEqual(youfish._git_path(), "/opt/bin/git")
+        youfish.shutil.which = lambda name: None
+        self.assertIn(youfish._git_path(), (None, "/usr/bin/git", "/usr/local/bin/git",
+                                            os.path.expanduser("~/.local/bin/git")))
+
+
+class PotPortAndPing(unittest.TestCase):
+    """_pot_ready_on_port / _pot_http_ping against real localhost sockets: a bound port is
+    'running', only an HTTP answer (even an error status) is 'responding', a wedged server that
+    accepts but never answers is not, and /ping's version is read."""
+
+    def setUp(self):
+        self._port = youfish._POT_PORT
+
+    def tearDown(self):
+        youfish._POT_PORT = self._port
+
+    def _serve(self, status, body):
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(h):
+                h.send_response(status)
+                h.send_header("Content-Length", str(len(body)))
+                h.end_headers()
+                h.wfile.write(body)
+
+            def log_message(h, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        _threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        youfish._POT_PORT = srv.server_address[1]
+
+    def test_answering_server(self):
+        self._serve(200, b'{"version": "1.3.2"}')
+        self.assertTrue(youfish._pot_ready_on_port())
+        self.assertEqual(youfish._pot_http_ping(), {"ok": True, "version": "1.3.2"})
+
+    def test_error_status_still_counts_as_alive(self):
+        self._serve(500, b"boom")
+        self.assertEqual(youfish._pot_http_ping(), {"ok": True, "version": ""})
+
+    def test_non_json_body(self):
+        self._serve(200, b"pong")
+        self.assertEqual(youfish._pot_http_ping(), {"ok": True, "version": ""})
+
+    def test_wedged_and_closed_ports(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)                                   # accepts, never answers
+        self.addCleanup(s.close)
+        youfish._POT_PORT = s.getsockname()[1]
+        self.assertTrue(youfish._pot_ready_on_port())
+        self.assertEqual(youfish._pot_http_ping(timeout=0.3), {"ok": False, "version": ""})
+        s.close()
+        self.assertFalse(youfish._pot_ready_on_port())
+        self.assertEqual(youfish._pot_http_ping(), {"ok": False, "version": ""})
+
+
+class PotDiagnostics(_Restore):
+    """pot_diagnostics, the copy-paste health report: its verdict, a crashed sidecar's exit code,
+    a failed restart and a plugin yt-dlp doesn't load must all show in it."""
+    SAVE = ("_pot_installed", "get_settings", "_pot_ready_on_port", "_ensure_pot_server",
+            "_deno_path", "_git_path", "_ytdlp_path", "_ffmpeg_path", "_pot_http_ping",
+            "_pot_plugin_probe", "deno_version", "ytdlp_version", "ffmpeg_version",
+            "_it_fallback_report", "_pot_server_log_tail", "_pot_proc", "_pot_last_error",
+            "_pot_effective_tag", "_data_dir")
+
+    def setUp(self):
+        super().setUp()
+        self.port, self.restarts, self.installed = [True], [], [True]
+        self.settings = {"pot_provider": True}
+        self.probe = {"checked": True, "loaded": True, "detail": "/repo", "js_runtimes": "deno 2.1",
+                      "bgutil_lines": ""}
+        youfish._pot_installed = lambda: self.installed[0]
+        youfish.get_settings = lambda: self.settings
+        youfish._pot_ready_on_port = lambda timeout=0.25: self.port[0]
+        youfish._ensure_pot_server = lambda wait=25.0: self.restarts.append(1) and False
+        youfish._deno_path = lambda: "/d/deno"
+        youfish._git_path = lambda: "/usr/bin/git"
+        youfish._ytdlp_path = lambda: "/d/yt-dlp"
+        youfish._ffmpeg_path = lambda: None
+        youfish._pot_http_ping = lambda timeout=1.5: {"ok": True, "version": "1.3.2"}
+        youfish._pot_plugin_probe = lambda timeout=30: self.probe
+        youfish.deno_version = lambda: "2.1.4"
+        youfish.ytdlp_version = lambda fresh=False: "2026.10.01"
+        youfish.ffmpeg_version = lambda: ""
+        youfish._it_fallback_report = lambda: ["InnerTube fast path: player client VISIONOS"]
+        youfish._pot_server_log_tail = lambda n=30: "Started POT server"
+        youfish._pot_proc = None
+        youfish._pot_last_error = ""
+        youfish._pot_effective_tag = lambda: "1.3.2"
+        youfish._data_dir = lambda: "/data"
+
+    def test_working(self):
+        d = youfish.pot_diagnostics()
+        r = d["report"]
+        for line in ("Deno   : /d/deno  (v2.1.4)", "yt-dlp : /d/yt-dlp  (2026.10.01)",
+                     "ffmpeg : not installed", "InnerTube fast path: player client VISIONOS",
+                     "provider installed : yes (1.3.2)", "answering HTTP     : yes (server v1.3.2)",
+                     "plugin in yt-dlp   : loads (/repo)", "verdict            : working",
+                     "--- server.log (last lines) ---\nStarted POT server",
+                     "server process     : not started in this app session"):
+            self.assertIn(line, r)
+        self.assertEqual(self.restarts, [])
+        self.assertEqual((d["responding"], d["plugin_loaded"], d["ffmpeg"], d["prev_exit"]),
+                         (True, True, False, None))
+
+    def test_unloaded_plugin_is_not_working(self):
+        self.probe.update(loaded=False, detail="none")
+        r = youfish.pot_diagnostics()["report"]
+        self.assertIn("plugin in yt-dlp   : NOT LOADED — none", r)
+        self.assertIn("verdict            : NOT working", r)
+
+    def test_crashed_sidecar_and_failed_restart(self):
+        self.port[0] = False
+        youfish._pot_proc = types.SimpleNamespace(poll=lambda: -11)
+        youfish._pot_last_error = "NotCapable: net"
+        d = youfish.pot_diagnostics()
+        self.assertEqual(self.restarts, [1])
+        self.assertEqual(d["prev_exit"], -11)
+        self.assertIn("STARTED, then EXITED (code -11)", d["report"])
+        self.assertIn("restart attempt    : FAILED — NotCapable: net", d["report"])
+        self.assertIn("verdict            : NOT working", d["report"])
+        self.assertIn("last error         : NotCapable: net", d["report"])
+
+    def test_switched_off_and_not_set_up(self):
+        self.settings.clear()
+        self.port[0] = False
+        self.assertIn("verdict            : installed but switched off",
+                      youfish.pot_diagnostics()["report"])
+        self.assertEqual(self.restarts, [])               # off: no restart attempt
+        self.installed[0] = False
+        youfish._pot_plugin_probe = lambda timeout=30: self.fail("probe without an install")
+        d = youfish.pot_diagnostics()
+        self.assertIn("verdict            : not set up", d["report"])
+        self.assertIsNone(d["plugin_loaded"])
+
+
+class PrewarmWiring(_Restore):
+    """prewarm (the first py call at launch): arms the delayed yt-dlp import ONCE, mints the
+    InnerTube visitor id off-thread, and starts the PO-token sidecar only when the provider is on;
+    the delayed import and the debug spawn-tax probe behave."""
+    SAVE = ("threading", "_ytdlp_warm_armed", "_autofetch_zipapp", "_pot_rotate_log", "_pot_active",
+            "_ensure_pot_server", "_import_yt_dlp", "_DEBUG", "_spawn_tax_probe", "_it",
+            "_force_ipv4", "_tlog", "_plog", "_ytdlp_path")
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        youfish.threading = _InlineThreading(run=False)
+        youfish._ytdlp_warm_armed = False
+        youfish._autofetch_zipapp = lambda: self.calls.append("autofetch")
+        youfish._pot_rotate_log = lambda: self.calls.append("rotate")
+        youfish._pot_active = lambda: False
+        youfish._ensure_pot_server = lambda wait=25.0: None
+        youfish._force_ipv4 = lambda: None
+        self.logs = []
+        youfish._tlog = youfish._plog = self.logs.append
+
+    def test_import_is_armed_once(self):
+        youfish.prewarm()
+        youfish.prewarm()
+        made = youfish.threading.made
+        timers = [m for m in made if m.interval is not None]
+        self.assertEqual(len(timers), 1)
+        self.assertEqual((timers[0].interval, timers[0].target, timers[0].daemon),
+                         (youfish._YTDLP_WARM_DELAY, youfish._delayed_ytdlp_warm, True))
+        self.assertEqual([m.name for m in made if m.interval is None],
+                         ["innertube-prewarm", "innertube-prewarm"])
+        self.assertEqual(self.calls, ["autofetch", "rotate"] * 2)
+
+    def test_sidecar_starts_only_when_active(self):
+        youfish._pot_active = lambda: True
+        youfish.prewarm()
+        pot = [m for m in youfish.threading.made if m.name == "pot-prewarm"]
+        self.assertEqual(len(pot), 1)
+        self.assertIs(pot[0].target, youfish._ensure_pot_server)
+
+    def test_delayed_warm(self):
+        youfish._import_yt_dlp = lambda: self.calls.append("import")
+        youfish._spawn_tax_probe = lambda: self.calls.append("tax")
+        youfish._DEBUG = False
+        youfish._delayed_ytdlp_warm()
+        youfish._DEBUG = True
+        youfish._delayed_ytdlp_warm()
+        self.assertEqual(self.calls, ["import", "import", "tax"])
+
+    def test_innertube_prewarm(self):
+        youfish._it = lambda: None
+        youfish._innertube_prewarm()                       # FinTune / no module: nothing to do
+        minted = []
+        youfish._it = lambda: types.SimpleNamespace(visitor_data=lambda: minted.append(1))
+        youfish._innertube_prewarm()
+        self.assertEqual(minted, [1])
+
+        def offline():
+            raise OSError("offline")
+        youfish._it = lambda: types.SimpleNamespace(visitor_data=offline)
+        youfish._innertube_prewarm()                       # a failure is logged, never raised
+        self.assertTrue(any("prewarm failed" in m for m in self.logs))
+
+    def test_spawn_tax_probe(self):
+        youfish._DEBUG = False
+        youfish._ytdlp_path = lambda: self.fail("probe ran without YOUFISH_DEBUG")
+        youfish._spawn_tax_probe()
+        youfish._DEBUG = True
+        youfish._ytdlp_path = lambda: None
+        youfish._spawn_tax_probe()
+        self.assertIn("spawn_tax: yt-dlp not found", self.logs)
+        ytdlp = _script(os.path.join(self._tmp, "yt-dlp"), "echo 2026.10.01\n")
+        youfish._ytdlp_path = lambda: ytdlp
+        youfish._spawn_tax_probe()
+        self.assertTrue(self.logs[-1].startswith("spawn_tax "))
+        self.assertTrue(self.logs[-1].endswith("yt-dlp 2026.10.01"))
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "prctl is Linux-only")
+class PotDeathSignal(unittest.TestCase):
+    """_set_pdeathsig really arms PR_SET_PDEATHSIG = SIGKILL (the Deno sidecar's preexec_fn, so it
+    dies with the app). Checked on this process via PR_GET_PDEATHSIG, then put back."""
+
+    def test_arms_sigkill(self):
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        before = ctypes.c_int()
+        libc.prctl(2, ctypes.byref(before))               # PR_GET_PDEATHSIG
+        try:
+            youfish._set_pdeathsig()
+            now = ctypes.c_int()
+            libc.prctl(2, ctypes.byref(now))
+            self.assertEqual(now.value, int(youfish.signal.SIGKILL))
+        finally:
+            libc.prctl(1, before.value)                   # PR_SET_PDEATHSIG back to what it was
+
+class InnertubeModuleLoad(unittest.TestCase):
+    """_it: imports innertube once, pins IPv4 BEFORE its pool can open a socket, and a missing
+    module reads as None (yt-dlp only) without retrying the import on every call."""
+
+    def setUp(self):
+        self.state = dict(youfish._INNERTUBE)
+        self._f, self._p = youfish._force_ipv4, youfish._plog
+        youfish._INNERTUBE.update(mod=None, tried=False)
+        self.forced = []
+        youfish._force_ipv4 = lambda: self.forced.append(1)
+        youfish._plog = lambda m: None
+
+    def tearDown(self):
+        youfish._INNERTUBE.clear()
+        youfish._INNERTUBE.update(self.state)
+        youfish._force_ipv4, youfish._plog = self._f, self._p
+        sys.modules["innertube"] = innertube
+
+    def test_loads_once_after_pinning_ipv4(self):
+        self.assertIs(_REAL_IT(), innertube)
+        self.assertIs(_REAL_IT(), innertube)
+        self.assertEqual(self.forced, [1])
+
+    def test_missing_module_is_none(self):
+        sys.modules["innertube"] = None                   # import innertube -> ImportError
+        self.assertIsNone(_REAL_IT())
+        sys.modules["innertube"] = innertube
+        self.assertIsNone(_REAL_IT())                     # not retried
+        self.assertTrue(youfish._INNERTUBE["tried"])
+
+
+class PrefetchResolve(_Restore):
+    """prefetch_resolve: one background resolve per video (deduped), at most 2 at once (over the cap
+    it is dropped, not queued), and a prefetch thread never starts the PO-token sidecar."""
+    SAVE = ("_resolve_key", "_resolve_cache_get", "_resolve_and_cache", "_pot_active",
+            "_pot_ready_on_port", "prewarm", "threading", "_prefetch_sema")
+
+    def setUp(self):
+        super().setUp()
+        self._pending = set(youfish._prefetch_pending)
+        youfish._prefetch_pending.clear()
+        self.resolved = []
+        youfish._resolve_key = lambda vid: "k:" + vid
+        youfish._resolve_cache_get = lambda key: None
+        youfish._resolve_and_cache = lambda vid, key, speculative=False: self.resolved.append(
+            (vid, key, speculative))
+        youfish._pot_active = lambda: False
+        youfish.threading = _InlineThreading(run=False)
+        youfish._prefetch_sema = _threading.BoundedSemaphore(2)
+
+    def tearDown(self):
+        youfish._prefetch_pending.clear()
+        youfish._prefetch_pending.update(self._pending)
+        super().tearDown()
+
+    def _run_last(self):
+        youfish.threading.made[-1].target()
+
+    def test_empty_and_cached(self):
+        self.assertEqual(youfish.prefetch_resolve(""), {"ok": True, "queued": False})
+        youfish._resolve_cache_get = lambda key: {"payload": {}}
+        self.assertEqual(youfish.prefetch_resolve("abc"),
+                         {"ok": True, "queued": False, "cached": True})
+        self.assertEqual(youfish.threading.made, [])
+
+    def test_deduped_while_in_flight(self):
+        self.assertEqual(youfish.prefetch_resolve("abc", speculative=True),
+                         {"ok": True, "queued": True})
+        self.assertEqual(youfish.prefetch_resolve("abc"),
+                         {"ok": True, "queued": False, "inflight": True})
+        self.assertEqual(len(youfish.threading.made), 1)
+        self._run_last()
+        self.assertEqual(self.resolved, [("abc", "k:abc", True)])
+        self.assertEqual(youfish._prefetch_pending, set())
+        self.assertTrue(youfish.prefetch_resolve("abc")["queued"])     # done: may run again
+
+    def test_over_the_cap_is_dropped(self):
+        youfish._prefetch_sema = _threading.BoundedSemaphore(1)
+        youfish._prefetch_sema.acquire()
+        youfish.prefetch_resolve("abc")
+        self._run_last()
+        self.assertEqual(self.resolved, [])
+        self.assertEqual(youfish._prefetch_pending, set())
+
+    def test_failed_resolve_frees_its_slot(self):
+        def boom(*a, **k):
+            raise RuntimeError("yt-dlp died")
+        youfish._resolve_and_cache = boom
+        youfish._prefetch_sema = _threading.BoundedSemaphore(1)
+        youfish.prefetch_resolve("abc")
+        self._run_last()
+        self.assertTrue(youfish._prefetch_sema.acquire(blocking=False))
+        self.assertEqual(youfish._prefetch_pending, set())
+
+    def test_never_starts_the_sidecar_itself(self):
+        youfish._pot_active = lambda: True
+        youfish._pot_ready_on_port = lambda timeout=0.25: False
+        warmed = []
+        youfish.prewarm = lambda: warmed.append(1)
+        youfish.prefetch_resolve("abc")
+        self._run_last()
+        self.assertEqual((warmed, self.resolved, youfish._prefetch_pending), ([1], [], set()))
+
+    def test_thread_start_failure(self):
+        youfish.threading = _InlineThreading(fail=True)
+        self.assertEqual(youfish.prefetch_resolve("abc"),
+                         {"ok": False, "queued": False, "error": "spawn failed"})
+        self.assertEqual(youfish._prefetch_pending, set())
+
+
+class ProxyReapIdle(unittest.TestCase):
+    """_reap_one_idle_locked frees a proxy slot by dropping the least-recently-active stream no
+    connection holds, never one that is playing; _reap_proc never raises on a stuck child."""
+
+    def setUp(self):
+        self._streams, self._rl = youfish._streams, youfish._reap_locked
+        self.reaped = []
+        youfish._reap_locked = lambda s: self.reaped.append(s.vid)
+
+    def tearDown(self):
+        youfish._streams, youfish._reap_locked = self._streams, self._rl
+
+    @staticmethod
+    def _s(vid, refs, last_active):
+        return types.SimpleNamespace(vid=vid, refs=refs, last_active=last_active,
+                                     cond=_threading.Condition())
+
+    def test_reaps_oldest_idle_only(self):
+        youfish._streams = {("a", 1): self._s("a", 0, 50), ("b", 1): self._s("b", 1, 10),
+                            ("c", 1): self._s("c", 0, 20)}
+        youfish._reap_one_idle_locked()
+        self.assertEqual(self.reaped, ["c"])                  # b is older but playing
+        youfish._reap_one_idle_locked()
+        youfish._reap_one_idle_locked()
+        self.assertEqual(self.reaped, ["c", "a"])
+        self.assertEqual(list(youfish._streams), [("b", 1)])
+
+    def test_reap_proc(self):
+        waits = []
+        youfish._reap_proc(None)
+        youfish._reap_proc(types.SimpleNamespace(wait=lambda timeout=None: waits.append(timeout)))
+
+        def stuck(timeout=None):
+            raise youfish.subprocess.TimeoutExpired("yt-dlp", timeout)
+        youfish._reap_proc(types.SimpleNamespace(wait=stuck))
+        self.assertEqual(waits, [5])
+
+
+class ProbeUrlOk(_Restore):
+    """_probe_url_ok (the token-free → token escalation trigger): only a definite 403 says no; a
+    timeout or another status never makes resolve pay for the slower client. Plus _url_shape,
+    the identity-free URL summary in debug logs."""
+    SAVE = ("_force_ipv4",)
+
+    def setUp(self):
+        super().setUp()
+        youfish._force_ipv4 = lambda: None
+        self.reqs = []
+
+    def _answer(self, outcome):
+        def fake(req, timeout=None):
+            self.reqs.append(req)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _FakeHttpResp(206, b"ab")
+        urllib.request.urlopen = fake
+
+    def test_serving_url(self):
+        self._answer(None)
+        self.assertTrue(youfish._probe_url_ok("https://r1.googlevideo.com/v", "UA/1"))
+        self.assertEqual(self.reqs[0].get_header("Range"), "bytes=0-1")
+        self.assertEqual(self.reqs[0].get_header("User-agent"), "UA/1")
+        youfish._probe_url_ok("https://r1.googlevideo.com/v", "")
+        self.assertEqual(self.reqs[1].get_header("User-agent"), youfish._BROWSER_UA)
+
+    def test_only_403_says_no(self):
+        def err(code):
+            return urllib.error.HTTPError("https://r1.googlevideo.com/v", code, "x", {}, None)
+        self._answer(err(403))
+        self.assertFalse(youfish._probe_url_ok("https://r1.googlevideo.com/v", "UA"))
+        for maybe in (err(404), err(503), urllib.error.URLError("dns"), socket.timeout("slow")):
+            self._answer(maybe)
+            self.assertTrue(youfish._probe_url_ok("https://r1.googlevideo.com/v", "UA"))
+
+    def test_no_url_is_not_probed(self):
+        self._answer(None)
+        self.assertTrue(youfish._probe_url_ok("", "UA"))
+        self.assertEqual(self.reqs, [])
+
+    def test_url_shape(self):
+        exp = int(time.time()) + 600
+        s = youfish._url_shape("https://r1.googlevideo.com/videoplayback?c=VISIONOS&ip=203.0.113.1"
+                               "&n=abc&expire=%d&sparams=expire,ip" % exp)
+        m = re.match(r"c=VISIONOS ip=v4 n=y pot=- exp=\+(\d+)s sparams=expire,ip$", s)
+        self.assertTrue(m, s)
+        self.assertTrue(590 <= int(m.group(1)) <= 600)
+        self.assertIn("ip=v6", youfish._url_shape("https://x/v?ip=2001:db8::1&pot=T"))
+        self.assertEqual(youfish._url_shape("https://x/v"), "c=? ip=- n=- pot=- exp=+0s sparams=")
+
+
+class WatchStateStore(_TmpDataDir):
+    """watch_state: the whole watch map the thumbnails read, straight from watch_history.json."""
+
+    def test_reads_the_history_store(self):
+        self.assertEqual(youfish.watch_state(), {})
+        youfish.set_watched("dQw4w9WgXcQ", True, "T", "C")
+        st = youfish.watch_state()
+        self.assertEqual(st["dQw4w9WgXcQ"]["w"], 1)
+        self.assertEqual(st, youfish._load_watch_history())
+
+
+class SponsorSegmentsFetch(_Restore):
+    """_sponsor_segments_fetch: SponsorBlock's answer → sorted, sane segments. No segments (404) is
+    a valid empty answer; an outage is ok:False, so it isn't cached as 'nothing to skip'."""
+    SAVE = ("_force_ipv4",)
+
+    def setUp(self):
+        super().setUp()
+        youfish._force_ipv4 = lambda: None
+        self.urls = []
+
+    def _answer(self, outcome):
+        def fake(req, timeout=None):
+            self.urls.append(req.full_url)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return _Download(json.dumps(outcome).encode())
+        urllib.request.urlopen = fake
+
+    def test_segments(self):
+        self._answer([{"segment": [30, 40.5], "category": "outro"},
+                      {"segment": [5, 12], "category": "sponsor"},
+                      {"segment": [20, 20], "category": "intro"},       # empty: dropped
+                      {"segment": [1], "category": "selfpromo"}])       # malformed: dropped
+        r = youfish._sponsor_segments_fetch("a b&c")
+        self.assertEqual(r, {"ok": True, "segments": [
+            {"start": 5.0, "end": 12.0, "category": "sponsor"},
+            {"start": 30.0, "end": 40.5, "category": "outro"}]})
+        self.assertIn("videoID=a%20b%26c&categories=", self.urls[0])
+        self.assertTrue(self.urls[0].startswith("https://sponsor.ajay.app/api/skipSegments?"))
+
+    def test_none_vs_outage(self):
+        def err(code):
+            return urllib.error.HTTPError("https://sponsor.ajay.app", code, "x", {}, None)
+        self._answer(err(404))
+        self.assertEqual(youfish._sponsor_segments_fetch("v"), {"ok": True, "segments": []})
+        for bad in (err(500), urllib.error.URLError("offline")):
+            self._answer(bad)
+            self.assertEqual(youfish._sponsor_segments_fetch("v"), {"ok": False, "segments": []})
+        self._answer({"message": "odd"})
+        self.assertEqual(youfish._sponsor_segments_fetch("v"), {"ok": True, "segments": []})
+
+
+class YoutubeAccountWrappers(_Restore):
+    """The youtube_* QML wrappers over ytm: they pass ytm's answers through, fall back to a safe
+    signed-out shape when ytm fails or is missing, and every login/account change drops the
+    resolve cache (signed-in extraction differs)."""
+    SAVE = ("invalidate_resolve_cache",)
+
+    def setUp(self):
+        super().setUp()
+        self._ytm = sys.modules.get("ytm")
+        self.inval = []
+        youfish.invalidate_resolve_cache = lambda: self.inval.append(1)
+        self.calls = []
+        c = self.calls
+        sys.modules["ytm"] = types.SimpleNamespace(
+            login_status=lambda: {"logged_in": True, "count": 9},
+            import_browser_login=lambda: c.append("import") or {"ok": True, "count": 9},
+            logout=lambda: c.append("logout") or {"logged_in": False},
+            list_accounts=lambda: {"ok": True, "accounts": [{"name": "Me"}]},
+            select_account=lambda *a: c.append(a) or {"ok": True, "name": a[3]},
+            selected_account=lambda: {"authuser": "1", "page_id": "P", "name": "Brand"})
+
+    def tearDown(self):
+        if self._ytm is not None:
+            sys.modules["ytm"] = self._ytm
+        else:
+            sys.modules.pop("ytm", None)
+        super().tearDown()
+
+    def test_pass_through(self):
+        self.assertEqual(youfish.youtube_login_status(), {"logged_in": True, "count": 9})
+        self.assertEqual(youfish.youtube_import_login(), {"ok": True, "count": 9})
+        self.assertEqual(youfish.youtube_list_accounts()["accounts"], [{"name": "Me"}])
+        self.assertEqual(youfish.youtube_select_account("1", "P", "D", "Brand"),
+                         {"ok": True, "name": "Brand"})
+        self.assertEqual(youfish.youtube_selected_account()["name"], "Brand")
+        self.assertEqual(youfish.youtube_logout(), {"logged_in": False})
+        self.assertEqual(self.calls, ["import", ("1", "P", "D", "Brand"), "logout"])
+        self.assertEqual(len(self.inval), 3)              # import, select, logout
+
+    def test_failures_fall_back(self):
+        def boom(*a):
+            raise RuntimeError("cookie jar locked")
+        sys.modules["ytm"] = types.SimpleNamespace(**{n: boom for n in (
+            "login_status", "import_browser_login", "logout", "list_accounts", "select_account",
+            "selected_account")})
+        self.assertEqual(youfish.youtube_login_status(),
+                         {"logged_in": False, "count": 0, "imported_at": 0, "source": ""})
+        self.assertEqual(youfish.youtube_import_login(),
+                         {"ok": False, "count": 0, "error": "cookie jar locked"})
+        self.assertEqual(youfish.youtube_list_accounts(),
+                         {"ok": False, "accounts": [], "error": "cookie jar locked"})
+        self.assertEqual(youfish.youtube_select_account(),
+                         {"ok": False, "error": "cookie jar locked"})
+        self.assertEqual(youfish.youtube_selected_account(),
+                         {"authuser": "0", "page_id": "", "name": ""})
+        self.assertEqual(youfish.youtube_logout(), {"logged_in": False})
+        self.assertEqual(len(self.inval), 1)              # only logout clears after a failure
+        sys.modules["ytm"] = None                         # module missing altogether
+        self.assertFalse(youfish.youtube_login_status()["logged_in"])
+
+
+class AvatarCacheLoad(_TmpDataDir):
+    """_load_avatar_cache: avatars survive a restart, minus entries past the TTL and anything
+    malformed; a corrupt file is an empty cache, not a crash."""
+
+    def _write(self, obj):
+        with open(youfish._avatar_cache_path(), "w") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def test_keeps_only_fresh_wellformed(self):
+        now = time.time()
+        self._write({"fresh": {"ts": now - 60, "res": {"thumbnail": "t"}},
+                     "old": {"ts": now - youfish._AVATAR_CACHE_TTL - 1, "res": {"thumbnail": "t"}},
+                     "bad_res": {"ts": now, "res": "t"}, "not_dict": [1]})
+        self.assertEqual(youfish._load_avatar_cache(),
+                         {"fresh": {"ts": now - 60, "res": {"thumbnail": "t"}}})
+
+    def test_missing_corrupt_or_wrong_type(self):
+        self.assertEqual(youfish._load_avatar_cache(), {})
+        self._write("{truncated")
+        self.assertEqual(youfish._load_avatar_cache(), {})
+        self._write([1, 2])
+        self.assertEqual(youfish._load_avatar_cache(), {})
+
+
+class ChannelFeedRss(_TmpDataDir):
+    """channel_feed_rss: the channel page's instant first paint from RSS. Only a UC id or
+    /channel/UC… URL can use it; anything else (or a failed fetch) says ok:False so the page falls
+    back to channel_videos; the hide-Shorts setting applies."""
+    XML = ("<feed><title>Chan &amp; Co</title>"
+           "<entry><yt:videoId>aaaaaaaaaaa</yt:videoId><title>One &amp; two</title>"
+           "<published>2026-10-01T00:00:00+00:00</published><author><name></name></author>"
+           '<link rel="alternate" href="https://www.youtube.com/watch?v=aaaaaaaaaaa"/>'
+           '<media:statistics views="12"/></entry>'
+           "<entry><yt:videoId>bbbbbbbbbbb</yt:videoId><title>Short</title>"
+           "<author><name>Other</name></author>"
+           '<link rel="alternate" href="https://www.youtube.com/shorts/bbbbbbbbbbb"/></entry></feed>')
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {n: getattr(youfish, n) for n in ("_rss_get", "_hide_shorts")}
+        self.fetched = []
+        youfish._rss_get = lambda cid: self.fetched.append(cid) or self.XML
+        youfish._hide_shorts = lambda: True
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(youfish, n, v)
+        super().tearDown()
+
+    def test_first_paint(self):
+        r = youfish.channel_feed_rss("UCabc")
+        self.assertTrue(r["ok"] and r["has_more"])
+        self.assertEqual(r["channel"]["name"], "Chan & Co")
+        self.assertEqual(r["channel"]["url"], "https://www.youtube.com/channel/UCabc")
+        self.assertEqual([i["id"] for i in r["items"]], ["aaaaaaaaaaa"])     # Short hidden
+        it = r["items"][0]
+        self.assertEqual((it["title"], it["uploader"], it["views"], it["live"]),
+                         ("One & two", "Chan & Co", 12, 0))
+        self.assertTrue(it["posted"])
+
+    def test_shorts_shown_when_not_hidden(self):
+        youfish._hide_shorts = lambda: False
+        r = youfish.channel_feed_rss("https://www.youtube.com/channel/UCabc/videos")
+        self.assertEqual(self.fetched, ["UCabc"])
+        self.assertEqual([i["uploader"] for i in r["items"]], ["Chan & Co", "Other"])
+
+    def test_needs_a_channel_id(self):
+        for ref in ("@handle", "https://www.youtube.com/@handle", "", None, "UCx/videos"):
+            self.assertEqual(youfish.channel_feed_rss(ref), {"ok": False, "items": []})
+        self.assertEqual(self.fetched, [])
+
+        def fail(cid):
+            raise IOError("HTTP 404")
+        youfish._rss_get = fail
+        self.assertEqual(youfish.channel_feed_rss("UCabc"), {"ok": False, "items": []})
+
+
+class YoutubePlaylists(_TmpDataDir):
+    """youtube_playlist / save_youtube_playlist / refresh_playlist / channel_playlists: the yt-dlp
+    listing calls behind the library's YouTube playlists. Saving dedupes by list id, a failed
+    refresh keeps the stored items, and a channel without a Playlists tab falls back to Releases."""
+    PL = {"id": "PLx", "title": "Mix", "uploader": "Someone", "entries": [
+        {"id": "aaaaaaaaaaa", "title": "A", "duration": 61, "channel": "Ch"},
+        {"title": "no id"},
+        {"id": "bbbbbbbbbbb", "live_status": "is_live"}]}
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {n: getattr(youfish, n) for n in ("_ytdlp_path", "_ytdlp_run", "_cookies_args")}
+        youfish._ytdlp_path = lambda: "/fake/yt-dlp"
+
+        @contextlib.contextmanager
+        def no_cookies():
+            yield []
+        youfish._cookies_args = no_cookies
+        self.answers, self.runs = {}, []
+
+        def run(path, argv, timeout):
+            self.runs.append(argv)
+            a = self.answers.get(argv[-1], "ERROR: [youtube:tab] not found")
+            if isinstance(a, dict):
+                return types.SimpleNamespace(returncode=0, stdout=json.dumps(a), stderr="")
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=a)
+        youfish._ytdlp_run = run
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(youfish, n, v)
+        super().tearDown()
+
+    URL = "https://www.youtube.com/playlist?list=PLx"
+
+    def test_playlist(self):
+        self.answers[self.URL] = self.PL
+        r = youfish.youtube_playlist("PLx")
+        self.assertEqual((r["ok"], r["title"], r["uploader"], r["yt_id"]), (True, "Mix", "Someone", "PLx"))
+        self.assertEqual([(i["id"], i["title"], i["uploader"], i["duration"], i["live"])
+                          for i in r["items"]],
+                         [("aaaaaaaaaaa", "A", "Ch", 61, 0), ("bbbbbbbbbbb", "(untitled)", "", 0, 1)])
+        argv = self.runs[0]
+        self.assertEqual(argv[argv.index("--playlist-end") + 1], "200")
+        self.assertEqual(argv[-2:], ["--", self.URL])
+
+    def test_playlist_errors(self):
+        self.answers[self.URL] = "ERROR: [youtube:tab] PLx: The playlist does not exist."
+        r = youfish.youtube_playlist(self.URL)
+        self.assertFalse(r["ok"])
+        self.assertIn("does not exist", r["error"])
+        youfish._ytdlp_path = lambda: None
+        self.assertEqual(youfish.youtube_playlist("PLx"), {"ok": False, "error": "yt-dlp not found"})
+
+    def test_save_dedupes_and_refresh_updates(self):
+        self.answers[self.URL] = self.PL
+        self.assertTrue(youfish.save_youtube_playlist("PLx")["ok"])
+        self.answers[self.URL] = dict(self.PL, title="Mix (renamed)")
+        youfish.save_youtube_playlist(self.URL)
+        lst = youfish._load_playlists()
+        self.assertEqual(len(lst), 1)
+        self.assertEqual((lst[0]["kind"], lst[0]["yt_id"], lst[0]["title"]),
+                         ("youtube", "PLx", "Mix (renamed)"))
+        pid = lst[0]["id"]
+        self.answers[self.URL] = dict(self.PL, entries=[{"id": "ccccccccccc", "title": "New"}])
+        r = youfish.refresh_playlist(pid)
+        self.assertEqual([i["id"] for i in r["playlist"]["items"]], ["ccccccccccc"])
+        self.answers[self.URL] = "ERROR: HTTP Error 503"
+        self.assertFalse(youfish.refresh_playlist(pid)["ok"])
+        self.assertEqual([i["id"] for i in youfish.get_playlist(pid)["playlist"]["items"]],
+                         ["ccccccccccc"])                  # a failed refresh keeps the items
+        self.assertFalse(youfish.save_youtube_playlist("PLgone")["ok"])
+        self.assertEqual(len(youfish._load_playlists()), 1)
+
+    def test_refresh_leaves_local_playlists_alone(self):
+        local = youfish.create_playlist("Mine")
+        pid = next(p["id"] for p in youfish._load_playlists())
+        self.assertEqual(youfish.refresh_playlist(pid)["playlist"]["kind"], "local")
+        self.assertEqual(self.runs, [])
+        self.assertIsNotNone(local)
+
+    def test_channel_playlists(self):
+        base = "https://www.youtube.com/@x"
+        self.answers[base + "/playlists"] = {"entries": [
+            {"id": "PL1", "title": "P", "playlist_count": 3}, {"title": "no id"}, {"id": "PL2"}]}
+        r = youfish.channel_playlists(base + "/videos")
+        self.assertEqual([(i["yt_id"], i["title"], i["count"]) for i in r["items"]],
+                         [("PL1", "P", 3), ("PL2", "(playlist)", 0)])
+        self.assertEqual(len(self.runs), 1)
+
+    def test_channel_playlists_falls_back_to_releases(self):
+        base = "https://www.youtube.com/channel/UCm"
+        self.answers[base + "/playlists"] = {"entries": []}
+        self.answers[base + "/releases"] = {"entries": [{"id": "OLAK5", "title": "Album"}]}
+        r = youfish.channel_playlists("UCm")
+        self.assertEqual([i["yt_id"] for i in r["items"]], ["OLAK5"])
+        self.assertEqual([a[-1] for a in self.runs], [base + "/playlists", base + "/releases"])
+        self.assertEqual(youfish.channel_playlists("UCnothing"), {"ok": True, "items": []})
+        youfish._ytdlp_path = lambda: None
+        self.assertFalse(youfish.channel_playlists("UCm")["ok"])
+
+
+class InprocDebugHooks(_Restore):
+    """The YOUFISH_DEBUG instrumentation of in-process yt-dlp: its logger stays silent unless
+    debugging, and the Deno-share probe counts only deno spawns, only on a thread that armed it,
+    and wraps Popen once."""
+    SAVE = ("_DEBUG", "_tlog", "_orig_popen")
+
+    def setUp(self):
+        super().setUp()
+        self._popen = youfish.subprocess.Popen
+        self.logs = []
+        youfish._tlog = self.logs.append
+
+    def tearDown(self):
+        youfish.subprocess.Popen = self._popen
+        if hasattr(youfish._inproc_tls, "deno"):
+            del youfish._inproc_tls.deno
+        super().tearDown()
+
+    def test_logger(self):
+        lg = youfish._InprocLogger()
+        youfish._DEBUG = False
+        for m in (lg.debug, lg.info, lg.warning, lg.error):
+            m("noise")
+        self.assertEqual(self.logs, [])
+        youfish._DEBUG = True
+        lg.warning("still quiet")
+        lg.error("x" * 300)
+        self.assertEqual(self.logs, ["inproc yt-dlp error: " + "x" * 200])
+
+    def test_deno_probe_counts_only_armed_deno_spawns(self):
+        deno = _script(os.path.join(self._tmp, "deno"), "exit 0\n")
+        other = _script(os.path.join(self._tmp, "ffprobe"), "exit 0\n")
+        youfish._orig_popen = None
+        youfish._inproc_install_deno_probe()
+        wrapped = youfish.subprocess.Popen
+        self.assertIsNot(wrapped, self._popen)
+        youfish._inproc_install_deno_probe()
+        self.assertIs(youfish.subprocess.Popen, wrapped)       # idempotent: wrapped once
+        youfish.subprocess.run([deno])                         # not armed on this thread
+        acc = [0, 0.0]
+        youfish._inproc_tls.deno = acc
+        self.assertEqual(youfish.subprocess.run([deno], capture_output=True).returncode, 0)
+        youfish.subprocess.run([other])
+        p = youfish.subprocess.Popen([deno])
+        p.wait()
+        p.wait()                                               # one process counts once
+        self.assertEqual(acc[0], 2)
+        self.assertGreaterEqual(acc[1], 0.0)
+
+
+class _PoolConn:
+    """A fake http.client.HTTPSConnection for innertube's pool. `fail` makes the next request()
+    raise (a keep-alive socket the server already closed)."""
+    def __init__(self, test, host, timeout=None):
+        self.host, self.timeout, self.test = host, timeout, test
+        self.sock = types.SimpleNamespace(settimeout=lambda t: setattr(self, "sock_timeout", t))
+        self.sock_timeout, self.closed, self.fail, self.sent = None, False, False, []
+        test.conns.append(self)
+
+    def request(self, method, path, body=None, headers=None):
+        if self.fail:
+            self.fail = False
+            raise ConnectionResetError("peer closed")
+        self.sent.append((method, path, body, dict(headers or {})))
+
+    def getresponse(self):
+        status, data, hdrs, will_close = self.test.reply
+        return types.SimpleNamespace(status=status, read=lambda: data, will_close=will_close,
+                                     getheader=lambda n, d=None: hdrs.get(n, d), msg=hdrs)
+
+    def close(self):
+        self.closed = True
+
+
+class InnertubePool(unittest.TestCase):
+    """innertube.request, the keep-alive HTTPS pool every InnerTube call (and the feed's RSS) rides:
+    reuse, idle expiry, one retry on a dead reused socket (never on a fresh one), will_close,
+    the per-host cap, gunzip, and the env-proxy path through urllib."""
+    URL = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+
+    def setUp(self):
+        self._pool = dict(innertube._pool)
+        innertube._pool.clear()
+        self._conn = http.client.HTTPSConnection
+        self._proxies = urllib.request.getproxies
+        self._urlopen = urllib.request.urlopen
+        self.conns = []
+        http.client.HTTPSConnection = lambda host, timeout=None: _PoolConn(self, host, timeout)
+        urllib.request.getproxies = lambda: {}
+        self.reply = (200, b"ok", {}, False)
+
+    def tearDown(self):
+        http.client.HTTPSConnection = self._conn
+        urllib.request.getproxies = self._proxies
+        urllib.request.urlopen = self._urlopen
+        innertube._pool.clear()
+        innertube._pool.update(self._pool)
+
+    def test_reuses_one_connection(self):
+        st, data, hdrs = innertube.request("POST", self.URL, b"{}", {"X": "1"}, timeout=7)
+        self.assertEqual((st, data), (200, b"ok"))
+        innertube.request("GET", "https://www.youtube.com/feeds/videos.xml?channel_id=UC1", timeout=3)
+        self.assertEqual(len(self.conns), 1)
+        c = self.conns[0]
+        self.assertEqual((c.host, c.timeout, c.sock_timeout), ("www.youtube.com", 7, 3))
+        self.assertEqual(c.sent[0][:3], ("POST", "/youtubei/v1/browse?prettyPrint=false", b"{}"))
+        self.assertEqual(c.sent[0][3], {"X": "1", "Accept-Encoding": "gzip"})
+        self.assertEqual(c.sent[1][1], "/feeds/videos.xml?channel_id=UC1")
+
+    def test_idle_connection_expires(self):
+        innertube.request("GET", self.URL)
+        old = self.conns[0]
+        host = "www.youtube.com"
+        innertube._pool[host] = [(old, time.time() - innertube._POOL_IDLE_MAX - 1)]
+        innertube.request("GET", self.URL)
+        self.assertTrue(old.closed)
+        self.assertEqual(len(self.conns), 2)
+
+    def test_dead_reused_socket_is_retried_once(self):
+        innertube.request("GET", self.URL)
+        self.conns[0].fail = True
+        self.assertEqual(innertube.request("GET", self.URL)[1], b"ok")
+        self.assertTrue(self.conns[0].closed)
+        self.assertEqual(len(self.conns), 2)
+
+    def test_fresh_connection_failure_raises(self):
+        orig = http.client.HTTPSConnection
+
+        def failing(host, timeout=None):
+            c = orig(host, timeout)
+            c.fail = True
+            return c
+        http.client.HTTPSConnection = failing
+        with self.assertRaises(ConnectionResetError):
+            innertube.request("GET", self.URL)
+        self.assertEqual(len(self.conns), 1)              # no retry on a fresh socket
+        self.assertTrue(self.conns[0].closed)
+        self.assertEqual(innertube._pool.get("www.youtube.com", []), [])
+
+    def test_will_close_is_not_pooled(self):
+        self.reply = (404, b"", {}, True)
+        self.assertEqual(innertube.request("GET", self.URL)[0], 404)   # statuses come back, not raised
+        self.assertTrue(self.conns[0].closed)
+        self.assertEqual(innertube._pool.get("www.youtube.com", []), [])
+
+    def test_gzip_body(self):
+        self.reply = (200, gzip.compress(b'{"a": 1}'), {"Content-Encoding": "gzip"}, False)
+        self.assertEqual(innertube.request("GET", self.URL)[1], b'{"a": 1}')
+        self.assertEqual(_REAL_TRANSPORT("GET", self.URL), (200, b'{"a": 1}'))
+
+    def test_per_host_cap(self):
+        conns = [_PoolConn(self, "h") for _ in range(innertube._POOL_PER_HOST + 1)]
+        for c in conns:
+            innertube._put_conn("h", c)
+        self.assertEqual(len(innertube._pool["h"]), innertube._POOL_PER_HOST)
+        self.assertEqual([c.closed for c in conns].count(True), 1)
+        self.assertTrue(conns[-1].closed)
+
+    def test_env_proxy_goes_through_urllib(self):
+        urllib.request.getproxies = lambda: {"https": "http://proxy:3128"}
+        seen = []
+
+        def fake(req, timeout=None):
+            seen.append(req)
+            r = _Download(gzip.compress(b"hello"))
+            r.status, r.headers = 200, {"Content-Encoding": "gzip"}
+            return r
+        urllib.request.urlopen = fake
+        self.assertEqual(innertube.request("POST", self.URL, b"{}")[:2], (200, b"hello"))
+        self.assertEqual((seen[0].get_method(), seen[0].get_header("Accept-encoding")),
+                         ("POST", "gzip"))
+
+        def refused(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 429, "slow down", {}, io.BytesIO(b"later"))
+        urllib.request.urlopen = refused
+        self.assertEqual(innertube.request("GET", self.URL)[:2], (429, b"later"))
+        self.assertEqual(self.conns, [])
+
+    def test_reel_items(self):
+        it = innertube._from_reel({"videoId": "aaaaaaaaaaa", "headline": {"simpleText": "Reel"},
+                                   "viewCountText": {"simpleText": "1.2K views"}})
+        self.assertEqual((it["id"], it["title"], it["short"], it["views"]),
+                         ("aaaaaaaaaaa", "Reel", True, 1200))
+        self.assertIsNone(innertube._from_reel({"videoId": "short"}))
+        self.assertIsNone(innertube._from_reel({}))
+
+
+# --- ytm.py (cookie login): the cookie jar, SAPISIDHASH auth and the InnerTube identity ------- #
+
+class _FreshYtm(unittest.TestCase):
+    """Base: a freshly imported ytm.py over a throwaway data dir (other tests install a fake ytm).
+    Puts back the global socket/urllib/tempfile hooks the ytm tests replace."""
+
+    def setUp(self):
+        import importlib
+        self._prev = sys.modules.pop("ytm", None)
+        self.ytm = importlib.import_module("ytm")
+        self._tmp = tempfile.mkdtemp(prefix="ytm-")
+        self.ytm._data_dir = lambda: self._tmp
+        self._urlopen, self._gai, self._tempdir = (urllib.request.urlopen, socket.getaddrinfo,
+                                                   tempfile.tempdir)
+        self.logs = []
+        self.ytm._log = self.logs.append
+
+    def tearDown(self):
+        urllib.request.urlopen, socket.getaddrinfo, tempfile.tempdir = (self._urlopen, self._gai,
+                                                                        self._tempdir)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        if self._prev is not None:
+            sys.modules["ytm"] = self._prev
+        else:
+            sys.modules.pop("ytm", None)
+
+    def store(self, **c):
+        with open(self.ytm._cookies_path(), "w") as f:
+            json.dump(c, f)
+
+
+class YtmCookieJar(_FreshYtm):
+    """_read_cookie_jar: reads only google/youtube rows from the browser's cookies.sqlite, sees
+    rows still in a running browser's WAL, and leaves no copy of the live cookies behind."""
+    ROWS = [("SAPISID", "s1", ".youtube.com", "/", 2000000000, 1),
+            ("SID", "s2", ".google.com", "/", 0, 1),
+            ("other", "x", ".example.com", "/", 0, 0)]
+
+    def _jar(self, wal=False):
+        path = os.path.join(self._tmp, "cookies.sqlite")
+        con = sqlite3.connect(path)
+        if wal:
+            con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE moz_cookies (name, value, host, path, expiry, isSecure)")
+        con.executemany("INSERT INTO moz_cookies VALUES (?,?,?,?,?,?)", self.ROWS)
+        con.commit()
+        return path, con
+
+    def test_google_rows_only_and_no_copy_left(self):
+        path, con = self._jar()
+        con.close()
+        scratch = os.path.join(self._tmp, "scratch")
+        os.mkdir(scratch)
+        tempfile.tempdir = scratch
+        self.assertEqual(sorted(self.ytm._read_cookie_jar(path)), sorted(self.ROWS[:2]))
+        self.assertEqual(os.listdir(scratch), [])
+
+    def test_reads_a_running_browsers_wal(self):
+        path, con = self._jar(wal=True)                  # still open: the rows live in -wal
+        try:
+            self.assertTrue(os.path.exists(path + "-wal"))
+            self.assertEqual(len(self.ytm._read_cookie_jar(path)), 2)
+        finally:
+            con.close()
+
+    def test_missing_or_broken_jar(self):
+        self.assertEqual(self.ytm._read_cookie_jar(os.path.join(self._tmp, "nope.sqlite")), [])
+        bad = os.path.join(self._tmp, "bad.sqlite")
+        with open(bad, "w") as f:
+            f.write("not a database")
+        self.assertEqual(self.ytm._read_cookie_jar(bad), [])
+
+
+class YtmAuth(_FreshYtm):
+    """The signed-in request's credentials: SAPISIDHASH, the Cookie header + SAPISID (stored, or
+    derived from an older import's Netscape text with only the auth cookies), is_logged_in, the
+    gzip body reader and the IPv4 pin."""
+
+    def test_sapisidhash(self):
+        h = self.ytm._sapisidhash("SECRET", "https://www.youtube.com")
+        m = re.match(r"SAPISIDHASH (\d+)_([0-9a-f]{40})$", h)
+        self.assertTrue(m, h)
+        self.assertLessEqual(abs(int(m.group(1)) - time.time()), 5)
+        self.assertEqual(m.group(2), hashlib.sha1(
+            ("%s SECRET https://www.youtube.com" % m.group(1)).encode()).hexdigest())
+
+    def test_cookie_and_sapisid(self):
+        self.assertEqual(self.ytm._cookie_and_sapisid(), ("", ""))
+        self.assertFalse(self.ytm.is_logged_in())
+        rows = [("YSC", "p", ".youtube.com", "/", 0, 1), ("SAPISID", "plain", ".youtube.com", "/", 0, 1),
+                ("__Secure-3PAPISID", "s3", ".youtube.com", "/", 0, 1), ("SID", "sid", ".google.com", "/", 0, 1)]
+        self.store(ytdlp=self.ytm._netscape_from_rows(rows))
+        self.assertTrue(self.ytm.is_logged_in())
+        header, sapisid = self.ytm._cookie_and_sapisid()
+        self.assertEqual(sapisid, "s3")                  # the 3P one wins
+        self.assertNotIn("YSC", header)                  # not an auth cookie
+        vals = {"__Secure-3PAPISID": "s3", "SAPISID": "plain", "SID": "sid"}
+        self.assertEqual(header.split("; "), ["%s=%s" % (n, vals[n])
+                                              for n in self.ytm._AUTH_COOKIE_NAMES if n in vals])
+        self.assertIn("SAPISID=plain", header.split("; "))
+        self.store(cookie="A=1", sapisid="S", ytdlp="x")
+        self.assertEqual(self.ytm._cookie_and_sapisid(), ("A=1", "S"))
+
+    def test_read_body(self):
+        def resp(data, hdrs):
+            return types.SimpleNamespace(read=lambda: data, headers=hdrs)
+        self.assertEqual(self.ytm._read_body(resp(gzip.compress(b"x"), {"Content-Encoding": "GZIP"})), b"x")
+        self.assertEqual(self.ytm._read_body(resp(b"plain", {"Content-Encoding": "gzip"})), b"plain")
+        self.assertEqual(self.ytm._read_body(resp(b"plain", None)), b"plain")
+
+    def test_force_ipv4(self):
+        seen = []
+        socket.getaddrinfo = lambda host, port, family=0, *a: seen.append(family) or []
+        self.ytm._force_ipv4()
+        self.ytm._force_ipv4()                           # once: never wraps the wrapper
+        socket.getaddrinfo("www.youtube.com", 443)
+        self.assertEqual(seen, [socket.AF_INET])
+
+
+class YtmIdentityConfig(_FreshYtm):
+    """The self-healing InnerTube key + client version: the cached config and its default, the
+    background re-scrape when stale (at most every 10 min, committed only with a sane version)."""
+
+    def test_load_and_cache(self):
+        cfg = self.ytm._yt_cfg_load()
+        self.assertEqual(cfg, {"key": self.ytm._DEFAULT_INNERTUBE_KEY,
+                               "version": self.ytm._DEFAULT_CLIENT_VERSION, "ts": 0})
+        warms = []
+        self.ytm._warm_yt_config = lambda: warms.append(1)
+        self.assertEqual(self.ytm.innertube_identity()["source"], "default")
+        self.assertEqual(warms, [1])                      # default = stale: re-scrape
+        with open(self.ytm._yt_config_path(), "w") as f:
+            json.dump({"version": "2.20261001.00.00", "ts": time.time()}, f)
+        self.ytm._yt_cfg_cache = None
+        self.assertEqual(self.ytm.innertube_identity(),
+                         {"version": "2.20261001.00.00", "source": "live"})
+        self.assertEqual(warms, [1])                      # fresh: no scrape
+        self.assertEqual(self.ytm._context()["client"]["clientVersion"], "2.20261001.00.00")
+        self.assertEqual(self.ytm._yt_config()["key"], self.ytm._DEFAULT_INNERTUBE_KEY)
+        with open(self.ytm._yt_config_path(), "w") as f:
+            f.write("{")
+        self.assertEqual(self.ytm._yt_cfg_load()["ts"], 0)
+
+    def _page(self, html):
+        self.reqs = []
+
+        def fake(req, timeout=None):
+            self.reqs.append(req)
+            r = _Download(gzip.compress(html.encode()))
+            r.headers = {"Content-Encoding": "gzip"}
+            return r
+        urllib.request.urlopen = fake
+
+    def test_fetch_identity(self):
+        self.ytm._force_ipv4 = lambda: None
+        self._page('ytcfg.set({"INNERTUBE_API_KEY": "KEY1", "INNERTUBE_CLIENT_VERSION": "2.20261001.01.00"})')
+        self.assertEqual(self.ytm._fetch_yt_identity(), ("KEY1", "2.20261001.01.00"))
+        self.assertIn("SOCS=", self.reqs[0].get_header("Cookie"))      # skips the EU consent page
+        self._page('"INNERTUBE_API_KEY": "KEY1", "INNERTUBE_CLIENT_VERSION": "garbage"')
+        self.assertEqual(self.ytm._fetch_yt_identity(), ("KEY1", None))
+
+        def down(req, timeout=None):
+            raise urllib.error.URLError("offline")
+        urllib.request.urlopen = down
+        self.assertEqual(self.ytm._fetch_yt_identity(), (None, None))
+
+    def _warm(self):
+        self.ytm._warm_yt_config()
+        deadline = time.time() + 5
+        while self.ytm._yt_cfg_warming and time.time() < deadline:
+            time.sleep(0.01)
+
+    def test_warm_commits_only_a_real_version(self):
+        fetches = []
+        self.ytm._fetch_yt_identity = lambda: fetches.append(1) or (None, None)
+        self._warm()
+        self.assertIsNone(self.ytm._yt_cfg_cache)
+        self.assertFalse(os.path.exists(self.ytm._yt_config_path()))
+        self._warm()                                      # within 10 min of the last try: no fetch
+        self.assertEqual(fetches, [1])
+        self.ytm._yt_cfg_last_try = 0
+        self.ytm._fetch_yt_identity = lambda: (None, "2.20261001.00.00")
+        self._warm()
+        self.assertEqual(self.ytm._yt_cfg_cache["version"], "2.20261001.00.00")
+        self.assertEqual(self.ytm._yt_cfg_cache["key"], self.ytm._DEFAULT_INNERTUBE_KEY)
+        self.assertEqual(self.ytm._yt_cfg_load()["version"], "2.20261001.00.00")
+
+
+class YtmInnertubeCall(_FreshYtm):
+    """ytm._innertube, every signed-in InnerTube request: SAPISIDHASH auth, the chosen account's
+    AuthUser/PageId (overridable when probing logins), refuses to run signed out, and a 400
+    triggers an identity re-scrape."""
+
+    def setUp(self):
+        super().setUp()
+        self.ytm._force_ipv4 = lambda: None
+        self.warms = []
+        self.ytm._warm_yt_config = lambda: self.warms.append(1)
+        self.ytm._yt_cfg_cache = {"key": "K", "version": "2.20261001.00.00", "ts": time.time()}
+        self.reqs = []
+
+    def _answer(self, outcome):
+        def fake(req, timeout=None):
+            self.reqs.append(req)
+            if isinstance(outcome, Exception):
+                raise outcome
+            r = _Download(gzip.compress(json.dumps(outcome).encode()))
+            r.headers = {"Content-Encoding": "gzip"}
+            return r
+        urllib.request.urlopen = fake
+
+    def test_signed_out_refuses(self):
+        self._answer({})
+        with self.assertRaises(RuntimeError):
+            self.ytm._innertube("browse", {"browseId": "FEsubscriptions"})
+        self.assertEqual(self.reqs, [])
+
+    def test_authed_request(self):
+        self.store(cookie="SAPISID=S; SID=x", sapisid="S", authuser="2", page_id="PAGE")
+        self._answer({"contents": 1})
+        self.assertEqual(self.ytm._innertube("browse", {"browseId": "FEsubscriptions"}), {"contents": 1})
+        req = self.reqs[0]
+        self.assertEqual(req.full_url, self.ytm._INNERTUBE + "browse?key=K&prettyPrint=false")
+        self.assertTrue(req.get_header("Authorization").startswith("SAPISIDHASH "))
+        self.assertEqual((req.get_header("Cookie"), req.get_header("X-goog-authuser"),
+                          req.get_header("X-goog-pageid")), ("SAPISID=S; SID=x", "2", "PAGE"))
+        body = json.loads(req.data)
+        self.assertEqual((body["browseId"], body["context"]["client"]["clientName"]),
+                         ("FEsubscriptions", "WEB"))
+        self.ytm._innertube("account/accounts_list", {}, authuser=0, page_id="")
+        self.assertEqual(self.reqs[1].get_header("X-goog-authuser"), "0")
+        self.assertIsNone(self.reqs[1].get_header("X-goog-pageid"))
+
+    def test_400_rescrapes_identity(self):
+        self.store(cookie="SAPISID=S", sapisid="S")
+        for code, warmed in ((500, []), (400, [1])):
+            self._answer(urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b"bad")))
+            with self.assertRaises(urllib.error.HTTPError):
+                self.ytm._innertube("browse", {})
+            self.assertEqual(self.warms, warmed)
+
+
+class YtmDebugShapes(_FreshYtm):
+    """The debug-only response dumps (_skeleton, values-free so logs are safe to paste;
+    _dump_shape, silent unless YOUFISH_DEBUG) and _account_sections' in-order walk."""
+
+    def test_skeleton_has_no_values(self):
+        sk = self.ytm._skeleton({"a": 1, "b": [{"c": "secret"}, {"d": 2}], "e": [], "f": None})
+        self.assertEqual(sk, {"a": "int", "b": [{"c": "str"}], "e": [], "f": "NoneType"})
+        deep = {}
+        cur = deep
+        for _ in range(12):
+            cur["k"] = {}
+            cur = cur["k"]
+        self.assertIn("…", json.dumps(self.ytm._skeleton(deep), ensure_ascii=False))
+
+    def test_dump_shape_only_when_debugging(self):
+        data = {"contents": [{"videoRenderer": {"title": "t"}}],
+                "continuationItemRenderer": {}, "accountName": "x"}
+        self.ytm._DEBUG = False
+        self.ytm._dump_shape("browse", data)
+        self.assertEqual(self.logs, [])
+        self.ytm._DEBUG = True
+        self.ytm._dump_shape("browse", data)
+        self.assertEqual(len(self.logs), 3)
+        self.assertIn("'videoRenderer'", self.logs[1])
+        self.assertIn("'continuationItemRenderer'", self.logs[1])
+        self.ytm._dump_shape("bad", {"x": {1, 2}})         # not JSON-serialisable: logged, no raise
+        self.assertIn("dump failed", self.logs[-1])
+
+    def test_account_sections_in_order(self):
+        tree = {"a": [{"accountItemSectionRenderer": {"n": 0}},
+                      {"x": {"accountItemSectionRenderer": {"n": 1}}}],
+                "b": {"accountItemSectionRenderer": "not a dict"}}
+        out = []
+        self.ytm._account_sections(tree, out)
+        self.assertEqual(out, [{"n": 0}, {"n": 1}])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // A channel profile: header + recent uploads. `channelRef` may be a channel_id or any
 // channel URL — the Python side normalises it. Reached from a video's channel name and
@@ -83,16 +84,16 @@ Page {
         app.backend.channelVideos(page.channelRef, 1, function(res) {
             if (!page) return   // the page was popped before this async callback returned
             page.loading = false
+            // A channel with no Videos tab or no uploads opens its playlists instead
+            // (Logic.channelFirstPage; the engine flags reason "no_videos_tab").
+            var next = Logic.channelFirstPage(res, hadRss)
+            if (next === "error") {
+                page.errorText = (res && res.error) ? res.error : qsTr("channel failed")
+                return
+            }
             if (!res || !res.ok) {
-                if (!hadRss) {
-                    var err = (res && res.error) ? res.error : qsTr("channel failed")
-                    if (/videos tab/i.test(err)) {
-                        pageStack.replace(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
-                            { channelRef: page.channelRef, channelName: page.channelName })
-                        return
-                    }
-                    page.errorText = err
-                }
+                if (next === "playlists")
+                    page.openPlaylistsInstead()
                 return                          // hadRss: keep the RSS list; scroll can retry /videos
             }
             var ch = res.channel
@@ -104,12 +105,11 @@ Page {
                 page.channelSubs = ch.subscribers || 0
                 page.videoCount = ch.video_count || 0
             }
-            var items = res.items || []
-            if (!hadRss && items.length === 0) {
-                pageStack.replace(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
-                    { channelRef: page.channelRef, channelName: page.channelName })
+            if (next === "playlists") {         // after the header, so it passes the real name
+                page.openPlaylistsInstead()
                 return
             }
+            var items = res.items || []
             if (!hadRss) {
                 videosModel.clear()
                 page.seenIds = ({})
@@ -119,6 +119,11 @@ Page {
             page.hasMore = !!res.has_more
             page.nextStart = 1 + page.pageSize
         })
+    }
+
+    function openPlaylistsInstead() {
+        pageStack.replace(Qt.resolvedUrl("ChannelPlaylistsPage.qml"),
+            { channelRef: page.channelRef, channelName: page.channelName })
     }
 
     // Later pages (scroll-to-load-more) -> append the next /videos page, deduped by id.
@@ -145,22 +150,8 @@ Page {
 
     Component.onCompleted: loadInitial()
 
-    function fmtDur(sec) {
-        if (!sec || sec <= 0)
-            return ""
-        sec = Math.floor(sec)
-        var h = Math.floor(sec / 3600)
-        var m = Math.floor((sec % 3600) / 60)
-        var s = sec % 60
-        function p(n) { return (n < 10 ? "0" : "") + n }
-        return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(s)
-    }
-    function fmtCount(n) {
-        if (!n || n < 0) return "0"
-        if (n >= 1000000) return (n / 1000000).toFixed(1).replace(".0", "") + "M"
-        if (n >= 1000) return (n / 1000).toFixed(1).replace(".0", "") + "K"
-        return "" + n
-    }
+    function fmtDur(sec) { return Logic.fmtDur(sec) }
+    function fmtCount(n) { return Logic.fmtCount(n) }
 
     SilicaListView {
         id: listView

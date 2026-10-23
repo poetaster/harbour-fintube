@@ -1,0 +1,2 @@
+# Engine functions no offline test runs, each with the reason (tests/coverage_report.py --update).
+# This list may only shrink: test one, then --update. New code needs a test.

@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // Player controls overlaid on the video, YouTube-style: a large centred play/pause and a
 // thin scrubber pinned to the bottom edge, so the video stays visible instead of being
@@ -63,10 +64,7 @@ Item {
 
     // Display name of the audio track currently playing (matched by itag), for the Audio row.
     function currentAudioName() {
-        for (var i = 0; i < root.audioTracks.length; i++)
-            if (root.audioTracks[i].itag === root.currentAudioItag)
-                return root.audioTracks[i].name
-        return ""
+        return Logic.audioTrackName(root.audioTracks, root.currentAudioItag)
     }
     onPlaybackMenuOpenChanged: if (!playbackMenuOpen) root.playbackSection = ""   // reopen on main
     // Off the translate level, reset its filter + field so the search always reopens empty and in
@@ -79,17 +77,7 @@ Item {
     // Translations matching the live filter (by display name or language code). Referenced from
     // the Repeater's model so it re-runs whenever the filter or the translation set changes.
     function filteredTranslations() {
-        var f = root.captionFilter.toLowerCase()
-        if (f === "")
-            return root.captionTranslations
-        var out = []
-        for (var i = 0; i < root.captionTranslations.length; i++) {
-            var t = root.captionTranslations[i]
-            if ((t.name || "").toLowerCase().indexOf(f) >= 0
-                    || (t.lang || "").toLowerCase().indexOf(f) >= 0)
-                out.push(t)
-        }
-        return out
+        return Logic.filterTranslations(root.captionTranslations, root.captionFilter)
     }
 
     // A Canvas drops its buffer when the app is backgrounded, so the drawn glyphs come back
@@ -780,19 +768,6 @@ Item {
     }
 
 
-    function fmt(ms) {
-        if (!ms || ms < 0)
-            ms = 0
-        var s = Math.floor(ms / 1000)
-        var h = Math.floor(s / 3600)
-        var m = Math.floor((s % 3600) / 60)
-        var sec = s % 60
-        function p(n) { return (n < 10 ? "0" : "") + n }
-        return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(sec)
-    }
-
-    // "1×", "1.25×", "0.5×" — whole rates drop the decimal.
-    function fmtRate(r) {
-        return (r === Math.floor(r) ? r.toFixed(0) : ("" + r)) + "×"
-    }
+    function fmt(ms) { return Logic.fmtClock(ms) }
+    function fmtRate(r) { return Logic.fmtRate(r) }       // "1×", "1.25×", "0.5×"
 }

@@ -5,6 +5,7 @@ import Sailfish.Pickers 1.0
 import FinTube 1.0
 import "pages"
 import "cover"
+import "logic.js" as Logic
 
 ApplicationWindow {
     id: app
@@ -91,6 +92,10 @@ ApplicationWindow {
     // --- Live YouTube account import: subscriptions + playlists (Home → More → "Import from YouTube") ---
     // Needs an imported browser login (More → Providers → YouTube account). Two network calls;
     // a toast reports the combined result. Guarded so a signed-out tap explains itself.
+    // An engine result as {ok, text} for a toast (Logic.resultMessage). Called through the captured
+    // window from pyotherside callbacks, where this file's ids and imports may not resolve.
+    function resultMessage(res) { return Logic.resultMessage(res) }
+
     function importYoutubeAccount() {
         if (!app.backend.youtubeLoggedIn) {
             app.showToast(qsTr("Sign in first: More → Providers → YouTube account"))
@@ -99,11 +104,8 @@ ApplicationWindow {
         var win = app
         win.showToast(qsTr("Importing from YouTube…"))
         win.backend.importYoutubeAccount(function(res) {
-            if (!res || !res.ok) {
-                win.showToast((res && res.error) ? res.error : qsTr("Import failed"))
-                return
-            }
-            win.showToast(res.summary || qsTr("Imported from YouTube"))
+            var m = win.resultMessage(res)
+            win.showToast(m.text || (m.ok ? qsTr("Imported from YouTube") : qsTr("Import failed")))
         })
     }
 
@@ -125,12 +127,9 @@ ApplicationWindow {
                 var win = app
                 win.showToast(qsTr("Importing…"))
                 win.backend.importNewpipe(selectedContentProperties.filePath, function(res) {
-                    if (!res || !res.ok) {
-                        win.showToast((res && res.error) ? res.error : qsTr("Import failed"))
-                        return
-                    }
-                    var msg = res.summary || qsTr("Imported %n channel(s)", "", res.added)
-                    win.showToast(msg)
+                    var m = win.resultMessage(res)
+                    win.showToast(m.text || (m.ok ? qsTr("Imported %n channel(s)", "", res.added)
+                                                  : qsTr("Import failed")))
                 })
             }
         }
@@ -242,18 +241,18 @@ ApplicationWindow {
             return
         }
         backend.parseUrl(url, function(res) {
-            if (!res || !res.kind)
+            var r0 = Logic.routeFor(res)
+            if (!r0)
                 return
-            if (res.kind === "video")
-                pageStack.push(Qt.resolvedUrl("pages/VideoPage.qml"),
-                    { videoId: res.id || res.url, title: "" })
-            else if (res.kind === "channel")
+            if (r0.page === "video")
+                pageStack.push(Qt.resolvedUrl("pages/VideoPage.qml"), { videoId: r0.id, title: "" })
+            else if (r0.page === "channel")
                 pageStack.push(Qt.resolvedUrl("pages/ChannelPage.qml"),
-                    { channelRef: res.url, channelName: "", channelId: res.id || "", channelThumb: "" })
-            else if (res.kind === "playlist") {
+                    { channelRef: r0.ref, channelName: "", channelId: r0.id, channelThumb: "" })
+            else if (r0.page === "playlist") {
                 // Save the playlist into the library (async), then show the library — it fills in
                 // once the fetch completes since the page binds to backend.playlists.
-                backend.saveYoutubePlaylist(res.id || res.url, function(r) {
+                backend.saveYoutubePlaylist(r0.ref, function(r) {
                     if (!r || !r.ok) app.showToast((r && r.error) ? r.error : qsTr("Couldn't save playlist"))
                 })
                 pageStack.push(Qt.resolvedUrl("pages/PlaylistsPage.qml"))
@@ -275,9 +274,7 @@ ApplicationWindow {
             // the string property pendingUrl, and QML's string coercion flattens ["url"] to
             // "url" — while the warm path handed the raw array straight to Python (
             // 'list' object has no attribute 'strip'). Normalize at the D-Bus boundary.
-            var u = (typeof url === "string") ? url
-                    : (url && url.length > 0 ? String(url[0]) : "")
-            app.routeUrl(u)   // route first so a link still opens even if activate() is a no-op
+            app.routeUrl(Logic.dbusUrlArg(url))   // route first so a link still opens even if activate() is a no-op
             app.activate()
         }
     }

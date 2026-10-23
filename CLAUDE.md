@@ -39,17 +39,49 @@ internally — env vars `YOUFISH_DEBUG` / `YOUFISH_HWDEC`, the `[youfish]` log p
 sh build.sh          # shadow build via sfdk → ../harbour-fintube.build/RPMS/
                      # override target: TARGET=SailfishOS-5.1.0.11-aarch64 sh build.sh
 sh clean.sh          # remove build scatter from the source tree
+sh test.sh           # every offline test: engine, parsers, coverage check, QML logic
 python3 python/test_youfish.py   # offline engine tests — pure stdlib, externals mocked
+python3 tests/test_parsers.py    # innertube parsers vs recorded YouTube answers (--live/--record)
+python3 tests/coverage_report.py # engine functions no test runs (--check in CI)
+python3 tests/live_ytdlp.py      # real yt-dlp + live YouTube, yt-dlp paths only (--pot)
+node tests/qml_logic_test.js     # qml/logic.js — the pages' pure decisions
 ```
 
-- The **engine test suite** (`python/test_youfish.py`, ~3.7k lines) is the main safety net.
+- **Parser tests run on recorded answers.** `tests/fixtures/*.json.gz` are real YouTube answers
+  (public IP scrubbed to 203.0.113.1); the checks assert what the app needs, not exact values.
+  When a parser drifts, `--live` shows which; fix it, then `--record`. A parser change gets a
+  `--live` run before it ships.
+- **Coverage ratchet.** `tests/coverage_report.py --check` fails on any engine function no test
+  runs, unless `tests/coverage_baseline.txt` lists it with the reason it can't run offline.
+  New code needs a test; the baseline only shrinks (`--update` after adding tests).
+- **`TESTING.md`** is the release procedure (beta tag `1.x.y-betaN` → pre-release → device
+  checklist → final tag) and the per-feature device checklist. A new or changed feature gets a
+  checklist line there and, where it has logic, a test.
+- **Page decisions live in `qml/logic.js`** (`.pragma library`, ES5 only, no QML types, no qsTr):
+  caption choice and what gets remembered, SponsorBlock skip, seek stepping, the dual/muxed/HLS
+  play plan, queue advance, error recovery, reattach/reclaim of the shared player, link routing,
+  feed change detection and Shorts removal, search dedup and paging, the channel→playlists
+  redirect (engine `reason: "no_videos_tab"`), the quality/SponsorBlock/equalizer settings maps,
+  the PO-token status line, and every number/time formatter (`fmtDur`, `fmtClock`, `fmtCount`,
+  `fmtRate`; pages keep one-line wrappers). Pages apply the result and keep the qsTr text. Anything
+  *stored* is decided in the engine instead (`set_audio_track`).
+  The node harness rejects ES6 syntax Qt 5.6 can't parse. Put new page logic there, with a test.
+
+- The **engine test suite** (`python/test_youfish.py`, ~4.5k lines) is the main safety net.
   It is fully offline (no device, network, or yt-dlp) and runs in CI on every push/PR
-  (`.github/workflows/tests.yml`). It had silently rotted to 8 failures before CI was added —
+  (`.github/workflows/tests.yml`, together with the QML logic suite). It had silently rotted to 8
+  failures before CI was added —
   keep it green. **Run it after any change to `youfish.py`.**
-- The **release build** (`.github/workflows/build.yml`) only fires on tags matching `1.*` and
-  cross-builds aarch64, publishing the RPM as a GitHub release.
-- The C++ player and the real yt-dlp/ffmpeg/Deno/PO-token processes are **not** covered by any
-  automated test — verify those on-device. The InnerTube tests run on fixtures; the module-level
+- The **release build** (`.github/workflows/build.yml`) only fires on tags matching `1.*`, runs
+  both test suites first, cross-builds aarch64 + armv7hl and publishes a GitHub release. A tag
+  with a dash (`1.6.0-beta1`) is published as a pre-release.
+- **`tests/live_ytdlp.py`** is the only test that runs the real yt-dlp (binary and in-process,
+  InnerTube off, `--pot` adds Deno + the PO-token provider). Bot walls and rate limits are
+  skips, not failures. Weekly + on demand in `.github/workflows/live.yml` (arm64 runner, so
+  the phone's builds); not in `test.sh` or the release gate. Run it from home before a release.
+- The C++ player and ffmpeg (video downloads) are **not** covered by any automated test, and
+  the real yt-dlp/Deno/PO-token processes only by that live check — verify those on-device. The
+  InnerTube tests run on fixtures; the module-level
   `youfish._it = lambda: None` keeps every older test on the yt-dlp path, and
   `InnertubeEngineWiring` swaps in `_FakeIT`. Any change to the live request shape needs a
   network check on a PC and then on the device.
@@ -132,7 +164,8 @@ python3 python/test_youfish.py   # offline engine tests — pure stdlib, externa
     with playback's own first request: the same header set (`_gv_request`) and the same Range as
     `_DirectFetch`'s first chunk, read for 2 bytes. A 2-byte Range once passed URLs that the real
     request got 403 on. A refused probe, or an HTTP refusal at byte 0 mid-stream, is a strike; the
-    latter's recovery skips the fast client and drops the video's cached resolve. Two strikes in 10 minutes, or two bot walls, open a
+    latter's recovery skips the fast client and drops the video's cached resolve. Two strikes in 10
+  minutes, or two bot walls, open a
     breaker (`_fast_player_state`) and yt-dlp resolves for the cooldown. A network failure in the
     probe is no verdict. A running livestream goes to `_fast_live_data` (ANDROID_VR muxed HLS
     itags 91–96, unproxied, not probed). Search, related, video_info, channels and the feed's
@@ -217,7 +250,8 @@ render thread, everything else under the lock.
 ## Gotchas that will bite you
 
 - **Set `videoExt`/`audioExt` before the URLs** (see invariant 9). Ordering-sensitive.
-- **Qt 5.6 platform floor:** no `Qt.callLater` (use a zero-interval Timer restart); `Connections.enabled`
+- **Qt 5.6 platform floor:** no `Qt.callLater` (use a zero-interval Timer restart);
+  `Connections.enabled`
   needs 5.7 (disable by setting `target: null`); `Screen.hasCutouts`/cutout APIs are typeof-guarded.
 - **`droidvdec` is demoted to rank NONE in `main()`** yet HW mode still uses it — `buildPipeline`
   instantiates it *explicitly* to sidestep autoplug, which won't reliably pick it.
@@ -236,6 +270,11 @@ render thread, everything else under the lock.
   extractor prefix and yt-dlp's desktop advice (`--cookies-from-browser`, FAQ links). Errors that
   match `_FINAL_ERR` (removed, terminated, not yet live, geo-blocked, private while signed out) skip
   the binary re-run and the widen retry: no client changes YouTube's answer.
+- **A fresh PO-token URL is refused for its first ~3 s.** googlevideo answers 403 to a `pot=`
+  URL until ~2.6–3.1 s after extraction, then serves it (measured 2026-10-22, bgutil 1.3.2 and
+  2.0.2). `_DirectFetch._warming_up` retries such a URL's first request for `_POT_WARMUP` (6 s)
+  instead of dying into a re-resolve, whose new URL would be just as young. Token-free, older
+  or already-streaming URLs never wait. `tests/live_ytdlp.py --pot` is the check.
 - **A just-ended livestream (`live_status == "post_live"`) is refused** with a "still processing"
   message. Until YouTube finishes the recording, its formats are DASH segment lists that the proxy
   can't serve as one file.
@@ -259,7 +298,8 @@ render thread, everything else under the lock.
   Month names are parsed by hand (`innertube._upload_date`).
 - **Debug lines worth grepping** (`YOUFISH_DEBUG=1`, `[youfish/t …]`): `fast player`, `fast live`,
   `fast path strike`, `fast player off`, `resolve picks <id> [client=innertube:…]`, `resolve urls:`,
-  `direct-fetch itag=… died after N bytes`, `search innertube`, `watch_next`, `video_info innertube`,
+  `direct-fetch itag=… died after N bytes`, `search innertube`, `watch_next`, `video_info
+  innertube`,
   `comments innertube`, `yt-dlp in-process`.
 - **Download video ids are sanitised** to `[\w-]{≤64}` before hitting the `-o` template to block
   path traversal / output-template injection (`youfish.py:7077`).

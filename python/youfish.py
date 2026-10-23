@@ -323,6 +323,14 @@ _RANGE_RESTART = True
 # worst case is the status quo plus one failed HTTPS round-trip. Set False to force the child.
 _DIRECT_STREAM = True
 _DIRECT_CHUNK  = 10 << 20    # bounded Range chunk (== the child's --http-chunk-size 10M)
+# A freshly minted PO-token URL (pot=) is refused with 403 for its first ~3 s, then served.
+# Measured 2026-10-22 on a PC (mweb + bgutil 1.3.2 and 2.0.2, every run): 403 until 2.6-3.1 s
+# after extraction, then 206. yt-dlp's own downloads never see it; playback asks at once. The
+# direct fetch keeps retrying a YOUNG token URL's first request through this window instead of
+# dying into a re-resolve, whose fresh URL would be just as young and refused the same way.
+_POT_WARMUP = 6.0            # seconds a young token URL's first request keeps being retried
+_POT_WARMUP_STEP = 0.5       # pause between those retries
+_GV_URL_LIFETIME = 6 * 3600  # googlevideo URLs expire 6 h after issue, so expire= dates them
 _streams = {}                # (video_id, itag) -> _Stream
 _streams_lock = threading.Lock()
 _reap_pending = []           # R3/R5: Popen zombies to wait() OFF-lock, drained by _reaper + atexit
@@ -567,7 +575,8 @@ class _DirectFetch:
     closing — so _reader's existing resume machinery (re-resolve, R9 tries cap, D5) handles
     both; this object never retries what it can't fix (it has no way to re-resolve a URL).
     A mid-chunk truncation IS self-healed by reopening from the current offset (cheap — no
-    process to relaunch), capped so a no-progress loop still dies into the resume path. kill()
+    process to relaunch), capped so a no-progress loop still dies into the resume path, and so is
+    a young PO-token URL's warm-up 403 (_warming_up), which a re-resolve can't fix. kill()
     from the reap paths closes the live response, which unblocks a concurrent read(); a read
     blocked in connect() rides out its own <=30s timeout (the reader re-checks DEAD/gen right
     after, same as a slow child kill today)."""
@@ -580,6 +589,8 @@ class _DirectFetch:
         self.resp = None
         self.chunk_end = -1          # last offset of the open bounded chunk; None = open-ended 200
         self.reopens = 0             # consecutive ZERO-PROGRESS reopens (truncation guard)
+        self.got = 0                 # bytes handed out so far
+        self.warm_until = None       # end of a young token URL's warm-up (see _POT_WARMUP)
         self.returncode = None       # duck: None while live, 0 clean EOF / killed, 1 error death
         self.err = ""                # why it died ("HTTP 403", "timeout", ...) — for the debug log
         self.stdout = self           # _reader drains proc.stdout.read(n)
@@ -610,6 +621,9 @@ class _DirectFetch:
                 try:
                     self._open_next()
                 except urllib.error.HTTPError as ex:
+                    if ex.code == 403 and self._warming_up():
+                        time.sleep(_POT_WARMUP_STEP)              # kill() during it ends the loop
+                        continue
                     self.returncode = 0 if ex.code == 416 else 1   # 416: past EOF (no-clen case)
                     self.err = "HTTP %s" % ex.code
                     return b""
@@ -623,6 +637,7 @@ class _DirectFetch:
                 buf = b""
             if buf:
                 self.pos += len(buf)
+                self.got += len(buf)
                 self.reopens = 0
                 return buf
             try:                                          # response exhausted (or died) — retire it
@@ -640,6 +655,19 @@ class _DirectFetch:
                 self.returncode = 1
                 return b""
         return b""
+
+    def _warming_up(self):
+        """A 403 before the first byte on a PO-token URL issued within the last minute: is it
+        still inside the warm-up window (_POT_WARMUP)? A token-free, older or already-streaming
+        URL never waits: its 403 is a real refusal and goes straight to the resume path."""
+        if self.got or "pot=" not in self.url:
+            return False
+        now = time.time()
+        if self.warm_until is None:
+            if _expire_ts(self.url) - now < _GV_URL_LIFETIME - 60:
+                return False
+            self.warm_until = now + _POT_WARMUP
+        return now < self.warm_until
 
     # --- duck-typed child-process surface (for _reap_proc / _reap_locked / _reaper) --- #
     def kill(self):
@@ -794,8 +822,9 @@ def _reader(s, gen):
                 # stream to the binary child before the resume respawn — the fallback doctrine:
                 # worst case becomes exactly the pre-direct behaviour. (The re-resolve below may
                 # also hand the next spawn a fresh URL; the child gets first go at it.)
-                s.use_binary = True
-                _plog("direct-fetch dead at byte 0 (itag=%s) -> binary child" % s.itag)
+                if _ytdlp_path():                            # no yt-dlp (it's optional since the
+                    s.use_binary = True                      # fast path): keep the direct fetch
+                    _plog("direct-fetch dead at byte 0 (itag=%s) -> binary child" % s.itag)
                 # An unexpired InnerTube-minted URL refused at byte 0 is evidence against the fast
                 # path itself on this network — enough of them and resolve goes back to yt-dlp.
                 # Only an HTTP answer counts: a network failure is no verdict on the URL. The
@@ -845,10 +874,11 @@ def _reader(s, gen):
                 s.cond.notify_all()
 
 
-def _acquire(vid, itag, url, ua, total, start):
+def _acquire(vid, itag, url, ua, total, start, why=None):
     """Return the _Stream that will serve bytes from `start`, creating / restarting as needed.
-    The ONLY place a seek (re)starts a yt-dlp process. Bumps refs (caller MUST drop it in a
-    finally). Returns None at capacity / low disk / no yt-dlp, so do_GET can answer 503.
+    The ONLY place a seek (re)starts a download. Bumps refs (caller MUST drop it in a
+    finally). Returns None at capacity / low disk / nothing to feed it, so do_GET can answer 503;
+    the reason is appended to `why` (it becomes the 503's text, which GStreamer logs).
     refs is mutated under s.cond; acquire already holds _streams_lock and takes s.cond AFTER it,
     preserving the _streams_lock -> s.cond order (no deadlock). (D1, D7, R1, R6, R7)"""
     key = (vid, itag)
@@ -864,9 +894,19 @@ def _acquire(vid, itag, url, ua, total, start):
             del _streams[key]
         if len(_streams) >= _MAX_STREAMS:
             _reap_one_idle_locked()
-        if len(_streams) >= _MAX_STREAMS or _free_bytes(_STREAM_DIR) < _MIN_FREE:
-            return None
-        if not _ytdlp_path():                              # D7: never build a _Stream we can't feed
+        free = _free_bytes(_STREAM_DIR)
+        refusal = None
+        if len(_streams) >= _MAX_STREAMS:
+            refusal = "too many open streams (%d)" % len(_streams)
+        elif free < _MIN_FREE:
+            refusal = "not enough free storage for the stream cache (%d MB free, needs %d MB)" % (
+                free >> 20, _MIN_FREE >> 20)
+        elif not _DIRECT_STREAM and not _ytdlp_path():     # D7: never build a _Stream we can't
+            refusal = "yt-dlp not installed"               #     feed. The in-process direct fetch
+        if refusal:                                        #     needs no yt-dlp: a fast-path resolve
+            _plog("acquire refused itag=%s: %s" % (itag, refusal))   # plays without it installed
+            if why is not None:
+                why.append(refusal)
             return None
         s = None
         try:                                               # D7: guarded construction
@@ -887,6 +927,8 @@ def _acquire(vid, itag, url, ua, total, start):
             threading.Thread(target=_reader, args=(s, s.gen), daemon=True).start()
         except Exception as ex:
             _plog("acquire failed: %r" % ex)
+            if why is not None:
+                why.append("stream setup failed: %s" % str(ex)[:120])
             if s is not None:
                 if s.proc is not None:                     # R6: kill+queue a child spawned before the
                     try: s.proc.kill()                     #     Thread.start() that raised (else it
@@ -1076,9 +1118,11 @@ class _MediaProxyHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        s = _acquire(video_id, itag, target, ua, total, start)
-        if s is None:
-            self.send_error(503, "no stream capacity")   # too many streams, low disk, or no yt-dlp
+        why = []
+        s = _acquire(video_id, itag, target, ua, total, start, why)
+        if s is None:   # the reason rides in the status text: it's what GStreamer's error shows
+            msg = "no stream capacity: " + (why[0] if why else "unknown")
+            self.send_error(503, msg.encode("ascii", "replace").decode())   # status line is latin-1
             return
 
         # D1 (WARM reuse): anchor the read-ahead gate at (or past) our start. A forward seek into
@@ -5048,6 +5092,13 @@ def set_setting(key, value):
     return get_settings()
 
 
+def set_audio_track(lang, is_original):
+    """The player's Audio picker chose a track: remember it for the next video. A dub is stored by
+    its language. The video's ORIGINAL track stores "" (original audio), never its language:
+    remembering "pl" after "Polish (original)" made the next English video play its Polish dub."""
+    return set_setting("audio_lang", "" if is_original else (lang or "").strip())
+
+
 def _token_free_client():
     """The TOKEN-FREE, JS-less client the yt-dlp primary dump asks for: the installed yt-dlp's own
     JS-less default (visionos as of 2026.08), as adopted by innertube.configure_from_ytdlp — the
@@ -6372,6 +6423,16 @@ def _channel_videos_innertube(channel, start, n):
             }}
 
 
+def _channel_error(err):
+    """A failed channel listing. yt-dlp refuses a channel with no uploads ("…does not have a videos
+    tab"); reason "no_videos_tab" tells the page to open the channel's playlists instead, so the UI
+    doesn't depend on yt-dlp's wording."""
+    out = {"ok": False, "error": err}
+    if re.search(r"videos tab", err or "", re.I):
+        out["reason"] = "no_videos_tab"
+    return out
+
+
 @_timed_fn("q.channel_videos")
 def channel_videos(channel, start=1, n=30):
     """A page of a channel's uploads (a channel_id or any channel URL). `start` is the
@@ -6398,7 +6459,7 @@ def channel_videos(channel, start=1, n=30):
                        "--playlist-items", "%d:%d" % (start, start + n - 1),
                        "--dump-single-json", "--", url], 90)
         if proc.returncode != 0:
-            return {"ok": False, "error": _ytdlp_err(proc.stderr, "channel fetch failed")}
+            return _channel_error(_ytdlp_err(proc.stderr, "channel fetch failed"))
         data = json.loads(proc.stdout)
         raw = [e for e in data.get("entries", []) if e.get("id")]
         has_more = len(raw) >= n     # a full page back → assume another page exists
@@ -6429,7 +6490,7 @@ def channel_videos(channel, start=1, n=30):
             "video_count": data.get("playlist_count") or 0,
         }}
     except Exception as ex:
-        return {"ok": False, "error": str(ex)}
+        return _channel_error(str(ex))
 
 
 def _rss_get(cid):

@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 Page {
     id: page
@@ -81,38 +82,17 @@ Page {
             // ytsearch pagination can hand back overlapping windows; dedup by id/url so the same
             // video never appears twice. If a "load more" page adds nothing new, we've hit the
             // end of usefully-distinct results — stop paging rather than repeat forever.
-            var items = res.items || []
-            var added = 0
-            for (var i = 0; i < items.length; i++) {
-                var it = items[i]
-                var key = it.id || it.url || ""
-                if (key.length > 0 && page.seenIds[key])
-                    continue
-                if (key.length > 0)
-                    page.seenIds[key] = true
-                resultsModel.append(it)
-                added++
-            }
-            page.hasMore = !!res.has_more && (start <= 1 || added > 0)
+            var fresh = Logic.dedupPage(res.items, page.seenIds)
+            page.seenIds = fresh.seen
+            for (var i = 0; i < fresh.items.length; i++)
+                resultsModel.append(fresh.items[i])
+            page.hasMore = Logic.searchHasMore(res.has_more, start, fresh.items.length)
             page.nextStart = start + page.pageSize
         })
     }
 
-    function fmtDur(sec) {
-        if (!sec || sec <= 0) return ""
-        sec = Math.floor(sec)
-        var h = Math.floor(sec / 3600)
-        var m = Math.floor((sec % 3600) / 60)
-        var s = sec % 60
-        function p(nn) { return (nn < 10 ? "0" : "") + nn }
-        return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(s)
-    }
-    function fmtCount(n) {
-        if (!n || n < 0) return "0"
-        if (n >= 1000000) return (n / 1000000).toFixed(1).replace(".0", "") + "M"
-        if (n >= 1000) return (n / 1000).toFixed(1).replace(".0", "") + "K"
-        return "" + n
-    }
+    function fmtDur(sec) { return Logic.fmtDur(sec) }
+    function fmtCount(n) { return Logic.fmtCount(n) }
 
     ListModel { id: resultsModel }
 

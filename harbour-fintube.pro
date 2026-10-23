@@ -36,6 +36,7 @@ HEADERS += src/videoplayer.h \
 DISTFILES += \
     qml/harbour-fintube.qml \
     qml/Backend.qml \
+    qml/logic.js \
     qml/MprisControls.qml \
     qml/pages/HomePage.qml \
     qml/pages/SearchPage.qml \

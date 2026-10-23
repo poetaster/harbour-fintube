@@ -380,8 +380,10 @@ Item {
     // Remember the audio (dub) language across videos ("" = the video's original source audio).
     // resolve() starts a matching dub on the next video when one exists; the player's Audio picker
     // also swaps live. Most people who want a dub want it everywhere.
-    function setAudioLang(lang) {
-        py.call("youfish.set_setting", ["audio_lang", lang || ""], function(s) {
+    // The Audio picker chose track `a`; the engine decides what to remember (a dub's language, or
+    // "" for a video's original track).
+    function setAudioTrack(a) {
+        py.call("youfish.set_audio_track", [a.lang || "", !!a.is_original], function(s) {
             if (s) backend.audioLang = s.audio_lang || ""
         })
     }

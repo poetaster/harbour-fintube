@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // Providers — the third-party tools the app manages for you: yt-dlp (the extractor), ffmpeg (HD
 // download merging) and the optional PO-token provider (Deno sidecar) that unlocks full quality.
@@ -40,29 +41,35 @@ Page {
         onUpdateFinished: page.ytdlpStatus = message
     }
 
-    // PO-provider status line — kept as functions so the many states stay readable. Both read the
-    // backend properties directly, so QML re-binds them whenever the status refreshes.
+    // PO-provider status line. Logic.potStatus picks the state and tone; these map them to text and
+    // colour. Both read the backend properties directly, so QML re-binds them whenever the status
+    // refreshes.
+    function potStatus() {
+        var b = app.backend
+        return Logic.potStatus({ installing: b.potInstalling, deno: b.potDeno,
+                                 installed: b.potInstalled, enabled: b.potEnabled,
+                                 responding: b.potResponding, lastError: b.potLastError })
+    }
     function potStateText() {
         var b = app.backend
-        if (b.potInstalling) return b.potStatusMsg || qsTr("Setting up…")
-        if (!b.potDeno) return qsTr("Deno runtime not found. Tap Download Deno below.")
-        if (!b.potInstalled) return qsTr("Provider not installed.")
-        if (!b.potEnabled) return qsTr("Installed · off")
-        if (b.potResponding)
+        switch (page.potStatus().state) {
+        case "installing":    return b.potStatusMsg || qsTr("Setting up…")
+        case "no_deno":       return qsTr("Deno runtime not found. Tap Download Deno below.")
+        case "not_installed": return qsTr("Provider not installed.")
+        case "off":           return qsTr("Installed · off")
+        case "working":
             return b.potServerVersion ? qsTr("Installed · working (v%1)").arg(b.potServerVersion)
                                       : qsTr("Installed · working")
         // A real failure sets potLastError (shown in full just below) → say so and colour it red.
         // Otherwise the server is simply still coming up: a calm "starting…", not an alarming error.
-        if (b.potLastError) return qsTr("Installed · on — not working (see below)")
-        return qsTr("Installed · on — starting…")
+        case "failing":       return qsTr("Installed · on — not working (see below)")
+        default:              return qsTr("Installed · on — starting…")
+        }
     }
     function potStateColor() {
-        var b = app.backend
-        if (b.potInstalling) return Theme.secondaryColor
-        if (!b.potDeno) return Theme.errorColor
-        if (b.potEnabled && b.potResponding) return Theme.secondaryHighlightColor
-        if (b.potEnabled && b.potLastError) return Theme.errorColor   // red only on a genuine error
-        return Theme.secondaryColor                                    // "starting…" etc.: neutral
+        var tone = page.potStatus().tone
+        return tone === "error" ? Theme.errorColor
+             : (tone === "good" ? Theme.secondaryHighlightColor : Theme.secondaryColor)
     }
 
     SilicaFlickable {

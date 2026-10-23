@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // Recently-watched videos, newest first. Tap to reopen (resumes from the saved spot). The
 // thumbnail carries the same progress bar / WATCHED badge as everywhere else.
@@ -27,7 +28,7 @@ Page {
             for (var i = 0; i < list.length; i++)
                 histModel.append(list[i])
             page.loading = false
-            page.hasMore = list.length >= page.pageSize
+            page.hasMore = Logic.fullPage(list.length, page.pageSize)
             page.nextStart = 1 + page.pageSize
         })
     }
@@ -42,7 +43,7 @@ Page {
             page.loadingMore = false
             for (var i = 0; i < list.length; i++)
                 histModel.append(list[i])
-            page.hasMore = list.length >= page.pageSize
+            page.hasMore = Logic.fullPage(list.length, page.pageSize)
             page.nextStart += page.pageSize
         })
     }

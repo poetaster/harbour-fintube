@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // One playlist's videos. Tap a video to play it. (Part 2 will make it auto-continue down the
 // list from the tapped point.)
@@ -18,15 +19,7 @@ Page {
 
     ListModel { id: itemsModel }
 
-    function fmtDur(sec) {
-        if (!sec || sec <= 0) return ""
-        sec = Math.floor(sec)
-        var h = Math.floor(sec / 3600)
-        var m = Math.floor((sec % 3600) / 60)
-        var s = sec % 60
-        function p(nn) { return (nn < 10 ? "0" : "") + nn }
-        return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(s)
-    }
+    function fmtDur(sec) { return Logic.fmtDur(sec) }
 
     function load() {
         page.loading = true
@@ -55,7 +48,7 @@ Page {
             // videos now instead of making the user tap "Refresh from YouTube". Fires once
             // (_autoRefreshed), so a genuinely empty or fetch-failed playlist can't loop. The
             // spinner stays up: refreshPlaylist re-fetches, then its callback re-runs load().
-            if (page.playlistKind === "youtube" && its.length === 0 && !page._autoRefreshed) {
+            if (Logic.shouldAutoRefreshPlaylist(page.playlistKind, its.length, page._autoRefreshed)) {
                 page._autoRefreshed = true
                 app.backend.refreshPlaylist(page.playlistId, function() { page.load() })
                 return

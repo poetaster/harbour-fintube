@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // Home: one feed of the newest uploads across all subscribed channels (built from each
 // channel's RSS by the Python backend). Search, channel management and settings hang off
@@ -17,21 +18,8 @@ Page {
 
     ListModel { id: feedModel }
 
-    function fmtDur(sec) {
-        if (!sec || sec <= 0) return ""
-        sec = Math.floor(sec)
-        var h = Math.floor(sec / 3600)
-        var m = Math.floor((sec % 3600) / 60)
-        var s = sec % 60
-        function p(nn) { return (nn < 10 ? "0" : "") + nn }
-        return (h > 0 ? h + ":" + p(m) : "" + m) + ":" + p(s)
-    }
-    function fmtCount(n) {
-        if (!n || n < 0) return "0"
-        if (n >= 1000000) return (n / 1000000).toFixed(1).replace(".0", "") + "M"
-        if (n >= 1000) return (n / 1000).toFixed(1).replace(".0", "") + "K"
-        return "" + n
-    }
+    function fmtDur(sec) { return Logic.fmtDur(sec) }
+    function fmtCount(n) { return Logic.fmtCount(n) }
 
     function loadFeed(force) {
         if (feedModel.count === 0)
@@ -75,11 +63,10 @@ Page {
             // Repopulate only if the id SEQUENCE actually changed — catches any new / removed /
             // reordered video anywhere in the list (not just a new top one), while still skipping a
             // true no-op so an unchanged feed doesn't reset the user's scroll.
-            var changed = items.length !== feedModel.count
-            for (var j = 0; !changed && j < items.length; j++)
-                if (feedModel.get(j).id !== items[j].id)
-                    changed = true
-            if (changed) {
+            var shown = []
+            for (var j = 0; j < feedModel.count; j++)
+                shown.push(feedModel.get(j).id)
+            if (Logic.feedChanged(shown, items)) {
                 feedModel.clear()
                 for (var i = 0; i < items.length; i++)
                     feedModel.append(items[i])
@@ -94,19 +81,18 @@ Page {
     // row now known to be a Short (channel /shorts-tab membership — reliable regardless of length).
     function fillDurations(force) {
         app.backend.feedDurations(force, function(map, shorts) {
-            var shortSet = Object.create(null)   // no prototype → an id like "constructor" can't false-hit
-            if (app.backend.hideShorts && shorts)
-                for (var s = 0; s < shorts.length; s++)
-                    shortSet[shorts[s]] = true
-            for (var i = feedModel.count - 1; i >= 0; i--) {   // backwards → safe removal
-                var it = feedModel.get(i)
-                if (shortSet[it.id]) {
-                    feedModel.remove(i)
-                    continue
-                }
-                var d = map ? map[it.id] : undefined
-                if (d !== undefined && d > 0 && it.duration !== d)
-                    feedModel.setProperty(i, "duration", d)
+            var rows = []
+            for (var r = 0; r < feedModel.count; r++) {
+                var it = feedModel.get(r)
+                rows.push({ id: it.id, duration: it.duration })
+            }
+            // Edits come in descending index order, so a removal never shifts a later one.
+            var edits = Logic.feedBackfill(rows, map, shorts, app.backend.hideShorts)
+            for (var i = 0; i < edits.length; i++) {
+                if (edits[i].remove)
+                    feedModel.remove(edits[i].index)
+                else
+                    feedModel.setProperty(edits[i].index, "duration", edits[i].duration)
             }
         })
     }

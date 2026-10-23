@@ -3,6 +3,7 @@ import Sailfish.Silica 1.0
 import QtMultimedia 5.6
 import Sailfish.Share 1.0
 import FinTube 1.0
+import "../logic.js" as Logic
 
 Page {
     id: page
@@ -75,16 +76,7 @@ Page {
 
     property real playbackRate: app.backend.playbackRate || 1.0   // remembered across videos
     property var chapters: []         // [{start,title}] in seconds, from yt-dlp
-    property string currentChapter: {
-        if (page.chapters.length === 0) return ""
-        var pos = page.positionMs / 1000
-        var t = ""
-        for (var i = 0; i < page.chapters.length; i++) {
-            if (pos >= page.chapters[i].start) t = page.chapters[i].title
-            else break
-        }
-        return t
-    }
+    property string currentChapter: Logic.chapterAt(page.chapters, page.positionMs / 1000)
 
     // Comments: fetched once, a few seconds into playback (commentsAutoTimer); scrolling near them
     // or tapping the header loads them sooner. Then revealed a few at a time as the info area scrolls.
@@ -163,21 +155,13 @@ Page {
     }
     // One 10s step of a double-tap seek in the given zone; stacks while the gesture is live.
     function applySeekStep(zone) {
-        var step = (zone === "right") ? 10000 : -10000
-        if (!page.seekActive) {
-            page.seekActive = true
-            page.seekZone = zone
-            page.seekAmount = 0
-            page.seekTargetMs = page.positionMs
-        } else if (page.seekZone !== zone) {
-            page.seekZone = zone
-            page.seekAmount = 0        // switched direction → fresh count
-        }
-        var target = Math.max(0, page.seekTargetMs + step)
-        if (page.durationMs > 0)
-            target = Math.min(page.durationMs, target)
-        page.seekTargetMs = target
-        page.seekAmount += step / 1000
+        var st = Logic.seekStep({ active: page.seekActive, zone: page.seekZone,
+                                  amount: page.seekAmount, targetMs: page.seekTargetMs },
+                                zone, page.positionMs, page.durationMs)
+        page.seekActive = st.active
+        page.seekZone = st.zone
+        page.seekAmount = st.amount
+        page.seekTargetMs = st.targetMs
         seekApplyTimer.restart()      // accumulate; the actual seek fires once tapping settles
         seekHideTimer.restart()
     }
@@ -198,8 +182,9 @@ Page {
     }
 
     // Switch audio track on a multi-language (dubbed) video: swap the audio-only source, keep the
-    // video, restore position. Twin of switchQuality; dual-source GStreamer path only. The chosen
-    // language is remembered so the next video starts on it (setAudioLang → engine _pick_audio).
+    // video, restore position. Twin of switchQuality; dual-source GStreamer path only. A chosen dub
+    // is remembered so the next video starts on it (setAudioTrack → engine set_audio_track, which
+    // stores "" for a video's original track; tested there).
     function switchAudio(a) {
         // Dual-source only: bail on the muxed/HLS fallback path (audioUrl empty), where swapping in
         // a separate audio source would wire the muxed URL as the video branch and stall the pipeline.
@@ -207,7 +192,7 @@ Page {
                 || !a || !a.audio_url || gplayer.audioUrl === a.audio_url)
             return
         transport.currentAudioItag = a.itag || ""
-        app.backend.setAudioLang(a.lang || "")
+        app.backend.setAudioTrack(a)
         var at = page.positionMs          // capture before stop() zeroes the position
         gplayer.stop()
         gplayer.audioExt = a.ext || ""    // a dub rung may change container (m4a <-> webm)
@@ -224,16 +209,13 @@ Page {
         page.currentCaption = ""
         page.captionIndex = 0
         page.captionLastT = -1
-        if (!track || !track.url) {
-            page.captionLang = ""
-            transport.currentCaptionLang = ""
-            if (persist) app.backend.setCaptionLang("")
+        var lang = Logic.captionPref(track)    // "" = Off
+        page.captionLang = lang
+        transport.currentCaptionLang = lang
+        if (persist) app.backend.setCaptionLang(lang)
+        if (!track || !track.url)
             return
-        }
-        page.captionLang = track.lang
-        transport.currentCaptionLang = track.lang
-        if (persist) app.backend.setCaptionLang(track.lang)
-        var want = track.lang
+        var want = lang
         app.backend.captionCues(track.url, function(cues) {
             if (page.captionLang !== want)      // user switched again before this returned
                 return
@@ -244,36 +226,16 @@ Page {
         })
     }
 
-    // Base language code — "pt" from "pt-BR", "es" from "es-419", "en" from "en-orig". Used so a
-    // remembered language still matches the same language labelled at a different granularity.
-    function baseLang(code) {
-        return (code || "").split("-")[0].toLowerCase()
-    }
-
-    // If a caption language is remembered, auto-enable a matching track for the new video —
-    // real tracks first, then the auto-translations. Most people pick one language and keep it.
+    // If a caption language is remembered, auto-enable a matching track for the new video
+    // (Logic.pickCaption: exact code, then the same base language). persist stays false, so the
+    // exact preference is untouched by a base-language match.
     function autoSelectCaption(tracks, translations) {
-        var want = app.backend.captionLang
-        if (!want || want.length === 0)
-            return
-        var i
-        // Exact code match first (real tracks, then translations).
-        for (i = 0; i < tracks.length; i++)
-            if (tracks[i].lang === want) { page.selectCaption(tracks[i], false); return }
-        for (i = 0; i < translations.length; i++)
-            if (translations[i].lang === want) { page.selectCaption(translations[i], false); return }
-        // Fallback: same base language at a different granularity (manual "pt-BR" preference vs an
-        // ASR "pt" track, "en" vs "en-orig", "es-419" vs "es"). The preference is language-level,
-        // so a base match still counts — and persist stays false, so the exact pref is untouched.
-        var base = page.baseLang(want)
-        for (i = 0; i < tracks.length; i++)
-            if (page.baseLang(tracks[i].lang) === base) { page.selectCaption(tracks[i], false); return }
-        for (i = 0; i < translations.length; i++)
-            if (page.baseLang(translations[i].lang) === base) { page.selectCaption(translations[i], false); return }
+        var track = Logic.pickCaption(app.backend.captionLang, tracks, translations)
+        if (track)
+            page.selectCaption(track, false)
     }
 
-    // Recompute the on-screen caption for the current position. Cues are time-sorted, so we keep
-    // a cursor and only advance it; a backward jump in time resets the scan.
+    // Recompute the on-screen caption for the current position (Logic.captionAt keeps a cursor).
     function updateCaption() {
         var cues = page.captionCues
         if (cues.length === 0) {
@@ -281,13 +243,10 @@ Page {
             return
         }
         var t = page.positionMs / 1000
-        var i = page.captionIndex
-        if (i < 0 || t < page.captionLastT) i = 0        // first run or seeked backward → rescan
+        var r = Logic.captionAt(cues, t, page.captionIndex, page.captionLastT)
         page.captionLastT = t
-        while (i < cues.length && t >= cues[i].start + cues[i].dur) i++
-        page.captionIndex = i
-        var txt = (i < cues.length && t >= cues[i].start) ? cues[i].text : ""
-        if (page.currentCaption !== txt) page.currentCaption = txt
+        page.captionIndex = r.index
+        if (page.currentCaption !== r.text) page.currentCaption = r.text
     }
 
     // Start a background download of this video's audio or muxed video.
@@ -328,9 +287,10 @@ Page {
     function playNextInQueue() {
         if (page.status !== PageStatus.Active)
             return
-        if (page.fromQueue && app.playQueue && app.playQueueIndex + 1 < app.playQueue.length) {
-            app.playQueueIndex += 1
-            var next = app.playQueue[app.playQueueIndex]
+        var ni = page.fromQueue ? Logic.nextQueueIndex(app.playQueue, app.playQueueIndex) : -1
+        if (ni >= 0) {
+            app.playQueueIndex = ni
+            var next = app.playQueue[ni]
             pageStack.replace(Qt.resolvedUrl("VideoPage.qml"),
                 { videoId: next.id, title: next.title || "", fromQueue: true })
         }
@@ -352,10 +312,10 @@ Page {
         id: nextPrefetchTimer
         interval: 4000
         onTriggered: {
-            if (!page.fromQueue || !page.holdsPlayer || !app.playQueue)
+            if (!page.fromQueue || !page.holdsPlayer)
                 return
-            var ni = app.playQueueIndex + 1
-            if (ni < app.playQueue.length && app.playQueue[ni] && app.playQueue[ni].id)
+            var ni = Logic.nextQueueIndex(app.playQueue, app.playQueueIndex)
+            if (ni >= 0)
                 app.backend.prefetchResolve(app.playQueue[ni].id)
         }
     }
@@ -369,20 +329,21 @@ Page {
         // Backgrounded/locked: the network (and any reload) will just fail again — and the
         // stall was almost certainly caused by the blank itself (WiFi power-save / a frozen
         // fetch). Defer the reload to resume, and don't spend the retry budget on it.
-        if (!Qt.application.active) {
+        var plan = Logic.recoveryPlan(Qt.application.active, page.videoId.length > 0,
+                                      page.resolving, page.playRetries, page.maxPlayRetries,
+                                      page.positionMs, page.resumeMs)
+        if (plan.action === "defer") {
             page.pendingRecovery = true
             page.errorText = ""
             return
         }
-        if (page.videoId.length === 0 || page.resolving
-                || page.playRetries >= page.maxPlayRetries) {
+        if (plan.action === "fail") {
             page.errorText = message
             return
         }
         page.playRetries++
-        var atMs = page.positionMs > 0 ? page.positionMs : page.resumeMs
-        page.resumeMs = atMs > 0 ? atMs : 0      // captured BEFORE stop() zeroes the position
-        page.recoverAtMs = atMs + 5000    // 5s of clean playback past here = recovered
+        page.resumeMs = plan.resumeMs     // captured BEFORE stop() zeroes the position
+        page.recoverAtMs = plan.recoverAtMs
         page.errorText = ""
         page.resolving = true             // re-arm the onResolved handler + show the spinner
         // Full teardown so the re-resolve rebuilds a FRESH pipeline — a GStreamer error leaves the
@@ -487,13 +448,6 @@ Page {
             page.allowedOrientations = Orientation.LandscapeMask   // classic: rotate to landscape
     }
 
-    // Per-category action ("skip" | "manual" | "off"), from the SponsorBlock settings page. A
-    // category with no saved action is off (never touched).
-    function sbAction(cat) {
-        var m = app.backend.sbActions
-        var v = m ? m[cat] : undefined
-        return (v === "skip" || v === "manual") ? v : "off"
-    }
     // Human label for a category, used in the skip button and the "Skipped …" pill.
     function sbLabel(cat) {
         switch (cat) {
@@ -518,27 +472,13 @@ Page {
             page.manualSeg = null
             return
         }
-        var pos = page.positionMs / 1000
-        var pending = null
-        for (var i = 0; i < page.sponsorSegments.length; i++) {
-            var s = page.sponsorSegments[i]
-            if (pos < s.start || pos >= s.end - 0.5)
-                continue
-            var act = page.sbAction(s.category)
-            if (act === "skip") {
-                // Auto-skip only while actually playing — a paused user parked in a segment
-                // shouldn't be dragged forward.
-                if (page.isPlaying) {
-                    page.manualSeg = null
-                    page.seekTo(Math.round(s.end * 1000))
-                    page.showSkipHint(qsTr("Skipped %1").arg(page.sbLabel(s.category)))
-                    return
-                }
-            } else if (act === "manual" && pending === null) {
-                pending = s     // show the button; keep scanning in case a "skip" also overlaps
-            }
+        var d = Logic.sponsorDecision(page.sponsorSegments, page.positionMs / 1000,
+                                      app.backend.sbActions, page.isPlaying)
+        page.manualSeg = d.manual
+        if (d.skip) {
+            page.seekTo(Math.round(d.skip.end * 1000))
+            page.showSkipHint(qsTr("Skipped %1").arg(page.sbLabel(d.skip.category)))
         }
-        page.manualSeg = pending
     }
     // User tapped the manual skip button: jump past the segment and confirm with the pill.
     function skipManualSeg() {
@@ -690,9 +630,8 @@ Page {
     function persistPosition() {
         if (!page.videoId)
             return
-        var pos = Math.floor(page.positionMs / 1000)
-        var dur = Math.floor(page.durationMs / 1000)
-        app.backend.saveWatch(page.videoId, pos, dur, page.title, page.channel)
+        app.backend.saveWatch(page.videoId, Logic.wholeSeconds(page.positionMs),
+                              Logic.wholeSeconds(page.durationMs), page.title, page.channel)
     }
 
     // Reached the end — mark watched with a full position (position reporting can be flaky at
@@ -700,19 +639,12 @@ Page {
     function markFinished() {
         if (!page.videoId)
             return
-        var dur = Math.floor(page.durationMs / 1000)
-        if (dur <= 0)
-            dur = Math.floor(page.videoDuration || 0)
+        var dur = Logic.finishedSeconds(page.durationMs, page.videoDuration)
         app.backend.saveWatch(page.videoId, dur, dur, page.title, page.channel)
     }
 
     // 1.2K / 3.4M style abbreviation for like counts.
-    function fmtCount(n) {
-        if (!n || n < 0) return "0"
-        if (n >= 1000000) return (n / 1000000).toFixed(1).replace(".0", "") + "M"
-        if (n >= 1000) return (n / 1000).toFixed(1).replace(".0", "") + "K"
-        return "" + n
-    }
+    function fmtCount(n) { return Logic.fmtCount(n) }
 
     Connections {
         // A null target = disconnected (Connections.enabled needs Qt 5.7; SFOS is 5.6).
@@ -742,44 +674,27 @@ Page {
             page.populateMetadata(info)
             if (page.fromQueue)          // warm the next queued video's resolve shortly (see the Timer)
                 nextPrefetchTimer.restart()
-            if (info.video_url && info.video_url.length > 0
-                    && info.audio_url && info.audio_url.length > 0) {
+            // Logic.playPlan picks dual / muxed / hls. Dual and muxed both run on the C++ player;
+            // muxed carries empty exts and an empty audioUrl (one source feeds both tracks).
+            // QtMultimedia mishandled the proxied progressive stream, so only HLS goes there.
+            var plan = Logic.playPlan(info)
+            if (plan.mode === "hls") {
+                page.useGst = false
+                mediaPlayer.source = plan.url
+                mediaPlayer.play()
+            } else if (plan.mode === "dual" || plan.mode === "muxed") {
                 page.useGst = true
                 gplayer.userAgent = info.http_ua
                 // Containers before URLs: buildPipeline reads them to decide per-branch
                 // seekability (mp4/qtdemux branches need a downloadbuffer to seek at all).
-                gplayer.videoExt = info.video_ext || ""
-                gplayer.audioExt = info.audio_ext || ""
-                gplayer.audioUrl = info.audio_url
-                gplayer.videoUrl = info.video_url
+                gplayer.videoExt = plan.videoExt
+                gplayer.audioExt = plan.audioExt
+                gplayer.audioUrl = plan.audioUrl
+                gplayer.videoUrl = plan.videoUrl
                 gplayer.play()
                 // Resume: seek to the saved spot once the pipeline has prerolled (both branches up).
                 if (page.resumeMs > 0)
                     gplayer.seekWhenReady(page.resumeMs)
-            } else if (info.muxed_url && info.muxed_url.length > 0) {
-                // A muxed stream (both tracks in one URL). HLS (m3u8) is adaptive and plays
-                // natively through QtMultimedia; a progressive muxed URL (itag 18 — often the
-                // ONLY format left once YouTube forces SABR on the adaptive ones) goes through
-                // our reliable C++ player in single-source mode (empty audioUrl → one source
-                // feeds both tracks). QtMultimedia mishandled the proxied progressive stream.
-                if (info.muxed_proto && info.muxed_proto.indexOf("m3u8") >= 0) {
-                    page.useGst = false
-                    mediaPlayer.source = info.muxed_url
-                    mediaPlayer.play()
-                } else {
-                    page.useGst = true
-                    gplayer.userAgent = info.http_ua
-                    // Clear the container hints: muxed mode seeks at pipeline level and must
-                    // not inherit a previous dual attempt's videoExt (a stale "mp4" would
-                    // wrongly give the single bin a downloadbuffer).
-                    gplayer.videoExt = ""
-                    gplayer.audioExt = ""
-                    gplayer.audioUrl = ""
-                    gplayer.videoUrl = info.muxed_url
-                    gplayer.play()
-                    if (page.resumeMs > 0)
-                        gplayer.seekWhenReady(page.resumeMs)
-                }
             } else {
                 page.errorText = qsTr("no playable stream")
             }
@@ -840,10 +755,11 @@ Page {
         page.reclaimPlayer()
     }
     function reclaimPlayer() {
-        if (status !== PageStatus.Active || page.infoOnly || page.resolving || !page._played)
-            return                              // never loaded a video yet (first show) → nothing to reclaim
-        if (app.nowPlaying.videoId === page.videoId)
-            return                              // still our video on the shared player — nothing to do
+        // Not on first show (never loaded a video yet), and not while our video is still the one
+        // on the shared player.
+        if (!Logic.needsReclaim(status === PageStatus.Active, page.infoOnly, page.resolving,
+                                page._played, app.nowPlaying.videoId, page.videoId))
+            return
         page.errorText = ""
         page.useGst = false
         page.resolving = true                   // re-arm onResolved + show the spinner
@@ -866,7 +782,7 @@ Page {
     // auto-recovery budget: once we've played a few seconds past the last stall, the stream
     // is healthy, so a later, unrelated 403 gets its own fresh set of retries.
     onPositionMsChanged: {
-        if (page.playRetries > 0 && page.positionMs > page.recoverAtMs)
+        if (Logic.recovered(page.playRetries, page.positionMs, page.recoverAtMs))
             page.playRetries = 0
         // Deferred, NOT called inline: the skip check SEEKS, and gplayer.seek() reflects the
         // new position synchronously (so the scrubber doesn't snap back) — a seek issued from
@@ -998,9 +914,9 @@ Page {
         // Reattach: reopened onto the video that's still playing in the shared background player.
         // Adopt it exactly as it is (no re-resolve, no restart) and repopulate the page from the
         // stashed resolve() info, so browsing away and back is seamless.
-        if (app.bgAudioActive && app.nowPlaying.videoId === page.videoId
-                && app.lastResolvedId === page.videoId && app.lastResolvedInfo
-                && (gplayer.playing || gplayer.position > 0)) {
+        if (Logic.canReattach(app.bgAudioActive, app.nowPlaying.videoId, page.videoId,
+                              app.lastResolvedId, !!app.lastResolvedInfo,
+                              gplayer.playing, gplayer.position)) {
             page.reattaching = true
             page.useGst = true
             page.attachPlayer()
@@ -1819,8 +1735,8 @@ Page {
         // controller drive the cover/lockscreen. Otherwise stop and release the cover. Either way
         // the player MUST be reparented out (parkPlayer) so it survives this page's destruction.
         // (A never-started video — no pipeline, position 0 — isn't worth holding → stop.)
-        var keep = app.backend.backgroundAudio && page.useGst
-                   && (gplayer.playing || gplayer.position > 0)
+        var keep = Logic.keepPlayerOnLeave(app.backend.backgroundAudio, page.useGst,
+                                           gplayer.playing, gplayer.position)
         if (keep) {
             gplayer.setVideoActive(false)
             app.backend.releasePlayback(page.videoId, [transport.currentAudioItag])

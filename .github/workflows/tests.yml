@@ -1,11 +1,14 @@
 name: tests
 
-# The engine test suite is pure-stdlib and fully offline (externals mocked), so it runs
-# anywhere Python 3 does — no device, no yt-dlp, no network. Running it on every push/PR is
-# what stops it rotting silently (it had drifted to 8 failures at HEAD before this was added).
+# Every offline suite runs on every push/PR: the engine (pure-stdlib Python, externals mocked — no
+# device, no yt-dlp, no network), the parsers against recorded YouTube answers (tests/test_*.py),
+# the coverage check (no new engine function without a test) and the QML decisions (qml/logic.js
+# under Node). Running them on every push is what stops them rotting silently (the engine suite had
+# drifted to 8 failures before this was added). build.yml runs this workflow before a release.
 on:
   push:
   pull_request:
+  workflow_call:
 
 jobs:
   engine:
@@ -18,3 +21,17 @@ jobs:
       - name: Run engine test suite (offline)
         working-directory: python
         run: python3 test_youfish.py
+      - name: Run the parsers against recorded YouTube answers
+        run: for t in tests/test_*.py; do python3 "$t" || exit 1; done
+      - name: No new untested engine code
+        run: python3 tests/coverage_report.py --check
+
+  qml-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run QML logic tests
+        run: node tests/qml_logic_test.js

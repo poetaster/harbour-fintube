@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 
 // SponsorBlock configuration — split off Settings so the main page isn't cluttered. A master switch
 // plus a per-category action: Off (ignore), Auto-skip (jump past it silently), or Show skip button
@@ -12,8 +13,8 @@ Page {
     property bool hideDock: true   // hide the now-playing dock over this settings sub-page
 
     // Category action <-> ComboBox index. "off" is the absent state (index 0).
-    function actionToIndex(a) { return a === "skip" ? 1 : (a === "manual" ? 2 : 0) }
-    function indexToAction(i) { return i === 1 ? "skip" : (i === 2 ? "manual" : "off") }
+    function actionToIndex(a) { return Logic.sbActionIndex(a) }
+    function indexToAction(i) { return Logic.sbIndexAction(i) }
 
     // The skippable categories SponsorBlock exposes (matches _SB_CATEGORIES in youfish.py), in the
     // order shown. name = the row label, desc = what the segment type covers.

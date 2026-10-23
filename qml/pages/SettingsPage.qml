@@ -1,5 +1,6 @@
 import QtQuick 2.0
 import Sailfish.Silica 1.0
+import "../logic.js" as Logic
 import Sailfish.Pickers 1.0
 
 // App settings — playback and content preferences. Third-party tool management (yt-dlp, ffmpeg,
@@ -74,9 +75,8 @@ Page {
                 description: qsTr("Baseline video quality — the app plays this or the next lower one "
                              + "available. Decode is software: 1080p is 60fps and can tax the CPU, "
                              + "so 720p is the smooth default.")
-                // Index ↔ value map; "0" = best available (no cap).
-                property var vals: ["1080", "720", "480", "360", "0"]
-                currentIndex: Math.max(0, vals.indexOf(app.backend.defaultQuality))
+                // Index ↔ value map (Logic.QUALITY_VALUES, in the menu's order); "0" = best available.
+                currentIndex: Logic.qualityIndex(app.backend.defaultQuality)
                 menu: ContextMenu {
                     MenuItem { text: "1080p" }
                     MenuItem { text: "720p" }
@@ -85,7 +85,7 @@ Page {
                     MenuItem { text: qsTr("Best available") }
                 }
                 onCurrentIndexChanged: {
-                    var v = vals[currentIndex]
+                    var v = Logic.qualityValue(currentIndex)
                     if (v !== app.backend.defaultQuality)
                         app.backend.setDefaultQuality(v)
                 }

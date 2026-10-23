@@ -1,0 +1,28 @@
+name: live yt-dlp
+
+# The engine's yt-dlp paths against the real yt-dlp and live YouTube (tests/live_ytdlp.py): resolve
+# + the first bytes through the proxy, search, related, channels, playlists, comments, a download,
+# binary and in-process. Weekly and on demand only, never on push or before a release: YouTube
+# often refuses GitHub's datacenter IPs, and those checks come back SKIPPED (inconclusive), not
+# failed. A red run means yt-dlp or our use of it broke. The arm64 runner fetches the phone's builds.
+on:
+  schedule:
+    - cron: '17 5 * * 1'      # Mondays
+  workflow_dispatch:
+
+jobs:
+  ytdlp:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: ['', '--pot']   # without / with the PO-token provider (Deno + bgutil)
+    name: yt-dlp ${{ matrix.provider == '--pot' && 'with PO token' || 'token-free' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Real yt-dlp against live YouTube
+        run: python3 tests/live_ytdlp.py ${{ matrix.provider }}
